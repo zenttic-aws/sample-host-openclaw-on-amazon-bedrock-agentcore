@@ -67,6 +67,13 @@ LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 RUNTIME_TARGET = json.loads(os.environ.get("RUNTIME_TARGET", "null"))
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "")
 
+# Maximum accepted webhook body size (bytes). Matches the 1 MB cap enforced by
+# the WhatsApp/LINE/Discord verifiers (lambda/shared/python/*.py). Oversized
+# bodies are rejected with 413 before any parsing, base64 decoding or HMAC work
+# runs, so an unauthenticated client cannot force the 256 MB router Lambda to
+# materialise a multi-megabyte JSON document pre-signature.
+MAX_BODY_BYTES = 1_000_000
+
 
 def _load_user_selectable_models(raw):
     """Parse the operator's /model allowlist ({alias: model_id}).
@@ -2578,12 +2585,32 @@ def handler(event, context):
     if method != "POST":
         return {"statusCode": 405, "body": "Method not allowed"}
 
+    headers = event.get("headers", {})
+
+    # Reject oversized payloads before any parsing, base64 decoding or HMAC
+    # work. Check Content-Length first so a declared-huge base64 body is
+    # refused without allocating the decoded copy; then re-check the resolved
+    # body length because Content-Length is attacker-controlled.
+    content_length_header = (
+        headers.get("content-length")
+        or headers.get("Content-Length")
+        or ""
+    )
+    if content_length_header:
+        try:
+            if int(content_length_header) > MAX_BODY_BYTES:
+                return {"statusCode": 413, "body": "Payload too large"}
+        except (TypeError, ValueError):
+            pass
+
     body = event.get("body", "")
+    if isinstance(body, str) and len(body) > MAX_BODY_BYTES:
+        return {"statusCode": 413, "body": "Payload too large"}
     if event.get("isBase64Encoded"):
         import base64
         body = base64.b64decode(body).decode("utf-8")
-
-    headers = event.get("headers", {})
+    if isinstance(body, (bytes, str)) and len(body) > MAX_BODY_BYTES:
+        return {"statusCode": 413, "body": "Payload too large"}
 
     # Determine channel from path
     if path.endswith("/webhook/telegram"):
