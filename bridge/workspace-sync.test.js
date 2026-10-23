@@ -1946,7 +1946,7 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
       makeDb(src);
       const snapshot = await workspaceSync.snapshotSqlite(src);
       s3.objects[KEY] = zlib.gzipSync(snapshot);
-      s3.metadata[KEY] = { sha256: "0".repeat(64), encoding: "gzip" };
+      s3.metadata[KEY] = { sha256: "0".repeat(64), encoding: "gzip", "uncompressed-size": String(snapshot.length) };
       s3.encodings[KEY] = "gzip";
       const fresh = freshModule();
       await assert.rejects(fresh.restoreWorkspace(NS), /incomplete/);
@@ -2003,10 +2003,14 @@ describe("large SQLite databases (gzip snapshot backup)", () => {
       assert.deepEqual(s3.calls, []);
       const w = warnings.find((x) => /Skipping agents\/main\/agent\/openclaw-agent\.sqlite: SQLite database is \d+ bytes, above the 102400-byte backup cap \(WORKSPACE_SYNC_MAX_SQLITE_BYTES\) — its changes are NOT backed up to S3/.test(x));
       assert.ok(w, warnings.join("\n"));
-      // The cap is also applied to the listing on restore.
+      // The cap is also applied to the listing on restore. The listing-pass
+      // cap is `_limits.maxFileSize` (NOT the attacker-chosen `.sqlite`
+      // suffix): a legitimate large SQLite snapshot is gzip-compressed on
+      // upload and well under the non-SQLite cap even when its uncompressed
+      // form is hundreds of MB.
       s3.objects[KEY] = Buffer.alloc(101 * 1024);
       const fresh = freshModule();
-      fresh._setLimitsForTests({ maxSqliteFileSize: 100 * 1024 });
+      fresh._setLimitsForTests({ maxFileSize: 100 * 1024, maxSqliteFileSize: 100 * 1024 });
       await assert.rejects(fresh.restoreWorkspace(NS), /incomplete/);
       assert.ok(warnings.some((x) => /Skipping oversized file/.test(x)));
     },
