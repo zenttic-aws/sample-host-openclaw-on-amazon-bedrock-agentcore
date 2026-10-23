@@ -174,6 +174,8 @@ if tool == "aws":
                "EcrRepositoryName": os.environ.get("STACK_REPOSITORY", "openclaw-bridge")}[key])
     elif args[:2] == ["s3", "cp"]:
         shutil.copy(args[2], os.environ["UPLOADED_ZIP"])
+    elif args[:2] == ["s3api", "head-object"]:
+        print(os.environ.get("SOURCE_VERSION_ID", "version-id-00000000"))
     elif args[:2] == ["codebuild", "start-build"]:
         print("openclaw-bridge-build:00000000-0000-0000-0000-000000000000")
     elif args[:2] == ["codebuild", "batch-get-builds"]:

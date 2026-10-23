@@ -55,6 +55,26 @@ describe("buildSessionPolicy", () => {
       `policy must be <= 2048 bytes (STS packed limit), got ${policy.length}`);
   });
 
+  it("policy stays within the 2048-byte limit for a 46-char namespace with suffixed resource names", () => {
+    // 46 chars is the longest namespace the eventbridge-cron skill accepts;
+    // Feishu open_id namespaces ("feishu_ou_" + 32 hex) are 42.
+    const ns = "feishu_ou_" + "0123456789abcdef".repeat(2) + "abcd";
+    assert.equal(ns.length, 46);
+    const policy = buildSessionPolicy({
+      bucket: "openclaw-user-files-123456789012-ap-southeast-2-production",
+      namespace: ns,
+      internalUserId: "user_0123456789abcdef",
+      cmkArn: "arn:aws:kms:ap-southeast-2:123456789012:key/abcdef12-3456-7890-abcd-ef1234567890",
+      eventbridgeRoleArn: "arn:aws:iam::123456789012:role/openclaw-cron-scheduler-role-ap-southeast-2-production",
+      identityTableArn: "arn:aws:dynamodb:ap-southeast-2:123456789012:table/openclaw-identity-production",
+      scheduleGroupArn: "arn:aws:scheduler:ap-southeast-2:123456789012:schedule-group/openclaw-cron-production",
+      region: "ap-southeast-2",
+      account: "123456789012",
+    });
+    assert.ok(policy.length <= 2048,
+      `policy must be <= 2048 bytes (STS packed limit), got ${policy.length}`);
+  });
+
   it("S3 object actions scoped to namespace/* only", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
@@ -83,7 +103,7 @@ describe("buildSessionPolicy", () => {
     );
   });
 
-  it("ListBucket included in S3 statement without Condition block", () => {
+  it("ListBucket included in S3 statement with namespace prefix Condition", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_99999",
@@ -95,7 +115,18 @@ describe("buildSessionPolicy", () => {
       (s) => s.Action && (Array.isArray(s.Action) ? s.Action.includes("s3:ListBucket") : s.Action === "s3:ListBucket")
     );
     assert.ok(listStmt, "should have ListBucket statement");
-    assert.equal(listStmt.Condition, undefined, "ListBucket should have no Condition block");
+    assert.ok(listStmt.Condition, "ListBucket should have a Condition block");
+    const prefixes = listStmt.Condition.StringLike && listStmt.Condition.StringLike["s3:prefix"];
+    assert.ok(Array.isArray(prefixes), "s3:prefix condition should be an array");
+    assert.ok(
+      prefixes.includes("telegram_99999/*"),
+      `s3:prefix should include namespace/*, got: ${JSON.stringify(prefixes)}`,
+    );
+    // Must not allow listing other namespaces or the bucket root.
+    assert.ok(
+      !prefixes.some((p) => p === "*" || p === ""),
+      `s3:prefix must not allow wildcard/root, got: ${JSON.stringify(prefixes)}`,
+    );
   });
 
   it("KMS statement is scoped to the deployment CMK and pinned by kms:ViaService", () => {
@@ -222,7 +253,7 @@ describe("buildSessionPolicy", () => {
     assert.ok(dynamoStmt, "should have DynamoDB actions");
     const resources = Array.isArray(dynamoStmt.Resource) ? dynamoStmt.Resource : [dynamoStmt.Resource];
     assert.ok(resources.includes(tableArn), "should include the table ARN");
-    assert.ok(resources.includes(`${tableArn}/index/*`), "should include the GSI index ARN");
+    assert.ok(!resources.includes(`${tableArn}/index/*`), "no skill queries a GSI, so index ARNs are not granted");
     assert.ok(!resources.includes("*"), "must not grant DynamoDB access to all resources");
   });
 
@@ -253,8 +284,8 @@ describe("buildSessionPolicy", () => {
     const leadingKeys = dynamoStmt.Condition["ForAllValues:StringEquals"]["dynamodb:LeadingKeys"];
     assert.deepEqual(
       new Set(leadingKeys),
-      new Set(["USER#user_abc123", "CHANNEL#telegram:12345", "ALLOW#telegram:12345"]),
-      "LeadingKeys must only include this caller's USER#/CHANNEL#/ALLOW# keys",
+      new Set(["USER#user_abc123", "CHANNEL#telegram:12345"]),
+      "LeadingKeys must only include this caller's USER#/CHANNEL# keys",
     );
   });
 
@@ -694,6 +725,7 @@ describe("buildSessionPolicy Secrets Manager", () => {
     assert.ok(smStmt.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt.Action.includes("secretsmanager:CreateSecret"));
     assert.ok(smStmt.Action.includes("secretsmanager:DeleteSecret"));
+    assert.ok(smStmt.Action.includes("secretsmanager:PutSecretValue"));
     assert.ok(smStmt.Action.includes("secretsmanager:TagResource"), "TagResource needed for api-keys skill");
     // ListSecrets does not support resource-level ARNs — it must live in its
     // own statement with Resource:"*", not alongside the CRUD actions.

@@ -1,9 +1,36 @@
 /**
- * Scoped S3 Credentials — Per-user IAM isolation via STS session policies.
+ * Scoped S3 Credentials — Per-user IAM scoping via STS session policies.
  *
- * Creates STS AssumeRole session credentials that restrict S3 access to
- * a single user's namespace prefix. Prevents cross-user data access even
- * if OpenClaw's bash/code execution tools are used to call the AWS CLI/SDK.
+ * Creates STS AssumeRole session credentials that restrict S3 access to a
+ * single user's namespace prefix, writes them to a credential_process file,
+ * and builds a child environment that points the AWS SDK/CLI at that file
+ * instead of the container's ambient credentials.
+ *
+ * Threat-model caveat — read before extending this module:
+ *
+ *   The child OpenClaw process currently runs as uid 0 in the same PID,
+ *   mount and network namespace as this contract server (bridge/Dockerfile
+ *   has no USER directive; bridge/entrypoint.sh does `exec node
+ *   agentcore-contract.js` so the contract server is PID 1). A root process
+ *   in that namespace can read /proc/1/environ or reach the container
+ *   credential endpoint directly (AWS_EC2_METADATA_DISABLED is only an SDK
+ *   hint and no network rule blocks 169.254.170.2 / 169.254.169.254). That
+ *   means stripping credential environment variables from the child env
+ *   does NOT, on its own, prevent an attacker who achieves code execution
+ *   through OpenClaw's exec tool from recovering the full execution-role
+ *   credentials.
+ *
+ *   Real cross-user isolation therefore requires EITHER (a) running the
+ *   OpenClaw child under a dedicated unprivileged uid with hidepid / a
+ *   separate PID namespace plus an iptables owner-match rule blocking the
+ *   container credential endpoint for that uid, OR (b) exchanging the
+ *   ambient credentials once at bootstrap, scrubbing
+ *   AWS_CONTAINER_CREDENTIALS_* / AWS_CONTAINER_AUTHORIZATION_TOKEN* from
+ *   this process and dropping network access to the credential endpoint.
+ *   Until one of those holds, treat the per-user AgentCore microVM as the
+ *   enforced tenant boundary and treat the child env filter below as a
+ *   defence-in-depth hardening against accidental SDK fallback — not as
+ *   the isolation mechanism.
  *
  * Usage:
  *   const { createScopedCredentials, writeCredentialFiles, buildOpenClawEnv } = require("./scoped-credentials");
@@ -48,15 +75,31 @@ function assertCredentialsFresh(creds, { now = Date.now, minValidityMs = 0 } = {
   return creds;
 }
 
-// ENV vars that MUST be excluded from OpenClaw to prevent credential leakage
+// ENV vars that MUST be excluded from the OpenClaw child so the AWS SDK/CLI
+// in that child cannot resolve ambient container credentials through its
+// default provider chain. This is defence-in-depth: see the module header
+// for why a stripped env alone is NOT a tenant-isolation boundary when the
+// child shares a uid and PID namespace with this contract server. Every
+// known AWS credential source the SDK consults is listed here, including
+// the authorization-token variables used with the container credential
+// endpoint (previously missing — their presence let the child reach the
+// endpoint directly). Keep this list in sync with the lists in
+// bridge/openclaw-worker-owner.js, bridge/openclaw-preinit.mjs,
+// bridge/live-gateway-seed-common.mjs and bridge/sqlite-receiver-control.mjs.
 const CREDENTIAL_ENV_BLOCKLIST = [
   "AWS_ACCESS_KEY_ID",
   "AWS_SECRET_ACCESS_KEY",
   "AWS_SESSION_TOKEN",
+  "AWS_SECURITY_TOKEN",
   "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
   "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+  "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
   "AWS_WEB_IDENTITY_TOKEN_FILE",
   "AWS_ROLE_ARN",
+  "AWS_ROLE_SESSION_NAME",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_PROFILE",
 ];
 
 // ENV vars forwarded from baseEnv to OpenClaw process
@@ -94,20 +137,26 @@ const FORWARDED_ENV_KEYS = [
  * @returns {string} JSON policy document
  */
 // Per-namespace schedule name prefix. Must stay aligned with buildScheduleName
-// in bridge/skills/eventbridge-cron/common.js: `openclaw-<userId>-<scheduleId>`.
-// userId there == the namespace here. The schedule name is capped at 64 chars,
-// so when the namespace is long enough that the suffix was truncated at create
-// time, the per-namespace prefix must mirror the same truncation.
+// in bridge/skills/eventbridge-cron/common.js and
+// lambda/gateway_tools/eventbridge_cron/index.js:
+// `openclaw-<namespace>-<scheduleId>`. The schedule name is capped at 64
+// chars; a namespace too long for that is written as
+// `openclaw-<head>-<sha256(namespace)[0:12]>-<scheduleId>`, so the prefix
+// mirrors the same form.
 const SCHEDULE_NAME_PREFIX = "openclaw-";
 const SCHEDULE_ID_SUFFIX_LEN = 1 /* "-" */ + 8 /* 4-byte hex id */;
 const MAX_SCHEDULE_NAMESPACE_LEN =
   64 - SCHEDULE_NAME_PREFIX.length - SCHEDULE_ID_SUFFIX_LEN;
 
 function scheduleNamespacePrefix(namespace) {
-  const truncated = namespace.length > MAX_SCHEDULE_NAMESPACE_LEN
-    ? namespace.slice(0, MAX_SCHEDULE_NAMESPACE_LEN)
-    : namespace;
-  return `${SCHEDULE_NAME_PREFIX}${truncated}-`;
+  if (namespace.length <= MAX_SCHEDULE_NAMESPACE_LEN) {
+    return `${SCHEDULE_NAME_PREFIX}${namespace}-`;
+  }
+  const { createHash } = require("crypto");
+  const digestPart = `-${createHash("sha256").update(namespace).digest("hex").slice(0, 12)}`;
+  const room = MAX_SCHEDULE_NAMESPACE_LEN - digestPart.length;
+  const head = room > 0 ? namespace.slice(0, room) : "";
+  return `${SCHEDULE_NAME_PREFIX}${head}${digestPart}-`;
 }
 
 function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
@@ -130,6 +179,16 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
     Effect: "Allow",
     Action: "s3:ListBucket",
     Resource: `arn:aws:s3:::${bucket}`,
+    // Restrict ListObjectsV2 to this user's namespace: without this
+    // condition s3:ListBucket would enumerate every tenant's object
+    // keys (incl. _uploads/ filenames and agent-state files such as
+    // IDENTITY.md/MEMORY.md), even though object reads are already
+    // prefix-scoped above. StringLike "*" also matches the empty string, so
+    // "<ns>/*" covers a bare "<ns>/" listing; a single entry keeps the packed
+    // policy under the 2048-byte STS limit.
+    Condition: {
+      StringLike: { "s3:prefix": [`${namespace}/*`] },
+    },
   };
 
   // --- Secrets Manager (per-namespace secret path) ---
@@ -161,19 +220,19 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
   };
 
   // --- DynamoDB (per-user LeadingKeys condition) ---
-  // Resource is restricted to the single identity table plus its GSI indexes.
-  // LeadingKeys additionally restricts access to the three partition keys that
-  // belong to this session's bound identity:
+  // Resource is restricted to the single identity table. No skill that runs
+  // under these credentials queries a GSI or reads ALLOW# records (the
+  // allowlist is read by the router and the contract server with their own
+  // credentials), so neither is granted; omitting them also keeps the policy
+  // under the 2048-byte STS limit for long channel IDs such as Feishu open_ids.
+  // LeadingKeys restricts access to the partition keys that belong to this
+  // session's bound identity:
   //   USER#<internalUserId>  — CRON#/SESSION/profile records for this user
   //   CHANNEL#<actorId>      — PROFILE for this channel identity
-  //   ALLOW#<actorId>        — allowlist entry for this channel identity
   // StringEquals (not StringLike) so an attacker cannot widen the match.
-  const dynamoResources = identityTableArn
-    ? [identityTableArn, `${identityTableArn}/index/*`]
-    : undefined;
+  const dynamoResources = identityTableArn || undefined;
   const leadingKeys = [
     `CHANNEL#${effectiveActorId}`,
-    `ALLOW#${effectiveActorId}`,
   ];
   if (internalUserId) {
     leadingKeys.unshift(`USER#${internalUserId}`);
@@ -481,9 +540,16 @@ function createCredentialManager(namespace, {
 /**
  * Build a clean environment for the OpenClaw child process.
  *
- * Includes scoped credential config and app env vars.
- * Explicitly EXCLUDES all AWS credential env vars to prevent
- * OpenClaw from accessing the container's full execution role.
+ * Includes scoped credential config and app env vars, and strips every
+ * known AWS credential source (CREDENTIAL_ENV_BLOCKLIST) from the forwarded
+ * variables so the SDK/CLI inside the child defaults to the scoped
+ * credential_process file. This filter is defence-in-depth only: it does
+ * NOT, by itself, prevent a child that runs as root in the same PID
+ * namespace as this contract server from reading /proc/1/environ or
+ * contacting the container credential endpoint. See the module header for
+ * the required container-level controls (dedicated uid, hidepid / PID
+ * namespace, iptables owner-match on the credential endpoint, or ambient
+ * credentials scrubbed from this process after bootstrap).
  *
  * @param {object} opts
  * @param {string} opts.credDir - Directory containing scoped credential files
