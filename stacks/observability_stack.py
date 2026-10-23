@@ -328,7 +328,7 @@ class ObservabilityStack(Stack):
         ).add_alarm_action(cw_actions.SnsAction(self.alarm_topic))
 
         # --- Health alarms: session storage (cron ones are in TokenMonitoring) ---
-        add_health_alarms(self, self.alarm_topic, groups=("container",))
+        add_health_alarms(self, self.alarm_topic, groups=("container",), log_retention=log_retention)
 
         CfnOutput(
             self,
