@@ -1598,17 +1598,26 @@ def _download_telegram_image(message, token):
             logger.warning("Telegram getFile returned no file_path for file_id=%s", file_id)
             return None, None, None
 
-        # Check file size before downloading (Telegram includes it)
-        file_size = data.get("result", {}).get("file_size", 0)
+        # Check file size before downloading (Telegram includes it).
+        # Treat a missing file_size as a rejection rather than defaulting to 0,
+        # so we never trust "size absent" as "size zero".
+        file_size = data.get("result", {}).get("file_size")
+        if not isinstance(file_size, int) or file_size <= 0:
+            logger.warning("Telegram file missing or invalid file_size; rejecting")
+            return None, None, None
         if file_size > MAX_IMAGE_BYTES:
             logger.warning("Telegram file too large: %d bytes", file_size)
             return None, None, None
 
-        # Download the file
+        # Download the file. Bound the transfer itself in addition to the
+        # declared size, matching the sibling helpers (document/WhatsApp/LINE/Feishu).
         download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
         req = urllib_request.Request(download_url)
         resp = urllib_request.urlopen(req, timeout=15)
-        image_bytes = resp.read()
+        image_bytes = resp.read(MAX_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            logger.warning("Telegram image exceeded %d bytes during download", MAX_IMAGE_BYTES)
+            return None, None, None
 
         filename = file_path.split("/")[-1] if "/" in file_path else file_path
         return image_bytes, content_type, filename
@@ -1626,7 +1635,12 @@ def _download_slack_file(file_info, bot_token):
     if mimetype not in ALLOWED_IMAGE_TYPES:
         return None, None, None
 
-    file_size = file_info.get("size", 0)
+    # Treat a missing size as a rejection rather than defaulting to 0; Slack
+    # omits `size` on some file objects and we must not trust that as "empty".
+    file_size = file_info.get("size")
+    if not isinstance(file_size, int) or file_size <= 0:
+        logger.warning("Slack file missing or invalid size; rejecting")
+        return None, None, None
     if file_size > MAX_IMAGE_BYTES:
         logger.warning("Slack file too large: %d bytes", file_size)
         return None, None, None
@@ -1642,7 +1656,12 @@ def _download_slack_file(file_info, bot_token):
             headers={"Authorization": f"Bearer {bot_token}"},
         )
         resp = urllib_request.urlopen(req, timeout=15)
-        image_bytes = resp.read()
+        # Bound the transfer itself so an understated or absent declared size
+        # cannot cause an unbounded read into Lambda memory.
+        image_bytes = resp.read(MAX_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            logger.warning("Slack image exceeded %d bytes during download", MAX_IMAGE_BYTES)
+            return None, None, None
         filename = file_info.get("name", "image")
         return image_bytes, mimetype, filename
     except Exception as e:
