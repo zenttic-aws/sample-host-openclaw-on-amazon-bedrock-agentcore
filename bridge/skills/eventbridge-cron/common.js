@@ -17,13 +17,57 @@ const EVENTBRIDGE_ROLE_ARN = process.env.EVENTBRIDGE_ROLE_ARN;
 const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
 
 /**
- * Validate that userId is present, not the default-user fallback,
- * and matches the expected channel_identifier namespace pattern.
+ * Assert that the user_id argv value refers to the container's own
+ * AgentCore Runtime owner, not another tenant's namespace.
  *
- * Also fails closed when USER_ID (the session's bound actorId, set by
- * agentcore-contract.js at container init) disagrees with the argv user_id
- * — the scoped credentials belong to the bound actor and accepting any
- * other namespace would be a cross-tenant request.
+ * Compares argv[2] against the actorId recorded in
+ * /tmp/current-identity.json (owner of this microVM) and, as a
+ * belt-and-braces check, against USER_ID in the process environment
+ * (also written by agentcore-contract.js from the same source).
+ *
+ * Throws on mismatch so the skill scripts cannot operate on another
+ * tenant's schedules even if a prompt-injected LLM supplies a victim
+ * namespace on the command line.
+ */
+function assertNamespaceOwner(userId) {
+  let identity;
+  try {
+    identity = JSON.parse(fs.readFileSync("/tmp/current-identity.json", "utf8"));
+  } catch (err) {
+    throw new Error(
+      "Cannot verify schedule namespace: current-identity.json is unavailable",
+    );
+  }
+  if (typeof identity.actorId !== "string" || !identity.actorId) {
+    throw new Error(
+      "Cannot verify schedule namespace: current-identity.json has no actorId",
+    );
+  }
+  const ownerUserId = identity.actorId.replace(/:/g, "_");
+  if (ownerUserId !== userId) {
+    throw new Error("Schedule namespace does not match the AgentCore Runtime owner");
+  }
+  // Defence in depth: USER_ID is forwarded into the skill process by
+  // agentcore-contract.js from the same identity source. If it is set it
+  // must agree with the identity file.
+  const envUserId = process.env.USER_ID;
+  if (envUserId && envUserId !== identity.actorId) {
+    throw new Error("Schedule namespace does not match the AgentCore Runtime owner");
+  }
+  return identity;
+}
+
+/**
+ * Validate that userId is present, not the default-user fallback,
+ * matches the expected channel_identifier namespace pattern, AND
+ * identifies the container's own AgentCore Runtime owner.
+ *
+ * The ownership check is unconditional: it runs for every skill
+ * script (list, delete, update, create) so the agent cannot operate on
+ * another tenant's schedules by passing a different namespace on the
+ * command line. It also fails closed when USER_ID (the session's bound
+ * actorId, set by agentcore-contract.js at container init) disagrees with
+ * the argv user_id.
  */
 function validateUserId(userId) {
   if (!userId) {
@@ -69,6 +113,34 @@ function validateUserId(userId) {
       process.exit(1);
     }
   }
+  // Unconditional ownership check — the cross-tenant hijack precondition
+  // is that argv[2] names a namespace other than this container's owner.
+  try {
+    assertNamespaceOwner(userId);
+  } catch (err) {
+    console.error(`Error: ${err.message}`);
+    process.exit(1);
+  }
+}
+
+/**
+ * Return the DynamoDB partition-key owner for CRON# records.
+ *
+ * CRON# records are stored under PK=USER#<INTERNAL_USER_ID>, which is
+ * the container's own authorized internal userId (set by
+ * agentcore-contract.js at container init). Deriving the key from the
+ * environment — not from argv — prevents a prompt-injected LLM from
+ * pivoting to another tenant's records by supplying a victim namespace
+ * on the command line.
+ */
+function resolveOwnerInternalUserId() {
+  const internalUserId = process.env.INTERNAL_USER_ID;
+  if (!internalUserId) {
+    throw new Error(
+      "INTERNAL_USER_ID environment variable is not set; cannot resolve schedule owner",
+    );
+  }
+  return internalUserId;
 }
 
 /**
@@ -427,6 +499,8 @@ module.exports = {
   MAX_SCHEDULES_PER_USER,
   cronMinuteMinInterval,
   validateUserId,
+  assertNamespaceOwner,
+  resolveOwnerInternalUserId,
   validateEnv,
   validateExpression,
   validateTimezone,
