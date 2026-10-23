@@ -160,6 +160,22 @@ let cronJobStoreInstance = null;
 // Late sub-agent announce relay (#148): forwards an announce run that finishes
 // after the turn that spawned the sub-agent has replied. One per activation.
 let lateAnnounces = null;
+// Delivery triples (channel|channelActorId|channelTarget) that at least one
+// turn passed assertBinding against during this activation. deliverLateAnnounce
+// uses this as the ownership check on channelTarget: the lifecycle binding
+// forces one userId/actorId per activation, but it does not carry the chat
+// target, so a late announce destination has to be matched against the set of
+// targets this bound owner has actually used (#148 CWE-359 fix). Reset on
+// cleanup / activation reset together with `lateAnnounces`.
+let knownDeliveryRoutes = new Set();
+function routeTripleKey(route) {
+  if (!route || typeof route !== "object") return null;
+  const channel = typeof route.channel === "string" ? route.channel : "";
+  const actorId = typeof route.channelActorId === "string" ? route.channelActorId : "";
+  const target = typeof route.channelTarget === "string" ? route.channelTarget : "";
+  if (!channel || !actorId || !target) return null;
+  return `${channel}|${actorId}|${target}`;
+}
 let proxyModelOutcomeUnknown = false;
 const UNKNOWN_OUTCOME_RESPONSE = "The request outcome is unknown. It has not been automatically retried. Check any resulting changes before retrying.";
 const v2Lifecycle = createRuntimeLifecycle({
@@ -320,6 +336,7 @@ function assertUnboundResourcesAbsent(seedPrepared = false) {
 async function cleanupV2Resources() {
   lateAnnounces?.close();
   lateAnnounces = null;
+  knownDeliveryRoutes = new Set();
   const sdkStop = proxySdkOwner?.stop();
   sdkStop?.catch(() => {});
   retireBrowserStartOwner().catch(() => {});
@@ -2116,6 +2133,7 @@ function createTelegramStreamer(chatId) {
 function startLateAnnounceRelay() {
   lateAnnounces?.close();
   lateAnnounces = null;
+  knownDeliveryRoutes = new Set();
   try {
     let watcher = null;
     const relay = createLateAnnounceRelay({
@@ -2135,11 +2153,13 @@ function startLateAnnounceRelay() {
 }
 
 /**
- * Send a late announce to the chat of the session owner's latest turn.
- * Only Telegram for now (the token is already in-process); the route must
- * belong to the runtime's current user binding. Uses the streamer's send
- * path for a reply nobody else will deliver: plain text split under the
- * Telegram limit.
+ * Send a late announce to the chat of the TURN THAT SPAWNED the sub-agent
+ * (the route the relay captured when it first observed the sub-agent's
+ * session), not to the latest turn's chat. Only Telegram for now (the token
+ * is already in-process); the delivery triple (channel, channelActorId,
+ * channelTarget) must be one the current user binding has already used
+ * during this activation. Uses the streamer's send path for a reply nobody
+ * else will deliver: plain text split under the Telegram limit.
  */
 async function deliverLateAnnounce(text, route) {
   if (route.channel !== "telegram" || !route.channelActorId || !route.channelTarget || !TELEGRAM_BOT_TOKEN) {
@@ -2148,7 +2168,33 @@ async function deliverLateAnnounce(text, route) {
     return;
   }
   const binding = v2Lifecycle.snapshot().binding;
-  if (!binding || binding.actorId !== route.actorId) {
+  if (!binding) {
+    console.warn("[contract] Late sub-agent announce not delivered: no active user binding");
+    return;
+  }
+  // Ownership check on the full delivery triple (channel, channelActorId,
+  // channelTarget). The lifecycle binding only carries userId/actorId/
+  // runtimeSessionId/routingGeneration, so comparing route.actorId against
+  // binding.actorId is tautological under assertBinding and does not stop a
+  // sub-agent answer produced for a private chat from being posted into a
+  // group chat the same user spoke in afterwards (#148 CWE-359). Require
+  // that the destination triple be one this activation's turns have already
+  // validated against the user binding.
+  const tripleKey = routeTripleKey(route);
+  if (!tripleKey || !knownDeliveryRoutes.has(tripleKey)) {
+    console.warn(
+      "[contract] Late sub-agent announce not delivered: delivery triple not owned by the current binding (channel=%s, channelActorId=%s, channelTarget=%s)",
+      String(route.channel || "unknown"),
+      String(route.channelActorId || ""),
+      String(route.channelTarget || ""),
+    );
+    return;
+  }
+  // Backwards-compatible invariant: the lifecycle binding forces one actorId
+  // per activation, so an owned triple can never belong to a different user.
+  // Keep the comparison explicit (binding.actorId !== route.actorId) as a
+  // last-resort sanity check in case the binding is mutated unexpectedly.
+  if (binding.actorId !== route.actorId) {
     console.warn("[contract] Late sub-agent announce not delivered: route does not match the user binding");
     return;
   }
@@ -2344,6 +2390,18 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival,
         actorId: turn.actorId, channel: turn.channel,
         channelActorId: turn.channelActorId, channelTarget: turn.channelTarget,
       }) ?? null;
+      // Record this turn's full delivery triple as an owned route for the
+      // current binding. assertBinding has already run, so the triple is
+      // associated with the bound user. deliverLateAnnounce uses this set
+      // as the ownership check on channelTarget (#148 CWE-359 fix).
+      {
+        const ownedKey = routeTripleKey({
+          channel: turn.channel,
+          channelActorId: turn.channelActorId,
+          channelTarget: turn.channelTarget,
+        });
+        if (ownedKey) knownDeliveryRoutes.add(ownedKey);
+      }
       let streamer = null;
       if (action === "chat" && TELEGRAM_BOT_TOKEN && turn.channel === "telegram" &&
           turn.channelActorId && turn.channelTarget) {

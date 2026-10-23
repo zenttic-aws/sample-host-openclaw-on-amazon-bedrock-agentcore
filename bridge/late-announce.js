@@ -20,12 +20,19 @@
  *   If the turn returned that run itself (a sessions_yield successor), it is
  *   dropped.
  * - Each announce run id is handled at most once per container.
- * - The destination is the route of the latest turn, which the contract has
- *   already checked against the runtime's user binding.
+ * - The destination is the route that was active when the sub-agent that
+ *   produced this announce was first observed (its "originating" turn),
+ *   NOT the latest turn's route. The announce runId embeds the sub-agent
+ *   sessionKey (`announce:v1:<sub-agent sessionKey>:<child run id>`); the
+ *   relay records that sessionKey -> route when it first sees any event for
+ *   the sub-agent session, so a later turn in a different conversation can
+ *   never redirect the delivery. deliverLateAnnounce performs an ownership
+ *   check on the full triple (channel, channelActorId, channelTarget).
  */
 const { isSubagentSessionKey } = require("./chat-run-filter");
 
 const ANNOUNCE_RUN_PREFIX = "announce:";
+const ANNOUNCE_RUN_ID_PREFIX = "announce:v1:";
 const SILENT_REPLIES = new Set(["NO_REPLY", "HEARTBEAT_OK"]);
 const DEFAULT_SETTLE_MS = 5000;
 const DEFAULT_MAX_REMEMBERED = 500;
@@ -33,6 +40,21 @@ const DEFAULT_MAX_REMEMBERED = 500;
 /** Mirrors upstream isAnnounceRunId (announce-idempotency.ts). */
 function isAnnounceRunId(runId) {
   return typeof runId === "string" && runId.startsWith(ANNOUNCE_RUN_PREFIX);
+}
+
+/**
+ * Extract the sub-agent sessionKey embedded in an announce run id. Mirrors
+ * upstream buildAnnounceIdempotencyKey (announce-idempotency.ts):
+ * `announce:v1:<sub-agent sessionKey>:<child run id>`. Returns null if the
+ * run id does not match that shape.
+ */
+function parseAnnounceSubagentSessionKey(runId) {
+  if (typeof runId !== "string" || !runId.startsWith(ANNOUNCE_RUN_ID_PREFIX)) return null;
+  const rest = runId.slice(ANNOUNCE_RUN_ID_PREFIX.length);
+  const lastColon = rest.lastIndexOf(":");
+  if (lastColon <= 0 || lastColon === rest.length - 1) return null;
+  const sessionKey = rest.slice(0, lastColon);
+  return sessionKey || null;
 }
 
 /** openclaw's silent reply tokens mean the run chose not to say anything. */
@@ -54,6 +76,33 @@ function boundedSet(limit) {
   };
 }
 
+/** A Map that forgets its oldest entries past `limit`. */
+function boundedMap(limit) {
+  const items = new Map();
+  return {
+    has: (key) => items.has(key),
+    get: (key) => items.get(key),
+    set: (key, value) => {
+      items.delete(key);
+      items.set(key, value);
+      while (items.size > limit) items.delete(items.keys().next().value);
+    },
+  };
+}
+
+/**
+ * True if two routes point at the same delivery triple (channel +
+ * channelActorId + channelTarget). actorId is deliberately not part of this
+ * comparison: the lifecycle binding already forces a single actorId, so it
+ * does not distinguish conversations within one bound user.
+ */
+function sameConversation(a, b) {
+  if (!a || !b) return false;
+  return a.channel === b.channel &&
+    (a.channelActorId ?? null) === (b.channelActorId ?? null) &&
+    (a.channelTarget ?? null) === (b.channelTarget ?? null);
+}
+
 function bufferText(payload) {
   const content = payload?.message?.content;
   if (typeof content === "string") return content;
@@ -72,6 +121,11 @@ function createLateAnnounceRelay({
 }) {
   const seen = boundedSet(maxRemembered); // announce runs already queued or handled
   const claimed = boundedSet(maxRemembered); // runs some bridge turn returned
+  // Sub-agent sessionKey -> route of the turn that was active when we first
+  // observed any event for that sub-agent session. The announce runId embeds
+  // that sessionKey, so we can resolve the originating turn's route even if
+  // a later turn (in a different conversation) overwrites the current route.
+  const subagentRoutes = boundedMap(maxRemembered);
   const pending = [];
   const activeTurns = new Set();
   let route = null;
@@ -91,9 +145,16 @@ function createLateAnnounceRelay({
     while (pending.length && !closed && activeTurns.size === 0) {
       const entry = pending.shift();
       if (claimed.has(entry.runId)) continue;
-      const target = route;
+      // Deliver to the route that was active when the sub-agent that produced
+      // this announce was first observed, NOT the latest turn's route. This
+      // prevents a later turn in a different conversation from redirecting a
+      // private sub-agent answer into a group chat (CWE-359).
+      const target = entry.originatingRoute;
       if (!target) {
-        log?.warn?.("[late-announce] No delivery route yet; announce run not delivered");
+        log?.warn?.(
+          "[late-announce] No originating route for announce run; not delivered (runId: %s)",
+          entry.runId,
+        );
         continue;
       }
       try {
@@ -147,13 +208,32 @@ function createLateAnnounceRelay({
 
   const onChatEvent = (payload) => {
     if (closed || !payload || typeof payload !== "object") return;
-    if (payload.state !== "final" || payload.yielded === true) return;
     const { runId, sessionKey } = payload;
+    const subagent = (typeof sessionKey === "string" && isSubagentSessionKey(sessionKey)) ||
+      Boolean(payload.spawnedBy);
+    // Record the originating turn's route for every sub-agent session we see
+    // events for. First sighting wins so a later turn's route cannot overwrite
+    // the mapping. `route` is captured only when a turn is active, i.e. a
+    // route that the contract's assertBinding has already validated for this
+    // user binding. We cannot use payload.spawnedBy as a map key because it is
+    // the parent sessionKey (main), not the sub-agent's.
+    if (subagent && typeof sessionKey === "string" && sessionKey && route &&
+        activeTurns.size > 0 && !subagentRoutes.has(sessionKey)) {
+      subagentRoutes.set(sessionKey, route);
+    }
+    if (payload.state !== "final" || payload.yielded === true) return;
     if (!isAnnounceRunId(runId) || typeof sessionKey !== "string" || !sessionKey) return;
-    if (isSubagentSessionKey(sessionKey) || payload.spawnedBy) return;
+    if (subagent) return;
     if (seen.has(runId) || claimed.has(runId)) return;
     seen.add(runId);
-    pending.push({ runId, sessionKey, buffer: bufferText(payload) });
+    // Resolve the sub-agent sessionKey embedded in the announce run id and
+    // look up the originating turn's route. If we never saw a sub-agent event
+    // (e.g. the sub-agent predates this activation or events were dropped),
+    // originatingRoute is null and the drain will skip delivery rather than
+    // guess the destination.
+    const subagentKey = parseAnnounceSubagentSessionKey(runId);
+    const originatingRoute = subagentKey ? (subagentRoutes.get(subagentKey) ?? null) : null;
+    pending.push({ runId, sessionKey, buffer: bufferText(payload), originatingRoute });
     schedule();
   };
 
@@ -176,4 +256,12 @@ function createLateAnnounceRelay({
   return { beginTurn, onChatEvent, idle, close };
 }
 
-module.exports = { createLateAnnounceRelay, isAnnounceRunId, isSilentReply, ANNOUNCE_RUN_PREFIX };
+module.exports = {
+  createLateAnnounceRelay,
+  isAnnounceRunId,
+  parseAnnounceSubagentSessionKey,
+  isSilentReply,
+  sameConversation,
+  ANNOUNCE_RUN_PREFIX,
+  ANNOUNCE_RUN_ID_PREFIX,
+};
