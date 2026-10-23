@@ -112,10 +112,20 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
 
   // Build a minimal session policy that fits within the 2048-byte AWS packed limit.
   // The execution role (attached to the runtime) provides the broad permissions.
-  // This session policy only RESTRICTS to the user's namespace — it cannot grant
-  // permissions the role doesn't have. So we only need S3 namespace scoping here.
-  // DynamoDB/Scheduler/SecretsManager scoping is enforced at the application level
-  // (skill scripts validate namespace before every operation).
+  // This session policy only RESTRICTS — it cannot grant permissions the role
+  // doesn't have. We scope S3 and Secrets Manager to the caller's namespace so
+  // a compromised agent (prompt injection, user-supplied skill arguments) cannot
+  // reach another tenant's data even if it bypasses the application-level checks.
+  //
+  // Secrets Manager CRUD actions are scoped to
+  //   arn:aws:secretsmanager:<region>:<account>:secret:openclaw/user/<namespace>/*
+  // which matches the layout used by bridge/skills/api-keys/*. ListSecrets does
+  // NOT support resource-level restrictions (AWS API limitation), so it stays
+  // wildcard in its own statement; the skill filters results by namespace prefix.
+  const secretsResourceArn = (region && account)
+    ? `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`
+    : "*";
+
   const policy = {
     Version: "2012-10-17",
     Statement: [
@@ -131,18 +141,35 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
         Action: "s3:ListBucket",
         Resource: `arn:aws:s3:::${bucket}`,
       },
-      // Scheduler, DynamoDB, SecretsManager, KMS, PassRole — allowed by the
-      // execution role; no further restriction needed in the session policy.
-      // Application-level namespace enforcement in skill scripts provides isolation.
+      // Scheduler, DynamoDB, KMS, PassRole — allowed by the execution role;
+      // application-level checks in skill scripts enforce namespace isolation.
+      // Secrets Manager CRUD is namespace-scoped below (defence in depth).
       {
         Effect: "Allow",
         Action: [
           "scheduler:*",
           "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
           "kms:Decrypt", "kms:GenerateDataKey",
-          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
           "iam:PassRole",
         ],
+        Resource: "*",
+      },
+      {
+        Effect: "Allow",
+        Action: [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:CreateSecret",
+          "secretsmanager:DeleteSecret",
+          "secretsmanager:TagResource",
+        ],
+        Resource: secretsResourceArn,
+      },
+      {
+        Effect: "Allow",
+        // ListSecrets does not support resource-level restrictions. The caller
+        // filters by name prefix (openclaw/user/<namespace>/) in skill scripts.
+        Action: "secretsmanager:ListSecrets",
         Resource: "*",
       },
     ],

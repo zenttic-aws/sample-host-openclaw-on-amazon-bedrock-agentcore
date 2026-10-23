@@ -30,7 +30,7 @@ describe("buildSessionPolicy", () => {
     const parsed = JSON.parse(policy);
     assert.equal(parsed.Version, "2012-10-17");
     assert.ok(Array.isArray(parsed.Statement));
-    assert.equal(parsed.Statement.length, 3, "should have 3 statements (S3 object, S3 list, services)");
+    assert.equal(parsed.Statement.length, 5, "should have 5 statements (S3 object, S3 list, services, SM CRUD scoped, SM List wildcard)");
   });
 
   it("S3 object actions scoped to namespace/* only", () => {
@@ -584,7 +584,7 @@ describe("buildSessionPolicy Secrets Manager", () => {
     ({ buildSessionPolicy } = require("./scoped-credentials"));
   });
 
-  it("includes Secrets Manager actions always in statement 1 with Resource *", () => {
+  it("scopes Secrets Manager CRUD to openclaw/user/<namespace>/* when region/account are known", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -596,14 +596,23 @@ describe("buildSessionPolicy Secrets Manager", () => {
     const parsed = JSON.parse(policy);
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt, "Secrets Manager actions should exist");
-    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
+    assert.equal(
+      smStmt.Resource,
+      "arn:aws:secretsmanager:us-west-2:123456789012:secret:openclaw/user/telegram_12345/*",
+      "Secrets Manager CRUD should be scoped to the caller's namespace",
+    );
     assert.ok(smStmt.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt.Action.includes("secretsmanager:CreateSecret"));
     assert.ok(smStmt.Action.includes("secretsmanager:DeleteSecret"));
+    assert.ok(smStmt.Action.includes("secretsmanager:PutSecretValue"));
     assert.ok(smStmt.Action.includes("secretsmanager:TagResource"), "TagResource needed for api-keys skill");
+    // Cross-tenant protection: CRUD statement must NOT include ListSecrets
+    // (which cannot be resource-scoped) and must NOT be wildcard.
+    assert.ok(!smStmt.Action.includes("secretsmanager:ListSecrets"), "ListSecrets lives in its own wildcard statement");
+    assert.notEqual(smStmt.Resource, "*", "CRUD must not grant Resource: *");
   });
 
-  it("includes ListSecrets in the Secrets Manager statement with wildcard resource", () => {
+  it("keeps ListSecrets in its own wildcard statement (AWS does not support resource-level ListSecrets)", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -612,13 +621,16 @@ describe("buildSessionPolicy Secrets Manager", () => {
     });
 
     const parsed = JSON.parse(policy);
-    const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:ListSecrets"));
-    assert.ok(smStmt, "Secrets Manager statement with ListSecrets should exist");
-    const resources = Array.isArray(smStmt.Resource) ? smStmt.Resource : [smStmt.Resource];
-    assert.ok(resources.includes("*"), "Resource array should include wildcard for ListSecrets");
+    const listStmt = parsed.Statement.find((s) => {
+      const action = Array.isArray(s.Action) ? s.Action : [s.Action];
+      return action.includes("secretsmanager:ListSecrets");
+    });
+    assert.ok(listStmt, "ListSecrets statement should exist");
+    const resources = Array.isArray(listStmt.Resource) ? listStmt.Resource : [listStmt.Resource];
+    assert.ok(resources.includes("*"), "ListSecrets must stay wildcard — AWS does not allow resource-level restriction");
   });
 
-  it("includes Secrets Manager actions even when region/account not provided", () => {
+  it("falls back to wildcard Secrets Manager resource when region/account are missing", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -626,11 +638,15 @@ describe("buildSessionPolicy Secrets Manager", () => {
 
     const parsed = JSON.parse(policy);
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
-    assert.ok(smStmt, "Secrets Manager actions should exist even without region/account");
-    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
+    assert.ok(smStmt, "Secrets Manager CRUD statement should still exist without region/account");
+    // Without region/account we cannot build an ARN; the execution role itself
+    // still restricts CRUD to arn:aws:secretsmanager:...:secret:openclaw/user/*,
+    // so wildcard here is safe at the IAM layer. The skill-level identity check
+    // in validateUserId remains the defence in that case.
+    assert.equal(smStmt.Resource, "*", "Fallback is wildcard when ARN cannot be built");
   });
 
-  it("Secrets Manager resource is always wildcard regardless of namespace", () => {
+  it("Secrets Manager CRUD resource reflects the caller's namespace", () => {
     const policy = buildSessionPolicy({
       bucket: "test-bucket",
       namespace: "slack_abc-def",
@@ -640,8 +656,11 @@ describe("buildSessionPolicy Secrets Manager", () => {
 
     const parsed = JSON.parse(policy);
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
-    assert.ok(smStmt, "Secrets Manager actions should exist");
-    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
+    assert.ok(smStmt, "Secrets Manager CRUD statement should exist");
+    assert.equal(
+      smStmt.Resource,
+      "arn:aws:secretsmanager:ap-southeast-2:999888777666:secret:openclaw/user/slack_abc-def/*",
+    );
   });
 });
 
