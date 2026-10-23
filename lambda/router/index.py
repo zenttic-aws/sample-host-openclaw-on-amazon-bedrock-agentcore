@@ -231,6 +231,20 @@ def _get_feishu_tenant_token():
 # Webhook validation helpers
 # ---------------------------------------------------------------------------
 
+# Format whitelists for signature/token header values. Validating these before
+# calling hmac.compare_digest avoids a TypeError when a non-ASCII value is
+# supplied (hmac.compare_digest only accepts ASCII strings) and mirrors the
+# format checks already performed by discord_channel/line_channel.
+#
+# Telegram: X-Telegram-Bot-Api-Secret-Token is 1–256 chars from [A-Za-z0-9_-]
+# (https://core.telegram.org/bots/api#setwebhook).
+_TELEGRAM_SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{1,256}$")
+# Slack: X-Slack-Signature is "v0=" followed by 64 lowercase hex characters.
+_SLACK_SIGNATURE_RE = re.compile(r"^v0=[0-9a-f]{64}$")
+# Feishu/Lark: X-Lark-Signature is 64 lowercase hex characters (SHA-256).
+_FEISHU_SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
 
@@ -244,6 +258,13 @@ def validate_telegram_webhook(headers):
     token = headers.get("x-telegram-bot-api-secret-token", "")
     if not token:
         logger.warning("Telegram webhook missing X-Telegram-Bot-Api-Secret-Token header")
+        return False
+
+    # Reject malformed header values before comparing — hmac.compare_digest
+    # raises TypeError on non-ASCII strings, which would otherwise escape as
+    # an uncaught exception.
+    if not isinstance(token, str) or not _TELEGRAM_SECRET_TOKEN_RE.match(token):
+        logger.warning("Telegram webhook secret token has invalid format")
         return False
 
     if not hmac.compare_digest(token, webhook_secret):
@@ -271,6 +292,12 @@ def validate_slack_webhook(headers, body):
 
     if not timestamp or not signature:
         logger.warning("Slack webhook missing timestamp or signature headers")
+        return False
+
+    # Reject malformed signature headers before comparing — hmac.compare_digest
+    # raises TypeError on non-ASCII strings.
+    if not isinstance(signature, str) or not _SLACK_SIGNATURE_RE.match(signature):
+        logger.warning("Slack webhook signature has invalid format")
         return False
 
     # Reject requests older than 5 minutes to prevent replay attacks
@@ -314,6 +341,12 @@ def validate_feishu_webhook(headers, body_bytes):
 
     if not timestamp or not nonce or not signature:
         logger.warning("Feishu webhook missing signature headers")
+        return False
+
+    # Reject malformed signature headers before comparing — hmac.compare_digest
+    # raises TypeError on non-ASCII strings.
+    if not isinstance(signature, str) or not _FEISHU_SIGNATURE_RE.match(signature):
+        logger.warning("Feishu webhook signature has invalid format")
         return False
 
     body_b = body_bytes if isinstance(body_bytes, bytes) else body_bytes.encode("utf-8")
@@ -2560,131 +2593,148 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
-    request_context = event.get("requestContext", {})
-    http_info = request_context.get("http", {})
-    method = http_info.get("method", "")
-    path = http_info.get("path", event.get("rawPath", ""))
+    try:
+        request_context = event.get("requestContext", {})
+        http_info = request_context.get("http", {})
+        method = http_info.get("method", "")
+        path = http_info.get("path", event.get("rawPath", ""))
 
-    # Health check
-    if method == "GET" and path == "/health":
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"status": "ok", "service": "openclaw-router"}),
-        }
+        # Health check
+        if method == "GET" and path == "/health":
+            return {
+                "statusCode": 200,
+                "body": json.dumps({"status": "ok", "service": "openclaw-router"}),
+            }
 
-    if method == "GET" and path.endswith("/webhook/whatsapp"):
-        return _whatsapp_verify_subscription(event)
+        if method == "GET" and path.endswith("/webhook/whatsapp"):
+            return _whatsapp_verify_subscription(event)
 
-    if method != "POST":
-        return {"statusCode": 405, "body": "Method not allowed"}
+        if method != "POST":
+            return {"statusCode": 405, "body": "Method not allowed"}
 
-    body = event.get("body", "")
-    if event.get("isBase64Encoded"):
-        import base64
-        body = base64.b64decode(body).decode("utf-8")
+        body = event.get("body", "")
+        if event.get("isBase64Encoded"):
+            import base64
+            import binascii
+            # Attacker-chosen bodies can be invalid base64 (bad padding) or
+            # decode to bytes that are not valid UTF-8. Contain those failures
+            # as a clean 400 rather than letting the invocation crash with an
+            # uncaught UnicodeDecodeError/binascii.Error/ValueError.
+            try:
+                body = base64.b64decode(body).decode("utf-8")
+            except (binascii.Error, ValueError, UnicodeDecodeError):
+                logger.warning("Rejected request with undecodable base64/UTF-8 body")
+                return {"statusCode": 400, "body": "Bad request"}
 
-    headers = event.get("headers", {})
+        headers = event.get("headers", {})
 
-    # Determine channel from path
-    if path.endswith("/webhook/telegram"):
-        # Validate webhook secret before processing
-        if not validate_telegram_webhook(headers):
-            logger.warning("Telegram webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
+        # Determine channel from path
+        if path.endswith("/webhook/telegram"):
+            # Validate webhook secret before processing
+            if not validate_telegram_webhook(headers):
+                logger.warning("Telegram webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+                return {"statusCode": 401, "body": "Unauthorized"}
 
-        # Self-invoke async and return immediately
-        _self_invoke_async("telegram", body, headers)
-        return {"statusCode": 200, "body": "ok"}
-
-    elif path.endswith("/webhook/slack"):
-        # Slack url_verification — only allowed during initial setup
-        try:
-            event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
-                if os.environ.get("SLACK_VERIFIED") == "true":
-                    logger.warning("Slack url_verification rejected — already verified")
-                    return {"statusCode": 403, "body": "Already verified"}
-                # Validate challenge format before echoing (prevent injection)
-                challenge = str(event_data.get("challenge", ""))
-                if not re.match(r'^[a-zA-Z0-9_\-\.]{1,100}$', challenge):
-                    return {"statusCode": 400, "body": "Invalid challenge format"}
-                return {
-                    "statusCode": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({"challenge": challenge}),
-                }
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        # Validate Slack request signature before processing
-        if not validate_slack_webhook(headers, body):
-            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-
-        # Ignore Slack retries
-        if headers.get("x-slack-retry-num"):
+            # Self-invoke async and return immediately
+            _self_invoke_async("telegram", body, headers)
             return {"statusCode": 200, "body": "ok"}
 
-        # Self-invoke async for actual processing
-        _self_invoke_async("slack", body, headers)
-        return {"statusCode": 200, "body": "ok"}
+        elif path.endswith("/webhook/slack"):
+            # Slack url_verification — only allowed during initial setup
+            try:
+                event_data = json.loads(body) if isinstance(body, str) else body
+                if event_data.get("type") == "url_verification":
+                    if os.environ.get("SLACK_VERIFIED") == "true":
+                        logger.warning("Slack url_verification rejected — already verified")
+                        return {"statusCode": 403, "body": "Already verified"}
+                    # Validate challenge format before echoing (prevent injection)
+                    challenge = str(event_data.get("challenge", ""))
+                    if not re.match(r'^[a-zA-Z0-9_\-\.]{1,100}$', challenge):
+                        return {"statusCode": 400, "body": "Invalid challenge format"}
+                    return {
+                        "statusCode": 200,
+                        "headers": {"Content-Type": "application/json"},
+                        "body": json.dumps({"challenge": challenge}),
+                    }
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-    elif path.endswith("/webhook/feishu"):
-        # Feishu URL verification challenge — must respond synchronously
-        try:
-            event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
-                challenge = str(event_data.get("challenge", ""))
-                if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
-                    return {"statusCode": 400, "body": "Invalid challenge format"}
-                return {
-                    "statusCode": 200,
-                    "headers": {"Content-Type": "application/json"},
-                    "body": json.dumps({"challenge": challenge}),
-                }
-        except (json.JSONDecodeError, TypeError):
-            pass
+            # Validate Slack request signature before processing
+            if not validate_slack_webhook(headers, body):
+                logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+                return {"statusCode": 401, "body": "Unauthorized"}
 
-        # Validate Feishu signature
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
-        if not validate_feishu_webhook(headers, body_bytes):
-            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
+            # Ignore Slack retries
+            if headers.get("x-slack-retry-num"):
+                return {"statusCode": 200, "body": "ok"}
 
-        # Self-invoke async for actual processing
-        _self_invoke_async("feishu", body, headers)
-        return {"statusCode": 200, "body": "ok"}
+            # Self-invoke async for actual processing
+            _self_invoke_async("slack", body, headers)
+            return {"statusCode": 200, "body": "ok"}
 
-    elif path.endswith("/webhook/whatsapp"):
-        # Disabled (404) until the secret holds a complete JSON config.
-        config = _get_whatsapp_config()
-        if config is None:
-            return {"statusCode": 404, "body": "Not found"}
-        # Verify the signature over the raw body before parsing anything.
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
-        if not whatsapp.verify_signature(headers, body_bytes, config["appSecret"]):
-            logger.warning("WhatsApp webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-        _self_invoke_async("whatsapp", body, {})
-        return {"statusCode": 200, "body": "ok"}
+        elif path.endswith("/webhook/feishu"):
+            # Feishu URL verification challenge — must respond synchronously
+            try:
+                event_data = json.loads(body) if isinstance(body, str) else body
+                if event_data.get("type") == "url_verification":
+                    challenge = str(event_data.get("challenge", ""))
+                    if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
+                        return {"statusCode": 400, "body": "Invalid challenge format"}
+                    return {
+                        "statusCode": 200,
+                        "headers": {"Content-Type": "application/json"},
+                        "body": json.dumps({"challenge": challenge}),
+                    }
+            except (json.JSONDecodeError, TypeError):
+                pass
 
-    elif path.endswith("/webhook/discord"):
-        return _discord_entry(headers, body, http_info)
+            # Validate Feishu signature
+            body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+            if not validate_feishu_webhook(headers, body_bytes):
+                logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+                return {"statusCode": 401, "body": "Unauthorized"}
 
-    elif path.endswith("/webhook/line"):
-        # Disabled (404) until the secret holds a complete JSON config.
-        config = _get_line_config()
-        if config is None:
-            return {"statusCode": 404, "body": "Not found"}
-        # Verify the signature over the raw body before parsing anything.
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
-        if not line_channel.verify_signature(headers, body_bytes, config["channelSecret"]):
-            logger.warning("LINE webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-        _self_invoke_async("line", body, {})
-        return {"statusCode": 200, "body": "ok"}
+            # Self-invoke async for actual processing
+            _self_invoke_async("feishu", body, headers)
+            return {"statusCode": 200, "body": "ok"}
 
-    return {"statusCode": 404, "body": "Not found"}
+        elif path.endswith("/webhook/whatsapp"):
+            # Disabled (404) until the secret holds a complete JSON config.
+            config = _get_whatsapp_config()
+            if config is None:
+                return {"statusCode": 404, "body": "Not found"}
+            # Verify the signature over the raw body before parsing anything.
+            body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+            if not whatsapp.verify_signature(headers, body_bytes, config["appSecret"]):
+                logger.warning("WhatsApp webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+                return {"statusCode": 401, "body": "Unauthorized"}
+            _self_invoke_async("whatsapp", body, {})
+            return {"statusCode": 200, "body": "ok"}
+
+        elif path.endswith("/webhook/discord"):
+            return _discord_entry(headers, body, http_info)
+
+        elif path.endswith("/webhook/line"):
+            # Disabled (404) until the secret holds a complete JSON config.
+            config = _get_line_config()
+            if config is None:
+                return {"statusCode": 404, "body": "Not found"}
+            # Verify the signature over the raw body before parsing anything.
+            body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
+            if not line_channel.verify_signature(headers, body_bytes, config["channelSecret"]):
+                logger.warning("LINE webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+                return {"statusCode": 401, "body": "Unauthorized"}
+            _self_invoke_async("line", body, {})
+            return {"statusCode": 200, "body": "ok"}
+
+        return {"statusCode": 404, "body": "Not found"}
+    except Exception:
+        # Top-level containment: no unexpected exception from the
+        # pre-authentication code path should escape the Lambda entry point
+        # and surface as an API Gateway 5xx. Log with traceback for operators
+        # and return a generic 500 to the caller.
+        logger.exception("Unhandled exception in router handler")
+        return {"statusCode": 500, "body": "Internal server error"}
 
 
 def _self_invoke_async(channel, body, headers):
