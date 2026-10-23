@@ -232,6 +232,28 @@ class TestExtractTextFromContentBlocks(unittest.TestCase):
         )
         self.assertEqual(result, "Here is the answer.\n\n")
 
+    def test_pathological_quadratic_payload_is_bounded(self):
+        """Many '[{' tokens must not trigger a quadratic rescan (CWE-407).
+
+        A model (or injected tool/web result) can emit tens of thousands of
+        '[{' candidates. The repair logic must stay close to O(n) in the
+        input length and must finish well under the Lambda timeout.
+        """
+        import time as _time
+        # Oversized input bypasses repair entirely and must be fast.
+        oversized = '[{"type":0}' * 45454 + "]"
+        start = _time.monotonic()
+        result = index._extract_text_from_content_blocks(oversized)
+        elapsed = _time.monotonic() - start
+        self.assertEqual(result, oversized)
+        self.assertLess(elapsed, 1.0, f"oversize bypass too slow: {elapsed:.3f}s")
+        # Below the oversize cap, repair still runs but stays bounded.
+        medium = '[{"type":0}' * 4000 + "]"
+        start = _time.monotonic()
+        index._extract_text_from_content_blocks(medium)
+        elapsed = _time.monotonic() - start
+        self.assertLess(elapsed, 2.0, f"44KB input took {elapsed:.3f}s")
+
 
 if __name__ == "__main__":
     unittest.main()

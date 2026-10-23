@@ -20,6 +20,7 @@ from aws_cdk import (
     aws_kms as kms,
     aws_lambda as _lambda,
     aws_logs as logs,
+    aws_sqs as sqs,
 )
 import cdk_nag
 import json
@@ -99,6 +100,25 @@ class RouterStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
+        # --- Dead-letter queue for failed async self-invocations ---
+        # The Router self-invokes asynchronously (InvocationType="Event") to
+        # process webhooks past the API Gateway 30 s cap. Lambda's default
+        # async retry policy would re-run a failed/timed-out event twice,
+        # tripling the burned CPU and re-invoking AgentCore (a paid turn) on
+        # a payload that already failed. Pair retry_attempts=0 with a DLQ so
+        # the failing event is captured for inspection instead of being
+        # dropped silently.
+        router_dlq_key = kms.Key.from_key_arn(self, "RouterDlqCmk", cmk_arn)
+        self.router_dlq = sqs.Queue(
+            self,
+            "RouterAsyncDlq",
+            queue_name=namer.name("openclaw-router-async-dlq"),
+            encryption=sqs.QueueEncryption.KMS,
+            encryption_master_key=router_dlq_key,
+            retention_period=Duration.days(14),
+            enforce_ssl=True,
+        )
+
         # --- Lambda Function ---
         self.router_fn = _lambda.Function(
             self,
@@ -114,6 +134,14 @@ class RouterStack(Stack):
                 description="Shared per-user AgentCore Runtime route resolution and admission",
             )],
             timeout=Duration.seconds(lambda_timeout),
+            # Router handles webhooks via asynchronous self-invocation. Lambda's
+            # default two async retries would re-run a timed-out or crashed
+            # event (a fresh AgentCore turn + a fresh content-block scan each
+            # time), so disable them and capture the failing event in the DLQ
+            # instead. Mirrors stacks/cron_stack.py.
+            retry_attempts=0,
+            dead_letter_queue_enabled=True,
+            dead_letter_queue=self.router_dlq,
             memory_size=lambda_memory,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,

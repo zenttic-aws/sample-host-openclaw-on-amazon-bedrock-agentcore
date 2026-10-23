@@ -66,6 +66,21 @@ class TestCronExtractTextFromContentBlocks(unittest.TestCase):
         result = index._extract_text_from_content_blocks('\n\n[{"type":"text","text":"hello')
         self.assertNotIn("[{", result)
 
+    def test_pathological_quadratic_payload_is_bounded(self):
+        """Many '[{' tokens must not trigger a quadratic rescan (CWE-407)."""
+        import time as _time
+        oversized = '[{"type":0}' * 45454 + "]"
+        start = _time.monotonic()
+        result = index._extract_text_from_content_blocks(oversized)
+        elapsed = _time.monotonic() - start
+        self.assertEqual(result, oversized)
+        self.assertLess(elapsed, 1.0, f"oversize bypass too slow: {elapsed:.3f}s")
+        medium = '[{"type":0}' * 4000 + "]"
+        start = _time.monotonic()
+        index._extract_text_from_content_blocks(medium)
+        elapsed = _time.monotonic() - start
+        self.assertLess(elapsed, 2.0, f"44KB input took {elapsed:.3f}s")
+
 
 if __name__ == "__main__":
     unittest.main()
