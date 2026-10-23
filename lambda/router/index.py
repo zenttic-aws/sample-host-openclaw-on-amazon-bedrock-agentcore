@@ -2926,14 +2926,19 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     elif path.endswith("/webhook/slack"):
-        # Slack url_verification — only allowed during initial setup
+        # Validate Slack request signature BEFORE dispatching on the body.
+        # Slack signs url_verification requests too, so verifying first does
+        # not break the Request URL setup handshake and prevents an
+        # unauthenticated caller from echoing an attacker-chosen challenge.
+        if not validate_slack_webhook(headers, body):
+            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
+        # Slack url_verification — respond synchronously after signature check
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
-                if os.environ.get("SLACK_VERIFIED") == "true":
-                    logger.warning("Slack url_verification rejected — already verified")
-                    return {"statusCode": 403, "body": "Already verified"}
-                # Validate challenge format before echoing (prevent injection)
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
+                # Validate challenge format before echoing (defense in depth)
                 challenge = str(event_data.get("challenge", ""))
                 if not re.match(r'^[a-zA-Z0-9_\-\.]{1,100}$', challenge):
                     return {"statusCode": 400, "body": "Invalid challenge format"}
@@ -2945,11 +2950,6 @@ def handler(event, context):
         except (json.JSONDecodeError, TypeError):
             pass
 
-        # Validate Slack request signature before processing
-        if not validate_slack_webhook(headers, body):
-            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-
         # Ignore Slack retries
         if headers.get("x-slack-retry-num"):
             return {"statusCode": 200, "body": "ok"}
@@ -2959,10 +2959,23 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     elif path.endswith("/webhook/feishu"):
-        # Feishu URL verification challenge — must respond synchronously
+        # Validate Feishu signature BEFORE dispatching on the body. Once an
+        # Encrypt Key is configured, Feishu signs every event (including
+        # url_verification) and delivers url_verification encrypted inside an
+        # {"encrypt": "..."} envelope that is handled downstream in
+        # handle_feishu after decryption, so verifying first does not break
+        # a genuine setup flow.
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        if not validate_feishu_webhook(headers, body_bytes):
+            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
+        # Plaintext url_verification (only reachable with a valid signature);
+        # respond synchronously. Encrypted url_verification bodies are
+        # handled inside handle_feishu after decryption.
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
                 challenge = str(event_data.get("challenge", ""))
                 if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
                     return {"statusCode": 400, "body": "Invalid challenge format"}
@@ -2973,12 +2986,6 @@ def handler(event, context):
                 }
         except (json.JSONDecodeError, TypeError):
             pass
-
-        # Validate Feishu signature
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
-        if not validate_feishu_webhook(headers, body_bytes):
-            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
 
         # Self-invoke async for actual processing
         _self_invoke_async("feishu", body, headers)

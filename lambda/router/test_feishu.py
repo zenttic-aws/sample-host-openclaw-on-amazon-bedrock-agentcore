@@ -416,16 +416,29 @@ class TestDownloadFeishuImage(unittest.TestCase):
 class TestHandlerFeishuRouting(unittest.TestCase):
     """Tests for Feishu path routing in the Lambda handler."""
 
-    def test_feishu_challenge_routed(self):
-        """Feishu url_verification is handled synchronously (not async dispatched)."""
+    @patch.object(index, "validate_feishu_webhook", return_value=True)
+    def test_feishu_challenge_routed(self, _mock_validate):
+        """Feishu url_verification is handled synchronously (not async dispatched)
+        once the request signature has been verified."""
+        event = {
+            "requestContext": {"http": {"method": "POST", "path": "/webhook/feishu"}},
+            "body": json.dumps({"type": "url_verification", "challenge": "test123"}),
+            "headers": {"x-lark-request-timestamp": "123", "x-lark-request-nonce": "abc", "x-lark-signature": "sig"},
+        }
+        result = index.handler(event, None)
+        self.assertEqual(result["statusCode"], 200)
+        self.assertIn("test123", result["body"])
+
+    def test_feishu_challenge_without_signature_rejected(self):
+        """url_verification without a valid signature returns 401 (not an
+        attacker-controlled challenge echo)."""
         event = {
             "requestContext": {"http": {"method": "POST", "path": "/webhook/feishu"}},
             "body": json.dumps({"type": "url_verification", "challenge": "test123"}),
             "headers": {},
         }
         result = index.handler(event, None)
-        self.assertEqual(result["statusCode"], 200)
-        self.assertIn("test123", result["body"])
+        self.assertEqual(result["statusCode"], 401)
 
     @patch.object(index, "validate_feishu_webhook", return_value=False)
     def test_feishu_invalid_signature_rejected(self, _mock_validate):
