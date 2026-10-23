@@ -31,8 +31,13 @@ function validateUserId(userId) {
     );
     process.exit(1);
   }
+  // Body is capped at 37 chars so the full userId namespace stays within
+  // 46 characters — see buildScheduleName below (64-char EventBridge name
+  // limit minus the fixed `openclaw-` prefix and `-<8-hex-id>` suffix).
+  // Enforcing the cap at the identity edge prevents namespace truncation
+  // from making distinct tenants map to the same schedule name.
   const VALID_NAMESPACE =
-    /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,37}$/;
   if (!VALID_NAMESPACE.test(userId)) {
     console.error(
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,
@@ -156,17 +161,28 @@ function generateScheduleId() {
 
 /**
  * Build the EventBridge schedule name from userId and scheduleId.
- * Format: openclaw-{userId}-{scheduleId}
- * EventBridge schedule names have a 64-character limit.
+ * Format: openclaw-{userId}-{scheduleId} (<= 64 chars — the EventBridge limit).
+ *
+ * `validateUserId` already caps the userId at 46 characters so the short
+ * branch always applies for valid inputs. The digest branch is kept as a
+ * defence-in-depth fallback: if a longer value ever reaches this helper
+ * (older stored records, callers that bypass validateUserId), the name is
+ * still unique per full userId because the sha256 digest of the full value
+ * is embedded in the name instead of silently truncating.
  */
 function buildScheduleName(userId, scheduleId) {
+  const { createHash } = require("crypto");
   const prefix = "openclaw-";
   const suffix = `-${scheduleId}`;
   const maxUserIdLen = 64 - prefix.length - suffix.length;
-  const truncatedUserId = userId.length > maxUserIdLen
-    ? userId.slice(0, maxUserIdLen)
-    : userId;
-  return `${prefix}${truncatedUserId}${suffix}`;
+  if (userId.length <= maxUserIdLen) {
+    return `${prefix}${userId}${suffix}`;
+  }
+  const digest = createHash("sha256").update(userId).digest("hex").slice(0, 12);
+  const digestPart = `-${digest}`;
+  const room = maxUserIdLen - digestPart.length;
+  const head = room > 0 ? userId.slice(0, room) : "";
+  return `${prefix}${head}${digestPart}${suffix}`;
 }
 
 /**

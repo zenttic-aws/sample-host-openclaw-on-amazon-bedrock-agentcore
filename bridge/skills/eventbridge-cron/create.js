@@ -105,6 +105,11 @@ async function main() {
     await saveCronRecord(realUserId || userId, {
       scheduleId,
       scheduleName: scheduleName || `Schedule ${scheduleId}`,
+      // Persist the exact EventBridge name created here so update/delete
+      // bind to this object instead of recomputing a name from the user
+      // namespace at call time (preventing name-collision cross-tenant
+      // addressing if the derivation ever changes).
+      ebName: ebScheduleName,
       expression,
       timezone,
       message,

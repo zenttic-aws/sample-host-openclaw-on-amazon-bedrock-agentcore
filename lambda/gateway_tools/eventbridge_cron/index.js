@@ -65,11 +65,27 @@ function validateScheduleId(id) {
   return id;
 }
 
+// Build an EventBridge schedule name that is bounded by the service's
+// 64-character limit AND unique per full namespace. The identity layer
+// (lib/identity.js VALID_NAMESPACE) already caps namespaces at 46 chars so
+// the short branch always applies in production; the digest branch is a
+// defence-in-depth fallback that keeps the mapping injective if a longer
+// value ever reaches this function (e.g. CLI/skill reuse).
 function buildScheduleName(namespace, scheduleId) {
   const prefix = "openclaw-";
   const suffix = `-${scheduleId}`;
   const max = 64 - prefix.length - suffix.length;
-  return `${prefix}${namespace.length > max ? namespace.slice(0, max) : namespace}${suffix}`;
+  if (namespace.length <= max) {
+    return `${prefix}${namespace}${suffix}`;
+  }
+  // Collision-resistant form: keep a readable namespace prefix and append a
+  // sha256 digest of the full namespace so distinct namespaces that share a
+  // 46-character prefix map to distinct names.
+  const digest = crypto.createHash("sha256").update(namespace).digest("hex").slice(0, 12);
+  const digestPart = `-${digest}`;
+  const nsRoom = max - digestPart.length;
+  const nsPart = nsRoom > 0 ? namespace.slice(0, nsRoom) : "";
+  return `${prefix}${nsPart}${digestPart}${suffix}`;
 }
 
 function createHandler(deps = {}) {
@@ -139,6 +155,9 @@ function createHandler(deps = {}) {
       const scheduleId = newId();
       const ebName = buildScheduleName(identity.namespace, scheduleId);
       const displayName = scheduleName || `Schedule ${scheduleId}`;
+      // ebName is the sole addressing key for the EventBridge object; it is
+      // persisted below so update/delete bind to the exact name this caller
+      // created rather than a name recomputed from the namespace.
 
       await scheduler.send(
         new schedulerCmds.CreateScheduleCommand({
@@ -175,6 +194,7 @@ function createHandler(deps = {}) {
               SK: `CRON#${scheduleId}`,
               scheduleId,
               scheduleName: displayName,
+              ebName,
               expression: args.expression,
               timezone: args.timezone,
               message: args.message,
@@ -256,7 +276,10 @@ function createHandler(deps = {}) {
       );
       if (!rec.Item) return { error: "not_found", message: `Schedule ${scheduleId} not found for this user` };
 
-      const ebName = buildScheduleName(identity.namespace, scheduleId);
+      // Bind the EventBridge object to the owner recorded at create time:
+      // use the stored ebName when available, falling back to the derived
+      // name only for legacy records written before the field existed.
+      const ebName = rec.Item.ebName || buildScheduleName(identity.namespace, scheduleId);
       const current = await scheduler.send(
         new schedulerCmds.GetScheduleCommand({ Name: ebName, GroupName: env.scheduleGroup }),
       );
@@ -313,7 +336,7 @@ function createHandler(deps = {}) {
         }),
       );
       if (!rec.Item) return { error: "not_found", message: `Schedule ${scheduleId} not found for this user` };
-      const ebName = buildScheduleName(identity.namespace, scheduleId);
+      const ebName = rec.Item.ebName || buildScheduleName(identity.namespace, scheduleId);
       try {
         await scheduler.send(
           new schedulerCmds.DeleteScheduleCommand({ Name: ebName, GroupName: env.scheduleGroup }),
