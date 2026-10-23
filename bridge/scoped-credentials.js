@@ -136,97 +136,205 @@ const FORWARDED_ENV_KEYS = [
  * @param {string} [opts.scheduleGroupArn] - EventBridge schedule group ARN (scopes scheduler access)
  * @returns {string} JSON policy document
  */
+// Per-namespace schedule name prefix. Must stay aligned with buildScheduleName
+// in bridge/skills/eventbridge-cron/common.js and
+// lambda/gateway_tools/eventbridge_cron/index.js:
+// `openclaw-<namespace>-<scheduleId>`. The schedule name is capped at 64
+// chars; a namespace too long for that is written as
+// `openclaw-<head>-<sha256(namespace)[0:12]>-<scheduleId>`, so the prefix
+// mirrors the same form.
+const SCHEDULE_NAME_PREFIX = "openclaw-";
+const SCHEDULE_ID_SUFFIX_LEN = 1 /* "-" */ + 8 /* 4-byte hex id */;
+const MAX_SCHEDULE_NAMESPACE_LEN =
+  64 - SCHEDULE_NAME_PREFIX.length - SCHEDULE_ID_SUFFIX_LEN;
+
+function scheduleNamespacePrefix(namespace) {
+  if (namespace.length <= MAX_SCHEDULE_NAMESPACE_LEN) {
+    return `${SCHEDULE_NAME_PREFIX}${namespace}-`;
+  }
+  const { createHash } = require("crypto");
+  const digestPart = `-${createHash("sha256").update(namespace).digest("hex").slice(0, 12)}`;
+  const room = MAX_SCHEDULE_NAMESPACE_LEN - digestPart.length;
+  const head = room > 0 ? namespace.slice(0, room) : "";
+  return `${SCHEDULE_NAME_PREFIX}${head}${digestPart}-`;
+}
+
 function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
   validateNamespace(namespace);
 
-  // EventBridge Scheduler resources:
-  // - CRUD actions (Create/Update/Delete/Get) operate on individual schedules
-  //   ARN format: arn:aws:scheduler:REGION:ACCOUNT:schedule/GROUP/SCHEDULE
-  // - ListSchedules operates on the schedule-group resource
-  const scheduleCrudArn = scheduleGroupArn
-    ? scheduleGroupArn.replace(":schedule-group/", ":schedule/") + "/*"
-    : "*";
-  const scheduleListArn = scheduleGroupArn || "*";
+  // Derive actorId when not supplied (keeps backwards-compat with callers that
+  // pass only namespace). Namespace uses "_" to separate channel from target,
+  // actorId uses ":" (e.g. "telegram_123" -> "telegram:123").
+  const effectiveActorId = actorId || namespace.replace(/_/, ":");
 
-  // DynamoDB resources: table + GSI indexes
-  const dynamoResources = identityTableArn
-    ? [identityTableArn, `${identityTableArn}/index/*`]
-    : "*";
+  // --- S3 (per-namespace prefix) ---
+  const s3ObjectStmt = {
+    Effect: "Allow",
+    // AbortMultipartUpload: workspace-sync uploads large SQLite snapshots
+    // as multipart uploads and aborts a failed one so no billed parts linger.
+    Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+    Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
+  };
+  const s3ListStmt = {
+    Effect: "Allow",
+    Action: "s3:ListBucket",
+    Resource: `arn:aws:s3:::${bucket}`,
+    // Restrict ListObjectsV2 to this user's namespace: without this
+    // condition s3:ListBucket would enumerate every tenant's object
+    // keys (incl. _uploads/ filenames and agent-state files such as
+    // IDENTITY.md/MEMORY.md), even though object reads are already
+    // prefix-scoped above. StringLike "*" also matches the empty string, so
+    // "<ns>/*" covers a bare "<ns>/" listing; a single entry keeps the packed
+    // policy under the 2048-byte STS limit.
+    Condition: {
+      StringLike: { "s3:prefix": [`${namespace}/*`] },
+    },
+  };
 
-  // Build a minimal session policy that fits within the 2048-byte AWS packed limit.
-  // The execution role (attached to the runtime) provides the broad permissions.
-  // This session policy only RESTRICTS — it cannot grant permissions the role
-  // doesn't have. We scope S3 and Secrets Manager to the caller's namespace so
-  // a compromised agent (prompt injection, user-supplied skill arguments) cannot
-  // reach another tenant's data even if it bypasses the application-level checks.
-  //
-  // Secrets Manager CRUD actions are scoped to
-  //   arn:aws:secretsmanager:<region>:<account>:secret:openclaw/user/<namespace>/*
-  // which matches the layout used by bridge/skills/api-keys/*. ListSecrets does
-  // NOT support resource-level restrictions (AWS API limitation), so it stays
-  // wildcard in its own statement; the skill filters results by namespace prefix.
-  const secretsResourceArn = (region && account)
+  // --- Secrets Manager (per-namespace secret path) ---
+  // Restricts the "openclaw/user/<ns>/*" subset. The execution role already
+  // allows the whole openclaw/user/*, so this intersection is what prevents
+  // one tenant's agent from touching another tenant's API-key secrets.
+  const secretsPrefixArn = (region && account)
     ? `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`
-    : "*";
+    : `arn:aws:secretsmanager:*:*:secret:openclaw/user/${namespace}/*`;
+  const secretsCrudStmt = {
+    Effect: "Allow",
+    Action: [
+      "secretsmanager:GetSecretValue",
+      "secretsmanager:PutSecretValue",
+      "secretsmanager:CreateSecret",
+      "secretsmanager:DeleteSecret",
+      "secretsmanager:DescribeSecret",
+      "secretsmanager:TagResource",
+    ],
+    Resource: secretsPrefixArn,
+  };
+  // ListSecrets does not support resource ARNs; application code filters by
+  // the "openclaw/user/<ns>/" prefix. Keeping it in the session policy is
+  // required for list.js to enumerate the user's own secrets.
+  const secretsListStmt = {
+    Effect: "Allow",
+    Action: "secretsmanager:ListSecrets",
+    Resource: "*",
+  };
+
+  // --- DynamoDB (per-user LeadingKeys condition) ---
+  // Resource is restricted to the single identity table. No skill that runs
+  // under these credentials queries a GSI or reads ALLOW# records (the
+  // allowlist is read by the router and the contract server with their own
+  // credentials), so neither is granted; omitting them also keeps the policy
+  // under the 2048-byte STS limit for long channel IDs such as Feishu open_ids.
+  // LeadingKeys restricts access to the partition keys that belong to this
+  // session's bound identity:
+  //   USER#<internalUserId>  — CRON#/SESSION/profile records for this user
+  //   CHANNEL#<actorId>      — PROFILE for this channel identity
+  // StringEquals (not StringLike) so an attacker cannot widen the match.
+  const dynamoResources = identityTableArn || undefined;
+  const leadingKeys = [
+    `CHANNEL#${effectiveActorId}`,
+  ];
+  if (internalUserId) {
+    leadingKeys.unshift(`USER#${internalUserId}`);
+  }
+  const dynamoStmt = dynamoResources
+    ? {
+        Effect: "Allow",
+        Action: [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+        ],
+        Resource: dynamoResources,
+        Condition: {
+          "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": leadingKeys },
+        },
+      }
+    : null;
+
+  // --- EventBridge Scheduler (per-namespace schedule name prefix) ---
+  // The schedule name buildScheduleName() emits is "openclaw-<namespace>-<id>",
+  // so restricting the resource ARN to that prefix prevents the agent from
+  // reading/modifying/deleting another tenant's schedules.
+  // ListSchedules is intentionally omitted: the eventbridge-cron list.js skill
+  // enumerates schedules via DynamoDB Query on the user's CRON# records (already
+  // LeadingKeys-restricted above), so the agent never needs to call the API
+  // directly — and withholding ListSchedules prevents other tenants' schedule
+  // names from being enumerated through the shared schedule group.
+  let schedulerCrudStmt = null;
+  if (scheduleGroupArn) {
+    const schedulePrefix = scheduleNamespacePrefix(namespace);
+    const scheduleCrudArn =
+      scheduleGroupArn.replace(":schedule-group/", ":schedule/") + `/${schedulePrefix}*`;
+    schedulerCrudStmt = {
+      Effect: "Allow",
+      Action: [
+        "scheduler:CreateSchedule",
+        "scheduler:GetSchedule",
+        "scheduler:UpdateSchedule",
+        "scheduler:DeleteSchedule",
+      ],
+      Resource: scheduleCrudArn,
+    };
+  }
+
+  // --- iam:PassRole (restricted to the scheduler role, scheduler service) ---
+  // Mirrors the execution role's own PassRole guard (stacks/cron_stack.py).
+  // Without eventbridgeRoleArn we omit the statement entirely rather than
+  // emitting Resource:"*" — the session will simply be unable to CreateSchedule.
+  const passRoleStmt = eventbridgeRoleArn
+    ? {
+        Effect: "Allow",
+        Action: "iam:PassRole",
+        Resource: eventbridgeRoleArn,
+        Condition: {
+          StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" },
+        },
+      }
+    : null;
+
+  // --- KMS (via-service condition) ---
+  // Resource is scoped to the deployment CMK when known. The condition pins
+  // the key's use to AWS services in this region, so the agent cannot smuggle
+  // Decrypt requests through unexpected callers. We use a single wildcarded
+  // via-service pattern instead of enumerating s3/secretsmanager/dynamodb to
+  // leave headroom under the 2048-byte packed-policy limit.
+  const kmsResource = cmkArn || "*";
+  const kmsStmt = {
+    Effect: "Allow",
+    Action: ["kms:Decrypt", "kms:GenerateDataKey"],
+    Resource: kmsResource,
+    Condition: {
+      StringLike: { "kms:ViaService": `*.${region || "*"}.amazonaws.com` },
+    },
+  };
 
   const policy = {
     Version: "2012-10-17",
     Statement: [
-      {
-        Effect: "Allow",
-        // AbortMultipartUpload: workspace-sync uploads large SQLite snapshots
-        // as multipart uploads and aborts a failed one so no billed parts linger.
-        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
-        Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
-      },
-      {
-        Effect: "Allow",
-        Action: "s3:ListBucket",
-        Resource: `arn:aws:s3:::${bucket}`,
-        // Restrict ListObjectsV2 to this user's namespace: without this
-        // condition s3:ListBucket would enumerate every tenant's object
-        // keys (incl. _uploads/ filenames and agent-state files such as
-        // IDENTITY.md/MEMORY.md), even though object reads are already
-        // prefix-scoped above.
-        Condition: {
-          StringLike: { "s3:prefix": [`${namespace}/*`, `${namespace}/`] },
-        },
-      },
-      // Scheduler, DynamoDB, KMS, PassRole — allowed by the execution role;
-      // application-level checks in skill scripts enforce namespace isolation.
-      // Secrets Manager CRUD is namespace-scoped below (defence in depth).
-      {
-        Effect: "Allow",
-        Action: [
-          "scheduler:*",
-          "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
-          "kms:Decrypt", "kms:GenerateDataKey",
-          "iam:PassRole",
-        ],
-        Resource: "*",
-      },
-      {
-        Effect: "Allow",
-        Action: [
-          "secretsmanager:GetSecretValue",
-          "secretsmanager:PutSecretValue",
-          "secretsmanager:CreateSecret",
-          "secretsmanager:DeleteSecret",
-          "secretsmanager:TagResource",
-        ],
-        Resource: secretsResourceArn,
-      },
-      {
-        Effect: "Allow",
-        // ListSecrets does not support resource-level restrictions. The caller
-        // filters by name prefix (openclaw/user/<namespace>/) in skill scripts.
-        Action: "secretsmanager:ListSecrets",
-        Resource: "*",
-      },
+      s3ObjectStmt,
+      s3ListStmt,
+      secretsCrudStmt,
+      secretsListStmt,
+      ...(dynamoStmt ? [dynamoStmt] : []),
+      ...(schedulerCrudStmt ? [schedulerCrudStmt] : []),
+      ...(passRoleStmt ? [passRoleStmt] : []),
+      kmsStmt,
     ],
   };
 
-  return JSON.stringify(policy);
+  const serialized = JSON.stringify(policy);
+  // STS packed-policy limit is 2048 bytes after whitespace compaction. We emit
+  // compact JSON (no whitespace) so this check matches the service-side limit.
+  if (serialized.length > 2048) {
+    throw new Error(
+      `Session policy too large (${serialized.length} bytes, limit 2048). ` +
+      `Reduce resource ARN lengths or split privileges across sessions.`,
+    );
+  }
+  return serialized;
 }
 
 /**
