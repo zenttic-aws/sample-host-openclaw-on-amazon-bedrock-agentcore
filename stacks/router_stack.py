@@ -20,6 +20,7 @@ from aws_cdk import (
     aws_kms as kms,
     aws_lambda as _lambda,
     aws_logs as logs,
+    aws_wafv2 as wafv2,
 )
 import cdk_nag
 import json
@@ -60,6 +61,39 @@ class RouterStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
+        # Reserved concurrency bounds the Router Lambda's share of the account
+        # concurrency pool so the Cron and token-metrics functions cannot be
+        # starved by a burst of webhook traffic. Set to 0 to disable (not
+        # recommended) or raise via `router_reserved_concurrency` in cdk.json.
+        router_reserved_concurrency = int(
+            self.node.try_get_context("router_reserved_concurrency") or "100"
+        )
+        # Default stage throttle (POST event routes). Overridable via context.
+        stage_rate_limit = int(
+            self.node.try_get_context("router_stage_rate_limit") or "100"
+        )
+        stage_burst_limit = int(
+            self.node.try_get_context("router_stage_burst_limit") or "50"
+        )
+        # Much lower limit for the unauthenticated GET surface (/health,
+        # /webhook/whatsapp subscription verification) so one source cannot
+        # drain the budget the signed POST webhooks need.
+        get_route_rate_limit = int(
+            self.node.try_get_context("router_unauth_get_rate_limit") or "10"
+        )
+        get_route_burst_limit = int(
+            self.node.try_get_context("router_unauth_get_burst_limit") or "20"
+        )
+        # Optional WAFv2 WebACL with an IP-based rate rule in front of the
+        # stage. Enabled by default; set `router_waf_enabled` to false to opt
+        # out (for example on partitions where WAFv2 REGIONAL is unavailable).
+        waf_flag = self.node.try_get_context("router_waf_enabled")
+        router_waf_enabled = str(
+            waf_flag if waf_flag is not None else "true"
+        ).strip().lower() not in ("false", "0", "no", "off", "")
+        waf_rate_limit = int(
+            self.node.try_get_context("router_waf_rate_limit") or "2000"
+        )
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
         # Per-user `/model` switching: validated at synth so a bad map never deploys.
         user_selectable_models = parse_user_selectable_models(
@@ -115,6 +149,9 @@ class RouterStack(Stack):
             )],
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
+            reserved_concurrent_executions=(
+                router_reserved_concurrency if router_reserved_concurrency > 0 else None
+            ),
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
@@ -151,7 +188,9 @@ class RouterStack(Stack):
             description="OpenClaw webhook ingestion API (explicit routes only)",
         )
 
-        # Explicit routes — only these paths are reachable
+        # Explicit routes — only these paths are reachable. The route keys of
+        # unauthenticated GETs are collected so the stage can give them a
+        # tighter per-route throttle than the signed POST event routes.
         self.http_api.add_routes(
             path="/webhook/telegram",
             methods=[apigwv2.HttpMethod.POST],
@@ -192,6 +231,16 @@ class RouterStack(Stack):
             integration=lambda_integration,
         )
 
+        # Route keys that any internet client can reach without a signing
+        # key — /health is answered before validation and /webhook/whatsapp
+        # GET is Meta's subscription verification. They get a much lower
+        # per-route limit than the signed POST routes so one unauthenticated
+        # source cannot consume the global budget.
+        unauth_get_route_keys = [
+            "GET /health",
+            "GET /webhook/whatsapp",
+        ]
+
         # --- Access Logging ---
         access_log_group = logs.LogGroup(
             self,
@@ -206,14 +255,82 @@ class RouterStack(Stack):
         if default_stage:
             cfn_stage = default_stage.node.default_child
             cfn_stage.default_route_settings = apigwv2.CfnStage.RouteSettingsProperty(
-                throttling_burst_limit=50,
-                throttling_rate_limit=100,
+                throttling_burst_limit=stage_burst_limit,
+                throttling_rate_limit=stage_rate_limit,
                 detailed_metrics_enabled=True,
             )
+            # Per-route overrides: tighter cap on unauthenticated GET routes
+            # so they cannot drain the stage-wide bucket the signed POST event
+            # routes need. API Gateway v2 uses the route key ("METHOD /path")
+            # as the map key.
+            cfn_stage.route_settings = {
+                route_key: apigwv2.CfnStage.RouteSettingsProperty(
+                    throttling_burst_limit=get_route_burst_limit,
+                    throttling_rate_limit=get_route_rate_limit,
+                    detailed_metrics_enabled=True,
+                )
+                for route_key in unauth_get_route_keys
+            }
             cfn_stage.access_log_settings = apigwv2.CfnStage.AccessLogSettingsProperty(
                 destination_arn=access_log_group.log_group_arn,
                 format='{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","latency":"$context.responseLatency","time":"$context.requestTime"}',
             )
+
+            # --- Optional WAFv2 WebACL with IP-based rate limit ---
+            # One rate-based rule keyed on the source IP, so a single
+            # unauthenticated source cannot consume the whole stage budget.
+            # Associated to the API Gateway v2 stage (REGIONAL scope).
+            if router_waf_enabled:
+                web_acl = wafv2.CfnWebACL(
+                    self,
+                    "RouterWebAcl",
+                    name=namer.name("openclaw-router-waf"),
+                    scope="REGIONAL",
+                    default_action=wafv2.CfnWebACL.DefaultActionProperty(
+                        allow=wafv2.CfnWebACL.AllowActionProperty()
+                    ),
+                    visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                        cloud_watch_metrics_enabled=True,
+                        metric_name=namer.name("openclaw-router-waf"),
+                        sampled_requests_enabled=True,
+                    ),
+                    rules=[
+                        wafv2.CfnWebACL.RuleProperty(
+                            name="RateLimitPerSourceIp",
+                            priority=0,
+                            action=wafv2.CfnWebACL.RuleActionProperty(
+                                block=wafv2.CfnWebACL.BlockActionProperty()
+                            ),
+                            statement=wafv2.CfnWebACL.StatementProperty(
+                                rate_based_statement=wafv2.CfnWebACL.RateBasedStatementProperty(
+                                    limit=waf_rate_limit,
+                                    aggregate_key_type="IP",
+                                )
+                            ),
+                            visibility_config=wafv2.CfnWebACL.VisibilityConfigProperty(
+                                cloud_watch_metrics_enabled=True,
+                                metric_name=namer.name(
+                                    "openclaw-router-waf-ratelimit"
+                                ),
+                                sampled_requests_enabled=True,
+                            ),
+                        ),
+                    ],
+                )
+                stage_arn = (
+                    f"arn:{Stack.of(self).partition}:apigateway:{region}::"
+                    f"/apis/{self.http_api.api_id}/stages/{default_stage.stage_name}"
+                )
+                waf_association = wafv2.CfnWebACLAssociation(
+                    self,
+                    "RouterWebAclAssoc",
+                    resource_arn=stage_arn,
+                    web_acl_arn=web_acl.attr_arn,
+                )
+                # Create order: the WebACL must exist before the stage is
+                # associated. CfnStage is the L1 child of the default stage.
+                waf_association.add_dependency(cfn_stage)
+                waf_association.add_dependency(web_acl)
 
         # --- IAM Permissions ---
 
@@ -337,8 +454,13 @@ class RouterStack(Stack):
                     "X-Slack-Signature HMAC, Feishu X-Lark-Signature and WhatsApp "
                     "X-Hub-Signature-256 HMAC (plus a constant-time verify-token check on "
                     "its GET subscription route), Discord X-Signature-Ed25519 and LINE "
-                    "X-Line-Signature HMAC. API Gateway throttling provides rate "
-                    "limiting. Only explicit routes are exposed.",
+                    "X-Line-Signature HMAC. API Gateway stage throttling plus "
+                    "tighter per-route throttles on the unauthenticated GET "
+                    "routes (/health, /webhook/whatsapp subscription "
+                    "verification), a WAFv2 rate-based rule keyed on source "
+                    "IP, and a reserved concurrency cap on the Router Lambda "
+                    "together provide rate limiting. Only explicit routes "
+                    "are exposed.",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-APIG1",

@@ -55,6 +55,12 @@ class CronStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("cron_lambda_timeout_seconds") or "600")
         lambda_memory = int(self.node.try_get_context("cron_lambda_memory_mb") or "256")
+        # Reserved concurrency bounds the cron executor's share of the account
+        # concurrency pool so a flood of webhook traffic on the Router Lambda
+        # cannot starve scheduled briefs. Set to 0 to disable.
+        cron_reserved_concurrency = int(
+            self.node.try_get_context("cron_reserved_concurrency") or "50"
+        )
         # Async cron (default on): a schedule's Lambda invocation starts the
         # CronRunner state machine, which runs the turn in the container and polls
         # it, so a brief is not bound by the Lambda's 900 s limit. Rollback: deploy
@@ -117,6 +123,9 @@ class CronStack(Stack):
             # gets a duplicate turn (and its "already ran" reply) instead of the brief.
             retry_attempts=0,
             memory_size=lambda_memory,
+            reserved_concurrent_executions=(
+                cron_reserved_concurrency if cron_reserved_concurrency > 0 else None
+            ),
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,

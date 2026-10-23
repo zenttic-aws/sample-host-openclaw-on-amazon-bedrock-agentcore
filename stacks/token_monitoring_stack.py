@@ -106,6 +106,13 @@ class TokenMonitoringStack(Stack):
         )
         anomaly_band = self.node.try_get_context("anomaly_band_width") or 2
         ttl_days = self.node.try_get_context("token_ttl_days") or 90
+        # Reserved concurrency bounds the token-metrics Lambda's share of the
+        # account concurrency pool so a webhook burst on the Router cannot
+        # starve the token/cost accounting pipeline (which also feeds the
+        # budget alarms). Set to 0 in context to disable.
+        token_reserved_concurrency = int(
+            self.node.try_get_context("token_metrics_reserved_concurrency") or "10"
+        )
 
         # --- DynamoDB Token Usage Table -----------------------------------
         # CMK encryption is optional — uncomment the two lines below if the
@@ -188,6 +195,9 @@ class TokenMonitoringStack(Stack):
             ),
             timeout=Duration.seconds(60),
             memory_size=256,
+            reserved_concurrent_executions=(
+                token_reserved_concurrency if token_reserved_concurrency > 0 else None
+            ),
             environment={
                 "TABLE_NAME": self.table.table_name,
                 "TTL_DAYS": str(ttl_days),
