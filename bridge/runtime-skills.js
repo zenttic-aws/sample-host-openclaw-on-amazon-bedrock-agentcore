@@ -46,6 +46,58 @@ const SLUG_RE = /^[a-z][a-z0-9-]{0,63}$/;
 // instead, which `--version` cannot re-resolve; those are stored unpinned.
 const VERSION_RE = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
 
+/**
+ * Operator-controlled allowlist of ClawHub slugs that may be (re)installed
+ * at runtime. Baked into the container by the deployment operator via the
+ * `RUNTIME_SKILLS_ALLOWLIST` env var (comma- or whitespace-separated) and
+ * therefore NOT writable by the agent context: the agent runs as root in
+ * the microVM but it cannot rewrite its own process environment to add
+ * entries that the contract process will honour at cold start, and the
+ * value does not live in `.openclaw/` so it is not persisted/restored from
+ * S3 either. When the variable is unset or empty, no allowlist is
+ * enforced (back-compat: the pre-existing SLUG_RE / no-`--force` /
+ * ClawHub security-review guards still apply). When it is set, any slug
+ * missing from the list is refused at both install time (install.js) and
+ * cold-start reinstall time (reinstallFromManifest), so a manifest entry
+ * poisoned by a prompt-injected turn cannot bring in a slug the operator
+ * never approved.
+ */
+const ALLOWLIST_ENV = "RUNTIME_SKILLS_ALLOWLIST";
+
+/**
+ * Parse the operator allowlist from an env map. Returns `null` when the
+ * variable is unset or empty (meaning "no allowlist, back-compat"), and a
+ * Set<string> of validated lowercase slugs otherwise. Invalid tokens are
+ * dropped with a warning so a typo in the operator config fails loudly
+ * rather than silently permitting everything.
+ */
+function parseAllowlist(env = process.env, { log = console } = {}) {
+  const raw = env[ALLOWLIST_ENV];
+  if (raw === undefined || raw === null) return null;
+  const trimmed = String(raw).trim();
+  if (!trimmed) return null;
+  const tokens = trimmed.split(/[\s,]+/).filter(Boolean);
+  const result = new Set();
+  for (const token of tokens) {
+    const slug = token.toLowerCase();
+    if (!SLUG_RE.test(slug)) {
+      log.warn(`[runtime-skills] Ignoring invalid entry in ${ALLOWLIST_ENV}: ${JSON.stringify(token)}`);
+      continue;
+    }
+    result.add(slug);
+  }
+  return result;
+}
+
+/**
+ * True when the slug is permitted by the operator-controlled allowlist.
+ * Returns true unconditionally when no allowlist is configured.
+ */
+function isAllowed(slug, allowlist) {
+  if (!allowlist) return true;
+  return typeof slug === "string" && allowlist.has(slug.toLowerCase());
+}
+
 /** Validate a ClawHub skill name; returns the lowercased slug or throws. */
 function validateSkillName(name) {
   if (!name || typeof name !== "string") {
@@ -89,7 +141,7 @@ function emptyManifest() {
  * entries that fail slug/version validation are dropped (counted in
  * `invalid`) so nothing unvalidated ever reaches the CLI.
  *
- * @returns {{ version: number, skills: Record<string, {version: string|null, installedAt?: string}>, corrupt: boolean, invalid: number }}
+ * @returns {{ version: number, skills: Record<string, {version: string|null, installedAt?: string, installedBy?: string, installedSession?: string}>, corrupt: boolean, invalid: number }}
  */
 function readManifest(file = manifestPath(), { log = console } = {}) {
   const result = { ...emptyManifest(), corrupt: false, invalid: 0 };
@@ -128,10 +180,17 @@ function readManifest(file = manifestPath(), { log = console } = {}) {
       log.warn(`[runtime-skills] Dropping manifest entry ${slug}: invalid version ${JSON.stringify(version)}`);
       continue;
     }
-    result.skills[slug] = {
+    const normalized = {
       version: isValidVersion(version) ? version : null,
-      ...(entry && typeof entry.installedAt === "string" ? { installedAt: entry.installedAt } : {}),
     };
+    if (entry && typeof entry.installedAt === "string") normalized.installedAt = entry.installedAt;
+    if (entry && typeof entry.installedBy === "string" && entry.installedBy.length <= 256) {
+      normalized.installedBy = entry.installedBy;
+    }
+    if (entry && typeof entry.installedSession === "string" && entry.installedSession.length <= 256) {
+      normalized.installedSession = entry.installedSession;
+    }
+    result.skills[slug] = normalized;
   }
   return result;
 }
@@ -142,10 +201,17 @@ function writeManifest(file, manifest) {
   for (const slug of Object.keys(manifest.skills || {}).sort()) {
     const entry = manifest.skills[slug];
     if (!isValidSlug(slug)) continue;
-    out.skills[slug] = {
+    const persisted = {
       version: isValidVersion(entry?.version) ? entry.version : null,
-      ...(entry?.installedAt ? { installedAt: entry.installedAt } : {}),
     };
+    if (entry?.installedAt) persisted.installedAt = entry.installedAt;
+    if (typeof entry?.installedBy === "string" && entry.installedBy.length <= 256) {
+      persisted.installedBy = entry.installedBy;
+    }
+    if (typeof entry?.installedSession === "string" && entry.installedSession.length <= 256) {
+      persisted.installedSession = entry.installedSession;
+    }
+    out.skills[slug] = persisted;
   }
   fs.mkdirSync(path.dirname(file), { recursive: true });
   // `.tmp-<digits>` is what state-storage.js / workspace-sync.js treat as a
@@ -176,14 +242,34 @@ function mirrorManifest(file, mountStateDir = DEFAULT_MOUNT_STATE_DIR, { log = c
   }
 }
 
-/** Record a runtime install. `version` may be null (unpinned: latest on reinstall). */
+/**
+ * Record a runtime install. `version` may be null (unpinned: latest on
+ * reinstall). Captures install provenance (`installedAt`, `installedBy`,
+ * `installedSession`) so list.js can show who/when/which session added a
+ * slug and a reviewer can tell a user-driven install apart from a
+ * manifest poisoned by a prompt-injected turn. Provenance is informational
+ * only — it is written from the agent context and therefore not an
+ * authentication signal — but a missing or inconsistent trail is still
+ * a useful red flag.
+ */
 function recordInstall(file, slug, version, opts = {}) {
   const validSlug = validateSkillName(slug);
   const manifest = readManifest(file, opts);
-  manifest.skills[validSlug] = {
+  const env = opts.env || process.env;
+  const entry = {
     version: isValidVersion(version) ? version : null,
     installedAt: new Date().toISOString(),
   };
+  const by = typeof env.INTERNAL_USER_ID === "string" ? env.INTERNAL_USER_ID.trim() : "";
+  if (by && by.length <= 256) entry.installedBy = by;
+  const session =
+    typeof env.AGENTCORE_RUNTIME_SESSION_ID === "string"
+      ? env.AGENTCORE_RUNTIME_SESSION_ID.trim()
+      : typeof env.RUNTIME_SESSION_ID === "string"
+        ? env.RUNTIME_SESSION_ID.trim()
+        : "";
+  if (session && session.length <= 256) entry.installedSession = session;
+  manifest.skills[validSlug] = entry;
   return writeManifest(file, manifest);
 }
 
@@ -368,8 +454,18 @@ async function reinstallFromManifest({
   skillsDir = SKILLS_DIR,
   run = runClawhub,
   log = console,
+  env = process.env,
 } = {}) {
-  const summary = { total: 0, reinstalled: 0, present: 0, failed: 0, corrupt: false, invalid: 0, results: [] };
+  const summary = {
+    total: 0,
+    reinstalled: 0,
+    present: 0,
+    failed: 0,
+    corrupt: false,
+    invalid: 0,
+    refused: 0,
+    results: [],
+  };
   let manifest;
   try {
     manifest = readManifest(manifestFile, { log });
@@ -383,8 +479,22 @@ async function reinstallFromManifest({
   summary.total = entries.length;
   if (entries.length === 0) return summary;
 
+  const allowlist = parseAllowlist(env, { log });
+  if (allowlist) {
+    log.log(`[runtime-skills] Operator allowlist active: ${allowlist.size} slug(s) permitted`);
+  }
+
   for (const [slug, entry] of entries) {
     const version = entry.version || null;
+    if (!isAllowed(slug, allowlist)) {
+      summary.refused++;
+      summary.results.push({ slug, version, status: "refused", error: "not in operator allowlist" });
+      log.warn(
+        `[runtime-skills] Refusing to reinstall ${slug}${version ? `@${version}` : ""}: not in ${ALLOWLIST_ENV}` +
+          `${entry.installedBy ? ` (recorded installedBy=${entry.installedBy})` : " (no provenance)"}`,
+      );
+      continue;
+    }
     if (isSkillPresent(slug, skillsDir)) {
       summary.present++;
       summary.results.push({ slug, version, status: "present" });
@@ -407,7 +517,10 @@ async function reinstallFromManifest({
       }
       summary.reinstalled++;
       summary.results.push({ slug, version, status: "reinstalled" });
-      log.log(`[runtime-skills] Reinstalled ${slug}${version ? `@${version}` : ""} in ${Date.now() - started}ms`);
+      const prov = entry.installedBy
+        ? ` (installedBy=${entry.installedBy}${entry.installedAt ? ` at ${entry.installedAt}` : ""})`
+        : " (no provenance recorded)";
+      log.log(`[runtime-skills] Reinstalled ${slug}${version ? `@${version}` : ""} in ${Date.now() - started}ms${prov}`);
     } catch (err) {
       const detail = String(err.stderr || err.stdout || err.message || err).trim().split("\n").slice(-3).join(" | ");
       summary.failed++;
@@ -423,6 +536,9 @@ module.exports = {
   MANIFEST_NAME,
   DEFAULT_MOUNT_STATE_DIR,
   REINSTALL_TIMEOUT_MS,
+  ALLOWLIST_ENV,
+  parseAllowlist,
+  isAllowed,
   validateSkillName,
   isValidSlug,
   isValidVersion,

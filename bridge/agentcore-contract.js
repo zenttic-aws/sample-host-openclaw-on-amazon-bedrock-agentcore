@@ -1719,6 +1719,17 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       manifestFile: runtimeSkills.manifestPath(OPENCLAW_DIR), log: console, run: runRuntimeSkillInstall,
     });
     checkpoint();
+    if (skills.refused) {
+      // An operator-pinned allowlist refused one or more manifest entries.
+      // These are candidates for prompt-injection persistence: the slug is
+      // in the manifest but the deployment operator has not permitted it.
+      // Surface loudly so the attempt is visible in cold-start logs.
+      for (const r of skills.results) {
+        if (r.status === "refused") {
+          console.warn(`[contract] Runtime skill ${r.slug} refused by operator allowlist and NOT reinstalled`);
+        }
+      }
+    }
     if (skills.failed || skills.corrupt || skills.invalid) throw new Error("Required runtime skills could not be restored");
     activationScope.mark("skills");
     logActivationPhase("config_skills_ready");
