@@ -750,12 +750,14 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   assert.equal(result.body.runtimeSessionId, owner.runtimeSessionId);
   assert.equal(result.body.actorId, owner.actorId);
   assert.equal(result.body.routingGeneration, owner.routingGeneration);
-  const status = JSON.parse((await app.request({ action: "status" })).body.response);
+  const status = JSON.parse((await app.request({ ...owner, action: "status" })).body.response);
   assert.equal(status.lifecycle.generation, result.body.activationGeneration);
   assert.equal(activation.generation, result.body.activationGeneration);
   assert.equal(status.lifecycle.state, "USER_READY");
-  assert.equal(status.lifecycle.binding.userId, owner.userId);
-  assert.equal(status.lifecycle.binding.actorId, owner.actorId);
+  assert.equal(status.lifecycle.bound, true);
+  assert.equal(status.lifecycle.binding, undefined);
+  assert.equal(status.currentUserId, undefined);
+  assert.equal(status.openclawLogs, undefined);
   assert.ok(app.calls.some((call) => call.includes("[OPENCLAW_IMAGES:")));
   // The stale suspended-delivery sweep runs once, after readiness, before the first turn.
   assert.equal(app.calls.filter((call) => call === "gateway:sweep").length, 1);

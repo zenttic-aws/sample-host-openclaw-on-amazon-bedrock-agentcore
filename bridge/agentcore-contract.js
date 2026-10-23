@@ -2503,29 +2503,58 @@ const server = http.createServer(async (req, res) => {
       try {
         const payload = body ? JSON.parse(body) : {};
         startupTiming.recordHttpHandler(handlerArrival, payload?.startupAttemptId);
-        const action = payload.action || "status";
+        const action = payload.action;
 
-        // Status check (no init needed)
+        // Status check — bound to the active user binding like every other action.
+        // No action defaulting: an action-less payload is not an authenticated
+        // caller for the diagnostic branch; verbose runtime detail stays in
+        // CloudWatch rather than in an invocation reply.
         if (action === "status") {
+          const runtimeSessionHeader = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+          const statusContext = Object.freeze({
+            userId: payload.userId,
+            actorId: payload.actorId,
+            runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
+            routingGeneration: payload.routingGeneration ?? null,
+          });
+          try {
+            v2Lifecycle.assertBinding(statusContext);
+            v2Lifecycle.checkpoint();
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              response: "This AgentCore Runtime cannot accept the requested user binding.",
+              status: "error",
+            }));
+            return;
+          }
           // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = proxyReady ? await checkProxyHealth() : null;
 
+          // Lifecycle snapshot without the binding tuple: the binding four-tuple
+          // (userId, actorId, routingGeneration, runtimeSessionId) is the only
+          // thing assertBinding compares, so disclosing it here would hand the
+          // reachable in-microVM actor the material for the authenticated path.
+          const snapshot = v2Lifecycle.snapshot();
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-            currentUserId,
             openclawReady,
             proxyReady,
             secretsReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
-            openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             subagentRequestCount: proxyHealth?.subagent_requests ?? null,
             activeTaskCount,
             pingStatus: v2Lifecycle.health(activeTaskCount).body.status,
             runtimePlatform: RUNTIME_PLATFORM,
-            lifecycle: v2Lifecycle.snapshot(),
+            lifecycle: {
+              state: snapshot.state,
+              generation: snapshot.generation,
+              resources: snapshot.resources,
+              bound: Boolean(snapshot.binding),
+            },
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));

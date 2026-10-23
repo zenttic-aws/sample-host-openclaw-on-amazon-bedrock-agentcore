@@ -217,7 +217,9 @@ function contractHandler(telemetry) {
     openclawProcess: null, openclawLogs: [], RUNTIME_PLATFORM: "V2",
     v2Lifecycle: {
       health: () => ({ statusCode: 503, body: { status: "HealthyBusy" } }),
-      snapshot: () => ({ phase: "UNBOUND" }),
+      snapshot: () => ({ state: "UNBOUND", binding: null, generation: null, resources: [] }),
+      assertBinding: () => {},
+      checkpoint: () => {},
     },
     console: { log() {}, error() {} },
   });
@@ -288,10 +290,13 @@ test("unbound status correlates overlapping requests when bodies finish out of o
   for (const response of [firstResponse, secondResponse]) {
     assert.equal(response.code, 200);
     const diag = JSON.parse(response.body.response);
-    assert.equal(diag.currentUserId, null);
+    assert.equal(diag.currentUserId, undefined);
+    assert.equal(diag.openclawLogs, undefined);
     assert.equal(diag.openclawReady, false);
     assert.equal(diag.activeTaskCount, 0);
-    assert.equal(diag.lifecycle.phase, "UNBOUND");
+    assert.equal(diag.lifecycle.state, "UNBOUND");
+    assert.equal(diag.lifecycle.bound, false);
+    assert.equal(diag.lifecycle.binding, undefined);
   }
   for (const contract of [first, second]) {
     assert.deepEqual(contract.calls, ["disconnect", "readBody"]);
