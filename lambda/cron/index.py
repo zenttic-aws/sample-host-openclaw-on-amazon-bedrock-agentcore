@@ -301,6 +301,12 @@ _BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
 _MALFORMED_TEXT_BLOCK_RE = re.compile(
     r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
 )
+# Maximum consecutive '[{' / '[' / '{' opener depth we will attempt to JSON
+# decode. CPython's json scanner recurses in C per nested container and raises
+# RecursionError well before 500 levels; attacker-controlled model output may
+# contain arbitrary depth, so we reject obviously too-deep candidates before
+# raw_decode() is called. Legitimate subagent nesting is <<< 100 levels.
+_MAX_CONTENT_BLOCK_NEST_DEPTH = 100
 
 
 def _extract_text_from_content_blocks(text):
@@ -329,24 +335,43 @@ def _extract_text_from_content_blocks(text):
                 rebuilt.append(result[i:])
                 break
             rebuilt.append(result[i:pos])
-            # Try to parse a JSON array starting at pos
-            try:
-                blocks, end = decoder.raw_decode(result, pos)
-                if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
-                    # Check if this looks like a content block array (dicts with "type" keys)
-                    has_typed_blocks = any(b.get("type") for b in blocks)
-                    if has_typed_blocks:
-                        parts = [
-                            b.get("text", "")
-                            for b in blocks
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        ]
-                        # Always advance past the block — image-only blocks produce empty text
-                        rebuilt.append("".join(parts))
-                        i = end
-                        continue
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+            # Try to parse a JSON array starting at pos.
+            # Guard against attacker-controlled deeply nested JSON that would
+            # make json.JSONDecoder.raw_decode() raise RecursionError (not a
+            # subclass of ValueError/JSONDecodeError, so historically it would
+            # escape the handler, drop the brief delivery, and — because async
+            # scheduler invocations retry — trigger duplicate paid agent turns).
+            # Any candidate with more than _MAX_CONTENT_BLOCK_NEST_DEPTH
+            # consecutive openers at its start cannot be a legitimate content
+            # block array and is skipped as plain text.
+            opener_depth = 0
+            for ch in result[pos:pos + _MAX_CONTENT_BLOCK_NEST_DEPTH + 2]:
+                if ch in "[{":
+                    opener_depth += 1
+                else:
+                    break
+            if opener_depth <= _MAX_CONTENT_BLOCK_NEST_DEPTH:
+                try:
+                    blocks, end = decoder.raw_decode(result, pos)
+                    if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+                        # Check if this looks like a content block array (dicts with "type" keys)
+                        has_typed_blocks = any(b.get("type") for b in blocks)
+                        if has_typed_blocks:
+                            parts = [
+                                b.get("text", "")
+                                for b in blocks
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            ]
+                            # Always advance past the block — image-only blocks produce empty text
+                            rebuilt.append("".join(parts))
+                            i = end
+                            continue
+                except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+                    # RecursionError can escape raw_decode() for deeply nested
+                    # attacker-controlled JSON on top of the depth guard above
+                    # (platform/interpreter dependent); treat the fragment as
+                    # plain text rather than crashing the handler.
+                    pass
             # Not a valid content block array. If it looks like content-block
             # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
             # runs to the end of the string is dropped (a partial stream tail).
