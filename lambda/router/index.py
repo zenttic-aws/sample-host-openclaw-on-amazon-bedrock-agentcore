@@ -23,6 +23,7 @@ import re
 import threading
 import time
 import uuid
+import binascii
 from urllib import request as urllib_request
 from urllib.parse import quote
 
@@ -246,7 +247,16 @@ def validate_telegram_webhook(headers):
         logger.warning("Telegram webhook missing X-Telegram-Bot-Api-Secret-Token header")
         return False
 
-    if not hmac.compare_digest(token, webhook_secret):
+    # Normalise to bytes for hmac.compare_digest, which raises TypeError on
+    # non-ASCII str inputs. Treating the attacker-supplied header as bytes
+    # closes that pre-auth crash path without changing the comparison result.
+    try:
+        token_b = token.encode("utf-8", "strict") if isinstance(token, str) else bytes(token)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Telegram webhook secret token not valid UTF-8")
+        return False
+    secret_b = webhook_secret.encode("utf-8") if isinstance(webhook_secret, str) else webhook_secret
+    if not hmac.compare_digest(token_b, secret_b):
         logger.warning("Telegram webhook secret token mismatch")
         return False
 
@@ -290,7 +300,12 @@ def validate_slack_webhook(headers, body):
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    try:
+        signature_b = signature.encode("utf-8", "strict") if isinstance(signature, str) else bytes(signature)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Slack webhook signature header not valid UTF-8")
+        return False
+    if not hmac.compare_digest(expected.encode("utf-8"), signature_b):
         logger.warning("Slack webhook signature mismatch")
         return False
 
@@ -320,7 +335,12 @@ def validate_feishu_webhook(headers, body_bytes):
     content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
     expected = hashlib.sha256(content).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    try:
+        signature_b = signature.encode("utf-8", "strict") if isinstance(signature, str) else bytes(signature)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Feishu webhook signature header not valid UTF-8")
+        return False
+    if not hmac.compare_digest(expected.encode("utf-8"), signature_b):
         logger.warning("Feishu webhook signature mismatch")
         return False
 
@@ -2539,6 +2559,22 @@ def _handle_discord_command(command, reply):
 
 def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
+    try:
+        return _handler_impl(event, context)
+    except Exception:
+        # Contain any uncaught exception on the unauthenticated webhook path so
+        # that malformed input cannot register a Lambda invocation error
+        # (which API Gateway surfaces as 5xx and which drives the
+        # openclaw-router-errors CloudWatch alarm).
+        try:
+            logger.exception("Unhandled exception in router handler")
+        except Exception:
+            pass
+        return {"statusCode": 500, "body": "Internal Server Error"}
+
+
+def _handler_impl(event, context):
+    """Implementation of the Lambda handler, wrapped by ``handler`` for error containment."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
         channel = event.get("_channel")
@@ -2581,7 +2617,12 @@ def handler(event, context):
     body = event.get("body", "")
     if event.get("isBase64Encoded"):
         import base64
-        body = base64.b64decode(body).decode("utf-8")
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except (ValueError, TypeError, UnicodeDecodeError, binascii.Error):
+            logger.warning("Rejecting webhook with undecodable base64/UTF-8 body from %s",
+                           http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 400, "body": "Bad Request"}
 
     headers = event.get("headers", {})
 
@@ -2600,7 +2641,7 @@ def handler(event, context):
         # Slack url_verification — only allowed during initial setup
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
                 if os.environ.get("SLACK_VERIFIED") == "true":
                     logger.warning("Slack url_verification rejected — already verified")
                     return {"statusCode": 403, "body": "Already verified"}
@@ -2613,7 +2654,7 @@ def handler(event, context):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"challenge": challenge}),
                 }
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
         # Validate Slack request signature before processing
@@ -2633,7 +2674,7 @@ def handler(event, context):
         # Feishu URL verification challenge — must respond synchronously
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
                 challenge = str(event_data.get("challenge", ""))
                 if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
                     return {"statusCode": 400, "body": "Invalid challenge format"}
@@ -2642,7 +2683,7 @@ def handler(event, context):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"challenge": challenge}),
                 }
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
         # Validate Feishu signature
