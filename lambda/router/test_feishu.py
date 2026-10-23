@@ -98,7 +98,7 @@ class TestValidateFeishuWebhook(unittest.TestCase):
     def test_valid_signature(self, _mock_secret):
         """Valid signature returns True."""
         body = b'{"test": "data"}'
-        ts = "1234567890"
+        ts = str(int(time.time()))
         nonce = "abc123"
         sig = _make_feishu_signature(ts, nonce, ENCRYPT_KEY, body)
         headers = {
@@ -107,6 +107,30 @@ class TestValidateFeishuWebhook(unittest.TestCase):
             "x-lark-signature": sig,
         }
         self.assertTrue(index.validate_feishu_webhook(headers, body))
+
+    @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
+    def test_stale_timestamp_rejected(self, _mock_secret):
+        """Timestamp older than 5 minutes returns False (replay prevention)."""
+        body = b'{"test": "data"}'
+        ts = str(int(time.time()) - 600)  # 10 minutes old
+        nonce = "abc123"
+        sig = _make_feishu_signature(ts, nonce, ENCRYPT_KEY, body)
+        headers = {
+            "x-lark-request-timestamp": ts,
+            "x-lark-request-nonce": nonce,
+            "x-lark-signature": sig,
+        }
+        self.assertFalse(index.validate_feishu_webhook(headers, body))
+
+    @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
+    def test_non_numeric_timestamp_rejected(self, _mock_secret):
+        """Non-numeric timestamp returns False."""
+        headers = {
+            "x-lark-request-timestamp": "notanumber",
+            "x-lark-request-nonce": "abc123",
+            "x-lark-signature": "sig",
+        }
+        self.assertFalse(index.validate_feishu_webhook(headers, b"test"))
 
     @patch.object(index, "_get_secret", return_value=FEISHU_SECRET)
     def test_invalid_signature(self, _mock_secret):

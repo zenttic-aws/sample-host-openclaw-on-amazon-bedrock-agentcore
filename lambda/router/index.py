@@ -316,6 +316,15 @@ def validate_feishu_webhook(headers, body_bytes):
         logger.warning("Feishu webhook missing signature headers")
         return False
 
+    # Reject requests older than 5 minutes to prevent replay attacks
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            logger.warning("Feishu webhook timestamp too old (replay attack prevention)")
+            return False
+    except (ValueError, TypeError):
+        logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
+        return False
+
     body_b = body_bytes if isinstance(body_bytes, bytes) else body_bytes.encode("utf-8")
     content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
     expected = hashlib.sha256(content).hexdigest()
@@ -1977,6 +1986,25 @@ def handle_slack(body, headers=None):
     return {"statusCode": 200, "body": "ok"}
 
 
+FEISHU_DEDUP_TTL_SECONDS = 86400
+
+
+def _claim_feishu_event(event_id):
+    """Record a Feishu header.event_id so a replayed/retried delivery runs once. False = duplicate."""
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#feishu:{event_id}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + FEISHU_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Feishu dedupe write failed: %s", type(e).__name__)
+        return True
+
+
 def handle_feishu(body, headers=None):
     """Process a Feishu Events API webhook.
 
@@ -2008,6 +2036,13 @@ def handle_feishu(body, headers=None):
     header = event_data.get("header", {})
     event = event_data.get("event", {})
     event_type = header.get("event_type", "")
+
+    # Idempotency: claim header.event_id so replays/retries run at most once
+    event_id = header.get("event_id", "")
+    if event_id:
+        if not _claim_feishu_event(event_id):
+            logger.info("Feishu: duplicate event ignored")
+            return {"statusCode": 200, "body": "ok"}
 
     if event_type != "im.message.receive_v1":
         logger.info("Feishu: ignoring event type: %s", event_type)
