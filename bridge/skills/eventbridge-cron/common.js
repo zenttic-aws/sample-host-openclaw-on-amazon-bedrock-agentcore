@@ -19,6 +19,11 @@ const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
 /**
  * Validate that userId is present, not the default-user fallback,
  * and matches the expected channel_identifier namespace pattern.
+ *
+ * Also fails closed when USER_ID (the session's bound actorId, set by
+ * agentcore-contract.js at container init) disagrees with the argv user_id
+ * — the scoped credentials belong to the bound actor and accepting any
+ * other namespace would be a cross-tenant request.
  */
 function validateUserId(userId) {
   if (!userId) {
@@ -38,6 +43,26 @@ function validateUserId(userId) {
       `Error: Invalid user_id "${userId}". Must match channel_identifier format (e.g., telegram_123456, slack_username).`,
     );
     process.exit(1);
+  }
+  const boundActor = process.env.USER_ID;
+  if (boundActor) {
+    let boundNamespace = null;
+    if (VALID_NAMESPACE.test(boundActor)) {
+      boundNamespace = boundActor;
+    } else {
+      const idx = boundActor.indexOf(":");
+      if (idx > 0) {
+        const candidate = boundActor.slice(0, idx) + "_" + boundActor.slice(idx + 1);
+        if (VALID_NAMESPACE.test(candidate)) boundNamespace = candidate;
+      }
+    }
+    if (!boundNamespace || boundNamespace !== userId) {
+      console.error(
+        `Error: user_id "${userId}" does not match the session's bound identity ` +
+        `(USER_ID="${boundActor}"). Cross-tenant access is not allowed.`,
+      );
+      process.exit(1);
+    }
   }
 }
 

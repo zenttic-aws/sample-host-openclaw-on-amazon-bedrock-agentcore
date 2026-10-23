@@ -1041,6 +1041,11 @@ def verify_cron_event(event):
 
     # Verify schedule ownership — cross-check DynamoDB CRON# record
     # Use current_user_id (resolved from channel identity) for the lookup.
+    # The stored CRON# record is also the only authoritative source of the
+    # legitimate (channel, channelTarget) delivery destination: EventBridge
+    # Scheduler accepts whatever Input the schedule carries, so if we trusted
+    # the payload's channelTarget we could not detect a forged schedule that
+    # redirects a scheduled run's output to another user's chat.
     try:
         cron_record = identity_table.get_item(
             Key={"PK": f"USER#{current_user_id}", "SK": f"CRON#{schedule_id}"}, ConsistentRead=True,
@@ -1053,6 +1058,36 @@ def verify_cron_event(event):
             return None, {
                 "statusCode": 403,
                 "body": "Schedule ownership verification failed",
+            }
+        stored_channel = cron_record.get("channel")
+        stored_target = cron_record.get("channelTarget")
+        if stored_channel is not None and stored_channel != channel:
+            logger.error(
+                "Schedule %s channel=%s does not match stored channel=%s — refusing delivery",
+                schedule_id, channel, stored_channel,
+            )
+            return None, {
+                "statusCode": 403,
+                "body": "Channel does not match stored schedule",
+            }
+        if stored_target is not None and str(channel_target) != str(stored_target):
+            logger.error(
+                "Schedule %s channelTarget=%s does not match stored target=%s — refusing delivery",
+                schedule_id, channel_target, stored_target,
+            )
+            return None, {
+                "statusCode": 403,
+                "body": "Channel target does not match stored schedule",
+            }
+        stored_channel_actor = cron_record.get("channelActorId")
+        if stored_channel_actor is not None and stored_channel_actor != actor_id:
+            logger.error(
+                "Schedule %s channelActorId=%s does not match stored actor=%s — refusing delivery",
+                schedule_id, actor_id, stored_channel_actor,
+            )
+            return None, {
+                "statusCode": 403,
+                "body": "Channel actor does not match stored schedule",
             }
     except Exception as e:
         logger.error("Failed to verify schedule ownership: %s", e)
