@@ -2463,9 +2463,31 @@ async function handleCronAsync(payload, req, res) {
   };
   const { action, userId, actorId } = payload;
   if (!userId || !actorId) return reply({ error: "Missing userId or actorId" }, 400);
+  // Construct the binding context the same way handleV2Invocation does so
+  // cron_start / cron_status are authorized against the live user binding
+  // (userId + actorId + runtimeSessionId + routingGeneration), not just the
+  // self-asserted userId. This has to run before cronJobStore() is touched so
+  // a rejected caller cannot occupy or persist a jobId.
+  const runtimeSessionHeader = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+  if ((runtimeSessionHeader && payload.runtimeSessionId && runtimeSessionHeader !== payload.runtimeSessionId) ||
+      (payload.routingGeneration !== undefined &&
+        (!Number.isSafeInteger(payload.routingGeneration) || payload.routingGeneration < 0))) {
+    return reply({ error: "Invalid AgentCore Runtime session binding" }, 400);
+  }
+  const bindingContext = Object.freeze({
+    userId, actorId,
+    runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
+    routingGeneration: payload.routingGeneration ?? null,
+  });
+  try {
+    v2Lifecycle.assertBinding(bindingContext);
+    v2Lifecycle.checkpoint();
+  } catch {
+    return reply({ response: "This AgentCore Runtime cannot accept the requested user binding.", status: "error" });
+  }
   const store = cronJobStore();
   if (action === "cron_status") {
-    const status = store.status(payload.jobId, userId);
+    const status = store.status(payload.jobId, bindingContext);
     // The Lambda now has the brief; late announces may follow it.
     if (status.status === "done") releaseCronTurn(payload.jobId);
     return reply(status);
@@ -2474,8 +2496,20 @@ async function handleCronAsync(payload, req, res) {
   if (!parsed.ok) return reply({ error: parsed.error }, 400);
   if (!payload.message) return reply({ error: "Missing message" }, 400);
   const { jobId } = parsed;
-  const started = store.start(jobId, { userId, deadline: Date.now() + parsed.budgetMs });
+  const started = store.start(jobId, {
+    userId, actorId,
+    runtimeSessionId: bindingContext.runtimeSessionId,
+    deadline: Date.now() + parsed.budgetMs,
+  });
   if (started.duplicate) {
+    // Only the binding that first registered the job may collect the idempotent
+    // "accepted" reply. A duplicate jobId whose record belongs to a different
+    // binding (or a legacy record with no binding fields) is an error: it was
+    // never produced by an accepted turn of this caller.
+    if (!store.isOwnedBy(jobId, bindingContext)) {
+      console.warn("[contract] cron_start jobId %s is held by a different binding", jobId);
+      return reply({ error: "jobId is already in use" }, 409);
+    }
     console.warn("[contract] cron_start for a known job ignored (state %s)", started.job.state);
     return reply({ status: "accepted", jobId, duplicate: true, deadline: started.job.deadline });
   }
