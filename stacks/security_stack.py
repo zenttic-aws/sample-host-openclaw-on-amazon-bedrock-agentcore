@@ -35,7 +35,13 @@ class SecurityStack(Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
-        # Allow CloudWatch Alarms to publish to KMS-encrypted SNS topics
+        # Allow CloudWatch Alarms to publish to KMS-encrypted SNS topics.
+        # Scope the grant to this account's CloudWatch alarms only (confused-
+        # deputy guard): add aws:SourceAccount + aws:SourceArn conditions so
+        # the service principal cannot be induced from any other account or on
+        # behalf of a non-alarm resource. kms:Decrypt is retained because
+        # CloudWatch must decrypt the data key when publishing an alarm
+        # notification to the SSE-KMS SNS topic (see observability_stack.py).
         self.cmk.add_to_resource_policy(
             iam.PolicyStatement(
                 actions=[
@@ -46,6 +52,17 @@ class SecurityStack(Stack):
                     iam.ServicePrincipal("cloudwatch.amazonaws.com"),
                 ],
                 resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "aws:SourceAccount": Stack.of(self).account,
+                    },
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:cloudwatch:{Stack.of(self).region}:"
+                            f"{Stack.of(self).account}:alarm:*"
+                        ),
+                    },
+                },
             )
         )
 
