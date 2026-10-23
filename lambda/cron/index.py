@@ -1061,6 +1061,68 @@ def verify_cron_event(event):
             "body": "Schedule ownership verification error",
         }
 
+    # Bind the delivery destination (and the message to execute) to the stored,
+    # server-authoritative CRON# record. The EventBridge Scheduler Target.Input
+    # is attacker-influenceable (via the eventbridge-cron skill and via scoped
+    # STS credentials that allow scheduler:UpdateSchedule), so every field used
+    # for delivery or runtime invocation MUST come from DynamoDB and the payload
+    # is only accepted when it matches. See CWE-639.
+    required_record_fields = ("channel", "channelTarget", "channelActorId", "actorId", "message")
+    missing = [field for field in required_record_fields if not cron_record.get(field)]
+    if missing:
+        logger.error(
+            "CRON# record for schedule %s is missing authoritative fields %s — refusing to deliver",
+            schedule_id, missing,
+        )
+        return None, {
+            "statusCode": 403,
+            "body": "Schedule record is missing delivery binding",
+        }
+
+    record_channel = cron_record.get("channel")
+    record_channel_target = cron_record.get("channelTarget")
+    record_channel_actor = cron_record.get("channelActorId")
+    record_actor = cron_record.get("actorId")
+    record_message = cron_record.get("message")
+
+    # Reject any payload that disagrees with the stored binding. We never
+    # overwrite the record from the payload — the payload is treated as
+    # untrusted and must match what the owner persisted at schedule creation.
+    if (channel != record_channel
+            or channel_target != record_channel_target
+            or actor_id != record_channel_actor
+            or message != record_message
+            or (event.get("actorId") is not None and event.get("actorId") != record_actor)):
+        logger.error(
+            "Schedule %s payload does not match stored CRON# record — refusing to deliver",
+            schedule_id,
+        )
+        return None, {
+            "statusCode": 403,
+            "body": "Schedule payload does not match stored record",
+        }
+
+    # The stored channelActorId must itself be bound to the resolved owner on
+    # the resolved channel — the actor prefix check above only validates the
+    # payload; here we re-validate the record so a tampered record is still
+    # caught. authorize_channel_actor (below) performs the DynamoDB side of
+    # this binding; here we only enforce the simple shape invariant.
+    if not isinstance(record_channel_actor, str) or not record_channel_actor.startswith(f"{record_channel}:"):
+        logger.error(
+            "Schedule %s stored channelActorId %r does not match channel %r",
+            schedule_id, record_channel_actor, record_channel,
+        )
+        return None, {
+            "statusCode": 403,
+            "body": "Schedule record channel binding invalid",
+        }
+
+    # From here on, use the record values — never the payload — for delivery.
+    channel = record_channel
+    channel_target = record_channel_target
+    actor_id = record_channel_actor
+    message = record_message
+
     # Phase 1: Get or create session
     try:
         session_id = get_or_create_session(current_user_id)

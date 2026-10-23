@@ -381,6 +381,9 @@ def cron_table():
     }
     table.items[(f"USER#{USER}", "CRON#schedule123")] = {
         "PK": f"USER#{USER}", "SK": "CRON#schedule123",
+        "channel": "telegram", "channelTarget": "123",
+        "channelActorId": ACTOR, "actorId": ACTOR,
+        "message": "hi",
     }
     return table
 
