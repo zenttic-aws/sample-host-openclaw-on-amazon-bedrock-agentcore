@@ -5,6 +5,7 @@ if cold, sends the cron message, and delivers the response to the user's
 channel (Telegram, Slack or Feishu).
 """
 
+import html as _html
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import re
 import time
 import uuid
 from urllib import request as urllib_request
+from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
@@ -504,12 +506,25 @@ def _markdown_to_telegram_html(text):
     text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
-    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection.
+    # Reject any URL containing characters that could break out of the href attribute
+    # (quotes, angle brackets, whitespace, control/NUL — incl. placeholder markers), then
+    # validate the full scheme (not just a prefix) and HTML-escape for attribute context.
+    _LINK_URL_FORBIDDEN = re.compile(r'[\x00-\x20"\'<>]')
+    _LINK_ALLOWED_SCHEMES = {"http", "https", "tg", "mailto"}
+
     def _safe_link(m):
         link_text, link_url = m.group(1), m.group(2)
-        if re.match(r'^(https?://|tg://|mailto:)', link_url):
-            return f'<a href="{link_url}">{link_text}</a>'
-        return m.group(0)  # leave non-http links as plain text
+        if _LINK_URL_FORBIDDEN.search(link_url):
+            return m.group(0)  # unsafe characters — leave as plain text
+        try:
+            scheme = urlparse(link_url).scheme.lower()
+        except ValueError:
+            return m.group(0)
+        if scheme not in _LINK_ALLOWED_SCHEMES:
+            return m.group(0)  # leave non-allowlisted links as plain text
+        safe_url = _html.escape(link_url, quote=True)
+        return f'<a href="{safe_url}">{link_text}</a>'
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
