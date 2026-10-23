@@ -1819,7 +1819,7 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
+    logger.info("Response to send (len=%d)", len(response_text))
 
     # If contract already streamed progressively to Telegram, skip duplicate send
     if result.get("streamed"):
