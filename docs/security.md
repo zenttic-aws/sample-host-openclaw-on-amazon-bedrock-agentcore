@@ -496,12 +496,29 @@ aws logs start-query \
      --region $CDK_DEFAULT_REGION
    ```
 
-2. **Temporarily disable a user** — Remove from allowlist (existing sessions continue until idle timeout):
+2. **Revoke a channel identity** — Remove from allowlist. The router re-checks the
+   allowlist on every webhook turn (`resolve_user` / `_is_currently_authorized`
+   in `lambda/router/index.py`), so the next message from the revoked identity
+   is rejected with the standard "this bot is private" reply. No idle-timeout
+   wait is required.
    ```bash
    ./scripts/manage-allowlist.sh remove telegram:123456789
    ```
+   For users who have linked several channels, use the per-user kill switch
+   instead — removing a single `ALLOW#channel:id` entry only stops that one
+   channel binding.
 
-3. **Force-terminate a session** — Sessions terminate naturally after idle timeout (30 min). No manual kill is needed in normal operation.
+3. **Operator kill switch (per user)** — Mark a canonical user DISABLED. This
+   sets `USER#<user_id>/PROFILE.status = DISABLED` and flips the live SESSION
+   record's `routeStatus` to `DRAINING`. Both the router Lambda and the cron
+   Lambda consult the status flag before resolving a route, so webhook turns
+   and scheduled jobs stop on the next invocation.
+   ```bash
+   ./scripts/manage-allowlist.sh disable user_abc123...
+   ./scripts/manage-allowlist.sh enable  user_abc123...   # to restore
+   ```
+
+4. **Force-terminate a session** — Sessions terminate naturally after idle timeout (30 min); the idle timeout only recycles the AgentCore microVM, it does **not** invalidate the DynamoDB route, so always combine it with `remove` and/or `disable` above when deauthorizing a user.
 
 ### Investigating CloudWatch Anomalies
 

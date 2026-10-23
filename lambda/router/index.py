@@ -461,32 +461,90 @@ def _aes_cbc_decrypt(key, iv, data):
 # DynamoDB identity helpers
 # ---------------------------------------------------------------------------
 
+def _allow_record_exists(channel_key):
+    """Return True iff ALLOW#<channel_key> currently exists (consistent read).
+
+    Uses a consistent read so that an operator revocation via
+    scripts/manage-allowlist.sh is observed on the very next turn.
+    """
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"}, ConsistentRead=True,
+        )
+    except ClientError as e:
+        # Fail closed on allowlist read errors so revocation is never silently
+        # bypassed by a transient DynamoDB fault.
+        logger.error("Allowlist check failed for %s: %s", channel_key, e)
+        return False
+    return "Item" in resp
+
+
 def is_user_allowed(channel, channel_user_id):
-    """Check if a new user is permitted to register.
+    """Check if the given channel identity is currently permitted.
 
     Returns True if:
-    - REGISTRATION_OPEN is true (anyone can register), OR
-    - An ALLOW#{channel}:{channel_user_id} record exists in DynamoDB
+    - REGISTRATION_OPEN is true (anyone may use the bot), OR
+    - An ALLOW#{channel}:{channel_user_id} record exists in DynamoDB.
 
-    This is only called for NEW users (no existing CHANNEL# record).
-    Existing users and bind-code redemptions bypass this check.
+    This is now consulted on *every* turn by ``resolve_user`` (not only on
+    first enrollment) so that removing a user from the allowlist actually
+    revokes their access.
+    """
+    if REGISTRATION_OPEN:
+        return True
+    return _allow_record_exists(f"{channel}:{channel_user_id}")
+
+
+def _is_currently_authorized(channel, channel_user_id, user_id):
+    """Re-evaluate per-turn authorization for an already-enrolled identity.
+
+    An enrolled identity remains authorized only while REGISTRATION_OPEN is
+    on, an ALLOW# record exists for its own channel key, OR — for linked
+    secondary channels — an ALLOW# record exists for the owning user's
+    original enrollment actor. Fails closed on missing / unreadable records
+    so operator revocation via scripts/manage-allowlist.sh takes effect on
+    the next webhook turn.
     """
     if REGISTRATION_OPEN:
         return True
     channel_key = f"{channel}:{channel_user_id}"
+    if _allow_record_exists(channel_key):
+        return True
+    # Linked secondary channel: honour the primary enrollment actor's ALLOW#.
     try:
-        resp = identity_table.get_item(Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"})
-        if "Item" in resp:
-            return True
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
     except ClientError as e:
-        logger.error("Allowlist check failed: %s", e)
+        logger.error("Authorization profile read failed for %s: %s", user_id, e)
+        return False
+    enrollment_actor = profile.get("enrollmentActorId")
+    if isinstance(enrollment_actor, str) and enrollment_actor and enrollment_actor != channel_key:
+        if _allow_record_exists(enrollment_actor):
+            return True
     return False
+
+
+def _is_user_disabled(user_id):
+    """Operator kill switch: USER#<id>/PROFILE.status == "DISABLED" blocks routing."""
+    try:
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
+    except ClientError as e:
+        # Fail closed: an unreadable profile must not grant service.
+        logger.error("User status read failed for %s: %s", user_id, e)
+        return True
+    return profile.get("status") == "DISABLED"
 
 
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
-    Returns (user_id, is_new). Returns (None, False) if user is not allowed.
+    Returns (user_id, is_new). Returns (None, False) if the identity is not
+    currently authorized — either because it was never enrolled and is not on
+    the allowlist, or because its ALLOW# record has since been removed, or
+    because the owning user has been administratively disabled.
     """
     channel_key = f"{channel}:{channel_user_id}"
     pk = f"CHANNEL#{channel_key}"
@@ -495,10 +553,27 @@ def resolve_user(channel, channel_user_id, display_name=""):
     try:
         resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"}, ConsistentRead=True)
         if "Item" in resp:
+            existing_user_id = resp["Item"]["userId"]
             owner = read_actor_owner(identity_table, channel_key)
-            if owner and owner["userId"] != resp["Item"]["userId"]:
+            if owner and owner["userId"] != existing_user_id:
                 raise RouteUnavailable("Channel mapping conflicts with durable actor ownership")
-            return resp["Item"]["userId"], False
+            # Re-evaluate authorization on every turn so that an operator
+            # removing the ALLOW# record (the documented revocation step)
+            # actually revokes service, instead of only blocking first-time
+            # enrollment. See docs/security.md "Revoking access".
+            if not _is_currently_authorized(channel, channel_user_id, existing_user_id):
+                logger.warning(
+                    "Enrolled identity %s is no longer on the allowlist — denying turn",
+                    channel_key,
+                )
+                return None, False
+            if _is_user_disabled(existing_user_id):
+                logger.warning(
+                    "User %s is administratively DISABLED — denying turn for %s",
+                    existing_user_id, channel_key,
+                )
+                return None, False
+            return existing_user_id, False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
         raise
@@ -517,7 +592,15 @@ def resolve_user(channel, channel_user_id, display_name=""):
 
 
 def get_or_create_session(user_id):
-    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation.
+
+    Also honours the operator kill switch: a USER#<id>/PROFILE record with
+    ``status == "DISABLED"`` short-circuits routing before any AgentCore
+    invocation, so operators can halt a compromised user without waiting for
+    allowlist propagation.
+    """
+    if _is_user_disabled(user_id):
+        raise RouteUnavailable("User is administratively disabled")
     return resolve_route(identity_table, user_id)
 
 
