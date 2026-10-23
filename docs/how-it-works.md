@@ -315,7 +315,7 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 |---|---|
 | `eventbridge-cron` | Cron scheduling via EventBridge Scheduler — create, update, and delete recurring tasks |
 | `s3-user-files` | Per-user file storage (S3-backed) — read, write, list, and delete files |
-| `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills. Runtime installs are recorded per user (`~/.openclaw/runtime-skills.json`); activation awaits `reinstallFromManifest` before `USER_READY`, and failed or invalid restoration blocks readiness |
+| `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills. Runtime installs are recorded per user (`~/.openclaw/runtime-skills.json`); activation awaits `reinstallFromManifest` before `USER_READY`. A failed or invalid restoration is logged, surfaced via `list.js` and does not block readiness; entries that fail repeatedly are quarantined (`disabled: true`) and corrupt manifests are rewritten clean so a single bad entry cannot permanently lock a user out |
 | `api-keys` | Secure API key management — dual-mode storage with native file-based or AWS Secrets Manager backend (see [API Key Management](#api-key-management)) |
 | `agentcore-browser` | Headless Chromium browser — navigate, screenshot, interact with web pages (optional, see [Browser Support](#browser-support-optional)) |
 
