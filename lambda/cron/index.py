@@ -994,7 +994,13 @@ def handler(event, context):
     phase = event.get("cronPhase")
     if phase in ASYNC_PHASES:
         return run_async_phase(phase, event, context)
-    logger.info("Cron event received: %s", json.dumps(event)[:1000])
+    logger.info(
+        "Cron event received: schedule=%s user=%s channel=%s msg_len=%d",
+        event.get("scheduleId"),
+        event.get("userId"),
+        event.get("channel"),
+        len(event.get("message") or ""),
+    )
     if CRON_ASYNC_STATE_MACHINE_ARN:
         return launch_async(event)
 
