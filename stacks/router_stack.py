@@ -96,7 +96,10 @@ class RouterStack(Stack):
             "RouterLogGroup",
             log_group_name=namer.name("/openclaw/lambda/router"),
             retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
+            # RETAIN to match the API access log group so router history is
+            # preserved across stack delete/replace. Operational retention
+            # (30 d) still applies.
+            removal_policy=RemovalPolicy.RETAIN,
         )
 
         # --- Lambda Function ---

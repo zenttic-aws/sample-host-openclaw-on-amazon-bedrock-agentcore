@@ -32,7 +32,7 @@
     "registration_open": false,
     "cron_lambda_timeout_seconds": 900,
     "cron_lambda_memory_mb": 256,
-    "enable_cloudtrail": false,
+    "enable_cloudtrail": true,
     "enable_browser": true,
     "enable_gateway": false,
     "runtime_manifest": "",

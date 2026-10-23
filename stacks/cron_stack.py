@@ -94,7 +94,10 @@ class CronStack(Stack):
             "CronLogGroup",
             log_group_name=namer.name("/openclaw/lambda/cron"),
             retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
+            # RETAIN so cron execution history survives stack delete/replace;
+            # matches the API access and VPC flow log groups. Operational
+            # retention (30 d) still applies.
+            removal_policy=RemovalPolicy.RETAIN,
         )
 
         # --- Cron Executor Lambda ---
@@ -173,7 +176,9 @@ class CronStack(Stack):
             self, "CronRunnerLogGroup",
             log_group_name=namer.name("/openclaw/states/cron-runner"),
             retention=retention_days(log_retention),
-            removal_policy=RemovalPolicy.DESTROY,
+            # RETAIN so cron-runner state machine history survives stack
+            # delete/replace. Operational retention (30 d) still applies.
+            removal_policy=RemovalPolicy.RETAIN,
         )
         self.cron_runner = sfn.StateMachine(
             self, "CronRunner",

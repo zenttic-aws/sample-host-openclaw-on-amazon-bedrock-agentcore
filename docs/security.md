@@ -234,15 +234,23 @@ The former startup shim and its custom web-fetch SSRF implementation are removed
 
 ### 3.9 Audit, Monitoring & Observability
 
-#### CloudTrail (Optional — Off by Default)
+#### CloudTrail (On by Default)
 
-Most AWS accounts already have an organization-level or account-level CloudTrail. Deploying a second trail adds cost (S3 storage for log delivery, CloudWatch log group) with no additional security benefit. For this reason, the project's dedicated CloudTrail is **disabled by default**.
+Tenant isolation on the multi-tenant user-files bucket is enforced in
+application code, so object-level audit logs are the primary detection
+mechanism for a cross-namespace bypass. For that reason the project's
+dedicated CloudTrail is **enabled by default**, is multi-region, and
+selects S3 data events on the user-files bucket.
 
-To enable it, set `"enable_cloudtrail": true` in `cdk.json` and redeploy. This creates:
+If your account is already covered by an organization-level or account-
+level CloudTrail that captures these same events (including S3 data events
+for the user-files bucket), set `"enable_cloudtrail": false` in `cdk.json`
+and redeploy to avoid the duplicate cost. Enabled, it creates:
 
 | Feature | Configuration |
 |---|---|
-| API call audit trail | Multi-region disabled (single-region deployment), global service events included |
+| API call audit trail | Multi-region enabled, global service events included |
+| S3 data events | Read/write object-level events on the user-files bucket |
 | File validation | Enabled — cryptographic integrity checks detect log tampering |
 | Storage | Dedicated S3 bucket (SSE-S3, versioned, SSL enforced, public access blocked) |
 | CloudWatch delivery | Trail logs also sent to CloudWatch log group for real-time analysis |

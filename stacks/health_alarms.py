@@ -57,6 +57,11 @@ def add_health_alarms(scope: Construct, alarm_topic: sns.ITopic, groups=("contai
 
 
 def _ensure_container_group(scope, stack):
+    # Container log group retention is driven by the CDK context so this group
+    # matches every other /openclaw/* group. 30 d is the current default.
+    retention_days = int(
+        scope.node.try_get_context("cloudwatch_log_retention_days") or 30
+    )
     ensure = cr.AwsCustomResource(
         scope,
         "EnsureContainerLogGroup",
@@ -85,6 +90,59 @@ def _ensure_container_group(scope, stack):
         [cdk_nag.NagPackSuppression(
             id="AwsSolutions-IAM5",
             reason="logs:CreateLogGroup on the single /openclaw/container log group (its ARN ends in :*).",
+            applies_to=[cdk_nag.RegexAppliesTo(regex="/^Resource::arn:aws:logs:.*:log-group:\\/openclaw\\/container:\\*$/")],
+        )],
+        apply_to_children=True,
+    )
+
+    # The container log group is created with no retention by
+    # createLogGroup, and an existing group keeps whatever retention it has.
+    # Set it explicitly to the configured value so this group follows the
+    # same policy as every other /openclaw/* group. putRetentionPolicy is
+    # idempotent and runs on every stack update.
+    retention = cr.AwsCustomResource(
+        scope,
+        "EnsureContainerLogGroupRetention",
+        on_create=cr.AwsSdkCall(
+            service="CloudWatchLogs",
+            action="putRetentionPolicy",
+            parameters={
+                "logGroupName": CONTAINER_LOG_GROUP,
+                "retentionInDays": retention_days,
+            },
+            physical_resource_id=cr.PhysicalResourceId.of(
+                f"{CONTAINER_LOG_GROUP}:retention"
+            ),
+        ),
+        on_update=cr.AwsSdkCall(
+            service="CloudWatchLogs",
+            action="putRetentionPolicy",
+            parameters={
+                "logGroupName": CONTAINER_LOG_GROUP,
+                "retentionInDays": retention_days,
+            },
+            physical_resource_id=cr.PhysicalResourceId.of(
+                f"{CONTAINER_LOG_GROUP}:retention"
+            ),
+        ),
+        policy=cr.AwsCustomResourcePolicy.from_statements([
+            iam.PolicyStatement(
+                actions=["logs:PutRetentionPolicy"],
+                resources=[
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}",
+                    f"arn:aws:logs:{stack.region}:{stack.account}:log-group:{CONTAINER_LOG_GROUP}:*",
+                ],
+            ),
+        ]),
+        install_latest_aws_sdk=False,
+    )
+    # The retention custom resource must run after the group is created.
+    retention.node.add_dependency(ensure)
+    cdk_nag.NagSuppressions.add_resource_suppressions(
+        retention,
+        [cdk_nag.NagPackSuppression(
+            id="AwsSolutions-IAM5",
+            reason="logs:PutRetentionPolicy on the single /openclaw/container log group (its ARN ends in :*).",
             applies_to=[cdk_nag.RegexAppliesTo(regex="/^Resource::arn:aws:logs:.*:log-group:\\/openclaw\\/container:\\*$/")],
         )],
         apply_to_children=True,

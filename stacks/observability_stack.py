@@ -91,7 +91,9 @@ class ObservabilityStack(Stack):
                 "BedrockInvocationLogGroup",
                 log_group_name="/aws/bedrock/invocation-logs",
                 retention=retention_days(log_retention),
-                removal_policy=RemovalPolicy.DESTROY,
+                # RETAIN so Bedrock model-invocation history survives stack
+                # delete/replace. Operational retention still applies.
+                removal_policy=RemovalPolicy.RETAIN,
             )
 
             # IAM role for Bedrock to write to CloudWatch Logs
