@@ -231,6 +231,124 @@ def _get_feishu_tenant_token():
 # Webhook validation helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Async self-invocation authenticator
+# ---------------------------------------------------------------------------
+#
+# The handler re-enters itself via lambda:Invoke to finish processing after
+# ACK'ing the platform (see `_self_invoke_async`). Historically the re-entry
+# branch trusted a self-asserted `_async_dispatch` flag on the event, which
+# meant any principal that could invoke this function could skip the per-
+# channel signature verifiers. We now attach an HMAC produced from a secret
+# only the router holds, keyed to the exact channel + body + filtered headers,
+# and refuse to dispatch unless the MAC verifies and the timestamp is fresh.
+
+_ASYNC_DISPATCH_LABEL = b"openclaw-async-dispatch-v1"
+_ASYNC_DISPATCH_MAX_AGE_SECONDS = 300  # 5 minutes
+
+
+def _async_dispatch_key():
+    """Derive a dedicated subkey for signing async-dispatch envelopes.
+
+    We never sign with the raw webhook secret directly: the webhook secret is
+    also handed to Telegram as the X-Telegram-Bot-Api-Secret-Token value, so
+    reusing it verbatim would let a Telegram-controlled party forge async
+    envelopes. HKDF-style derivation isolates the key material.
+
+    Returns an empty bytes string when no webhook secret is configured; the
+    verifier treats that as fail-closed.
+    """
+    secret = _get_webhook_secret()
+    if not secret:
+        return b""
+    secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else secret
+    return hmac.new(secret_bytes, _ASYNC_DISPATCH_LABEL, hashlib.sha256).digest()
+
+
+def _canonical_async_dispatch_message(timestamp, nonce, channel, body, headers):
+    """Build the canonical byte string the MAC is computed over.
+
+    The body and headers can be arbitrarily large or structured; we hash each
+    before concatenating so field boundaries are unambiguous.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        body_bytes = bytes(body)
+    elif isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    headers_bytes = json.dumps(
+        headers or {}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+    body_digest = hashlib.sha256(body_bytes).hexdigest()
+    headers_digest = hashlib.sha256(headers_bytes).hexdigest()
+
+    return "|".join([
+        "v1",
+        str(timestamp),
+        str(nonce),
+        str(channel or ""),
+        body_digest,
+        headers_digest,
+    ]).encode("utf-8")
+
+
+def _sign_async_dispatch(channel, body, headers):
+    """Return the auth envelope that `_self_invoke_async` attaches to the event.
+
+    Returns None if no signing key is available; callers must then refuse to
+    dispatch rather than send an unsigned payload.
+    """
+    key = _async_dispatch_key()
+    if not key:
+        return None
+    timestamp = int(time.time())
+    nonce = uuid.uuid4().hex
+    message = _canonical_async_dispatch_message(timestamp, nonce, channel, body, headers)
+    mac = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return {"v": 1, "ts": timestamp, "nonce": nonce, "mac": mac}
+
+
+def _verify_async_dispatch(event):
+    """Verify the HMAC envelope on an incoming async-dispatch event.
+
+    Returns True only when the MAC matches a message built from the exact
+    channel/body/headers on the event and the timestamp is within the
+    allowed window. Any missing field, stale timestamp, or MAC mismatch is
+    rejected (fail-closed).
+    """
+    auth = event.get("_auth")
+    if not isinstance(auth, dict):
+        return False
+    if auth.get("v") != 1:
+        return False
+    ts = auth.get("ts")
+    nonce = auth.get("nonce")
+    provided_mac = auth.get("mac")
+    if not isinstance(ts, int) or not isinstance(nonce, str) or not isinstance(provided_mac, str):
+        return False
+    now = int(time.time())
+    if abs(now - ts) > _ASYNC_DISPATCH_MAX_AGE_SECONDS:
+        return False
+
+    key = _async_dispatch_key()
+    if not key:
+        logger.error("Async dispatch verification failed \u2014 no webhook secret configured")
+        return False
+
+    message = _canonical_async_dispatch_message(
+        ts,
+        nonce,
+        event.get("_channel"),
+        event.get("_body"),
+        event.get("_headers", {}),
+    )
+    expected_mac = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected_mac, provided_mac)
+
+
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
 
@@ -2541,6 +2659,15 @@ def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
+        # The handler re-enters itself via lambda:Invoke after the per-channel
+        # verifier passes. We refuse to dispatch unless the envelope carries a
+        # valid HMAC produced by `_self_invoke_async` with the router's own
+        # webhook secret; without this, any principal with lambda:InvokeFunction
+        # on this ARN could skip signature verification and impersonate users.
+        if not _verify_async_dispatch(event):
+            logger.warning("Async dispatch rejected \u2014 missing or invalid authenticator")
+            return {"statusCode": 401, "body": "Unauthorized"}
+
         channel = event.get("_channel")
         body = event.get("_body")
         headers = event.get("_headers", {})
@@ -2689,6 +2816,14 @@ def handler(event, context):
 
 def _self_invoke_async(channel, body, headers):
     """Invoke this Lambda asynchronously to process the webhook in the background."""
+    filtered_headers = {k: v for k, v in (headers or {}).items()
+                        if k.startswith(("x-slack-", "x-lark-"))}
+    auth = _sign_async_dispatch(channel, body, filtered_headers)
+    if auth is None:
+        # Refuse to emit an unsigned envelope — the receiver would reject it
+        # anyway and this way the failure is logged at the producer.
+        logger.error("Self-invoke aborted \u2014 cannot sign async dispatch (no webhook secret)")
+        return
     try:
         lambda_client.invoke(
             FunctionName=LAMBDA_FUNCTION_NAME,
@@ -2697,8 +2832,8 @@ def _self_invoke_async(channel, body, headers):
                 "_async_dispatch": True,
                 "_channel": channel,
                 "_body": body,
-                "_headers": {k: v for k, v in (headers or {}).items()
-                             if k.startswith(("x-slack-", "x-lark-"))},
+                "_headers": filtered_headers,
+                "_auth": auth,
             }).encode(),
         )
     except Exception as e:
