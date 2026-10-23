@@ -168,8 +168,27 @@ function extractSessionMetadata(parsed, headers) {
     if (BOUND_ACTOR_ID && identity.actorId !== BOUND_ACTOR_ID) {
       throw new Error("Proxy canonical actor changed");
     }
+    // The identity file is written by the trusted contract once per turn, but
+    // `/tmp` is world-writable inside the microVM. Treat the whole record as
+    // part of the binding: validate every sibling we forward to Bedrock
+    // `requestMetadata` against the proxy's own allowlists, and refuse any
+    // value that does not match — the same guarantee as the actorId pin.
+    const rawChannel = identity.channel == null ? "unknown" : identity.channel;
+    if (typeof rawChannel !== "string" || !VALID_CHANNELS.has(rawChannel)) {
+      throw new Error("Proxy canonical actor changed");
+    }
+    if (identity.sessionId !== undefined && identity.sessionId !== null &&
+        identity.sessionId !== "" &&
+        (typeof identity.sessionId !== "string" ||
+          !RUNTIME_SESSION_ID.test(identity.sessionId))) {
+      throw new Error("Proxy canonical actor changed");
+    }
+    if (identity.trigger !== undefined && identity.trigger !== null &&
+        identity.trigger !== "chat" && identity.trigger !== "cron") {
+      throw new Error("Proxy canonical actor changed");
+    }
     actorId = identity.actorId;
-    channel = identity.channel || "unknown";
+    channel = rawChannel;
     idSource = "identity-file";
   }
   const modelOverride = idSource === "identity-file" &&
@@ -359,9 +378,13 @@ function extractSessionMetadata(parsed, headers) {
   }
 
   // 5b. Validate actorId format to prevent prompt injection.
-  // Only allow channel:alphanumeric patterns or known fallback values.
+  // Only allow channel:alphanumeric patterns or known fallback values. The
+  // body is capped at 37 characters so the derived namespace
+  // (actorId.replace(':', '_')) stays within 46 characters — the maximum
+  // width that fits inside EventBridge schedule names without truncation
+  // (see bridge/skills/eventbridge-cron/common.js buildScheduleName).
   const VALID_ACTOR_ID =
-    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,37}$/;
   if (actorId !== "default-user" && !VALID_ACTOR_ID.test(actorId)) {
     console.warn(
       `[proxy] WARNING: actorId "${actorId.slice(0, 80)}" failed validation — falling back to default-user.`,
@@ -409,6 +432,11 @@ function extractSessionMetadata(parsed, headers) {
 // cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
 // both processes derive the same password for the same actorId.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
+// Per-session sticky redaction of previously-blocked user turns. Without this,
+// scopeGuardrailToLatestUserTurn would re-send blocked text untagged on the
+// next turn (see guardrail-blocklist.js and docs/guardrails.md).
+const { createGuardrailBlocklist } = require("./guardrail-blocklist");
+const guardrailBlocklist = createGuardrailBlocklist();
 const { reconcileToolHistory } = require("./tool-history");
 const { readBody } = require("./read-body");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
@@ -637,13 +665,12 @@ const WORKSPACE_DEFAULTS = {
  * Sanitize workspace file content before it is embedded in the Converse
  * `system` block.
  *
- * The source objects live under <namespace>/_system/ and are not writable
- * through either user-facing surface (bridge/skills/s3-user-files/common.js
- * SYSTEM_PREFIX, lambda/gateway_tools/lib/mcp.js SYSTEM_PREFIX, and the scoped
- * STS session policy in bridge/scoped-credentials.js), but the proxy itself
- * seeded or restored this file so the content may still have been shaped by
- * an earlier indirect prompt injection or a legacy write that pre-dated the
- * reserved-name denylist. Treat the bytes as untrusted data:
+ * The source objects live under _system/<namespace>/ at the bucket root and
+ * are not reachable through either user-facing surface or the scoped STS
+ * session (bridge/workspace-files-s3.js), but the content may still have been
+ * shaped by an earlier indirect prompt injection, or copied across from the
+ * user-writable legacy <namespace>/<filename> key on first read. Treat the
+ * bytes as untrusted data:
  *   - truncate to the per-file budget,
  *   - escape fence delimiters so the untrusted block cannot close the
  *     surrounding ~~~ wrapper,
@@ -688,28 +715,24 @@ function sanitizeWorkspaceContent(raw) {
   return out;
 }
 
-// Reserved sub-prefix in the user-files bucket that only the proxy and the
-// contract write to; the scoped STS session policy denies PutObject /
-// DeleteObject on it (see bridge/scoped-credentials.js), and both skill
-// surfaces refuse it (bridge/skills/s3-user-files/common.js SYSTEM_PREFIX,
-// lambda/gateway_tools/lib/mcp.js SYSTEM_PREFIX). Workspace Markdown
-// concatenated into the Converse `system` block MUST be read from this
-// prefix so a compromised user cannot plant persistent system-role
-// instructions.
-const SYSTEM_WORKSPACE_PREFIX = "_system/";
+// Workspace Markdown concatenated into the Converse `system` block is read
+// from `_system/<namespace>/` at the bucket root (bridge/workspace-files-s3.js).
+// That prefix is outside the user's `<namespace>/` prefix, so the scoped STS
+// session policy gives the in-microVM agent no access to it, and both skill
+// surfaces also refuse the reserved filenames
+// (bridge/skills/s3-user-files/common.js, lambda/gateway_tools/lib/mcp.js).
+// Only this proxy and the contract server write it, with the execution role.
+const workspaceFiles = require("./workspace-files-s3");
 
-/**
- * S3 key the proxy uses to read/write a workspace file. The reserved
- * `_system/` sub-prefix is the only location whose contents the proxy will
- * splice into the privileged system prompt.
- */
-function workspaceKey(namespace, filename) {
-  return `${namespace}/${SYSTEM_WORKSPACE_PREFIX}${filename}`;
+function s3Commands() {
+  const { GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+  return { GetObjectCommand, PutObjectCommand };
 }
 
 /**
- * Read a user file from S3 (fire-and-forget on error).
- * Returns the file content or empty string.
+ * Read a workspace file from S3 (never throws).
+ * Returns the file content or empty string. A file still at the legacy
+ * `<namespace>/<filename>` key is copied to the new key on first read.
  */
 async function readUserFileFromS3(namespace, filename) {
   const bucket = process.env.S3_USER_FILES_BUCKET;
@@ -721,42 +744,33 @@ async function readUserFileFromS3(namespace, filename) {
   ) {
     return "";
   }
-  const key = workspaceKey(namespace, filename);
   try {
-    const { GetObjectCommand } = require("@aws-sdk/client-s3");
-    const s3 = getS3Client();
-    const response = await s3.send(
-      new GetObjectCommand({
-        Bucket: bucket,
-        Key: key,
-      }),
-    );
-    const chunks = [];
-    for await (const chunk of response.Body) {
-      chunks.push(chunk);
-    }
-    const content = Buffer.concat(chunks).toString("utf-8").trim();
-    console.log(
-      `[proxy] Read ${filename} for ${namespace}: ${content.length} bytes`,
-    );
-    return content;
-  } catch (err) {
-    if (err.name === "NoSuchKey" || err.$metadata?.httpStatusCode === 404) {
+    const { content, source } = await workspaceFiles.readWorkspaceFile({
+      s3: getS3Client(), commands: s3Commands(), bucket, namespace, filename,
+      log: (msg) => console.log(msg),
+    });
+    if (source === "none") {
       console.log(`[proxy] No ${filename} for ${namespace} (not created yet)`);
     } else {
-      console.warn(
-        "[proxy] Failed to read %s for %s:",
-        filename,
-        namespace,
-        err.message,
+      console.log(
+        `[proxy] Read ${filename} for ${namespace}: ${content.length} bytes`,
       );
     }
+    return content;
+  } catch (err) {
+    console.warn(
+      "[proxy] Failed to read %s for %s:",
+      filename,
+      namespace,
+      err.message,
+    );
     return "";
   }
 }
 
 /**
- * Write a file to a user's S3 namespace (fire-and-forget on error).
+ * Seed a default workspace file (fire-and-forget on error). Never
+ * overwrites an existing object.
  */
 async function writeUserFileToS3(namespace, filename, content) {
   const bucket = process.env.S3_USER_FILES_BUCKET;
@@ -769,19 +783,14 @@ async function writeUserFileToS3(namespace, filename, content) {
     return;
   }
   try {
-    const { PutObjectCommand } = require("@aws-sdk/client-s3");
-    const s3 = getS3Client();
-    await s3.send(
-      new PutObjectCommand({
-        Bucket: bucket,
-        Key: workspaceKey(namespace, filename),
-        Body: content,
-        ContentType: "text/markdown; charset=utf-8",
-      }),
-    );
-    console.log(
-      `[proxy] Seeded ${filename} for ${namespace}: ${content.length} bytes`,
-    );
+    const written = await workspaceFiles.seedWorkspaceFile({
+      s3: getS3Client(), commands: s3Commands(), bucket, namespace, filename, content,
+    });
+    if (written) {
+      console.log(
+        `[proxy] Seeded ${filename} for ${namespace}: ${content.length} bytes`,
+      );
+    }
   } catch (err) {
     console.warn(
       "[proxy] Failed to seed %s for %s:",
@@ -833,8 +842,15 @@ const VALID_CHANNELS = new Set([
   "discord",
   "whatsapp",
   "line",
+  "feishu",
   "unknown",
 ]);
+
+// Bedrock's requestMetadata charset: identifiers only, up to 128 characters.
+// The identity file is written by the trusted contract so legitimate values
+// stay inside this set; a mutated file that strays out of it is treated as
+// a canonical-actor change and refused.
+const RUNTIME_SESSION_ID = /^[A-Za-z0-9:_@$#=/+,.-]{1,128}$/;
 
 async function retrieveMemoryContext(_actorId, _lastUserText) {
   // Stub — memory retrieval not yet implemented.
@@ -870,7 +886,7 @@ async function buildUserIdentityContext(actorId, channel) {
           `\n### Workspace (UNTRUSTED): ${wf.label} (${wf.filename})\n` +
             `*Skipped — total workspace size cap reached.* ` +
             `The file lives under the operator-controlled ` +
-            `\`${namespace}/_system/\` prefix and is not fetched again here. ` +
+            `\`_system/${namespace}/\` prefix and is not fetched again here. ` +
             `If the user asks to inspect it, read it on demand.\n`,
         );
         continue;
@@ -895,7 +911,7 @@ async function buildUserIdentityContext(actorId, channel) {
       fileSections.push(
         `\n### Workspace (UNTRUSTED): ${wf.label} (${wf.filename})\n` +
           `*Not yet seeded.* This user has no \`${wf.filename}\` under the ` +
-          `operator-controlled \`${namespace}/_system/\` prefix. ` +
+          `operator-controlled \`_system/${namespace}/\` prefix. ` +
           `This file is operator-sourced and is NOT writable through ` +
           `write_user_file; the proxy will seed a default on the next ` +
           `request. When the user provides ${wf.purpose}, save it to a ` +
@@ -1151,7 +1167,7 @@ function resolveModelId(requestedModel, modelOverride = null) {
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
 async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel, modelOverride = null,
-  metadataFor = null) {
+  metadataFor = null, sessionId = "") {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
@@ -1161,7 +1177,12 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     region: AWS_REGION,
     requestHandler: bedrockClientOptions(modelId),
   });
-  const { bedrockMessages, systemText } = convertMessages(messages);
+  let { bedrockMessages, systemText } = convertMessages(messages);
+  // Strip any text block the input filter already blocked in this session,
+  // so it is not replayed untagged as part of history (see guardrail-blocklist.js).
+  if (guardrailConfig && sessionId) {
+    bedrockMessages = guardrailBlocklist.redactBlockedHistory(sessionId, bedrockMessages);
+  }
   const finalSystemText = systemTextOverride || systemText;
 
   const params = {
@@ -1197,9 +1218,13 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
       if (response?.trace?.guardrail) {
         console.debug("[guardrail] trace:", JSON.stringify(response.trace.guardrail));
       }
-      // Handle guardrail intervention
+      // Handle guardrail intervention: remember the blocked turn so later
+      // requests in this session strip it from history before scoping.
       if (response?.stopReason === "guardrail_intervened") {
         console.warn("[guardrail] intervention on non-streaming response");
+        if (sessionId) {
+          guardrailBlocklist.recordBlockedUserTurn(sessionId, params.messages);
+        }
       }
 
       const outputMessage = response.output?.message;
@@ -1260,6 +1285,7 @@ async function invokeBedrockStreaming(
   systemPrefix,
   modelOverride = null,
   metadataFor = null,
+  sessionId = "",
 ) {
   if (modelOutcomeUnknown) {
     if (!res.destroyed && !res.writableEnded) {
@@ -1279,12 +1305,12 @@ async function invokeBedrockStreaming(
   });
   try {
     return await invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
-      metadataFor);
+      metadataFor, sessionId);
   } finally { route?.finish(); }
 }
 
 async function invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
-  metadataFor = null) {
+  metadataFor = null, sessionId = "") {
   const {
     BedrockRuntimeClient,
     ConverseStreamCommand,
@@ -1295,7 +1321,12 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     requestHandler: bedrockStreamClientOptions(modelId),
     ...(route && { maxAttempts: 1 }),
   });
-  const { bedrockMessages, systemText } = convertMessages(messages);
+  let { bedrockMessages, systemText } = convertMessages(messages);
+  // Strip any text block the input filter already blocked in this session,
+  // so it is not replayed untagged as part of history (see guardrail-blocklist.js).
+  if (guardrailConfig && sessionId) {
+    bedrockMessages = guardrailBlocklist.redactBlockedHistory(sessionId, bedrockMessages);
+  }
   const finalSystemText = systemTextOverride || systemText;
 
   const payload = {
@@ -1476,6 +1507,9 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
         }
         if (event.messageStop?.stopReason === "guardrail_intervened") {
           console.warn("[guardrail] intervention on streaming response");
+          if (sessionId) {
+            guardrailBlocklist.recordBlockedUserTurn(sessionId, params.messages);
+          }
         }
       }
 
@@ -1783,6 +1817,7 @@ const server = http.createServer(async (req, res) => {
             systemPrefix,
             modelOverride,
             metadataFor,
+            sessionId,
           );
         } else {
           const result = await invokeBedrock(
@@ -1792,6 +1827,7 @@ const server = http.createServer(async (req, res) => {
             parsed.model,
             modelOverride,
             metadataFor,
+            sessionId,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(

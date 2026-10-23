@@ -118,84 +118,114 @@ describe("buildKey", () => {
 });
 
 describe("validateUserId", () => {
-  it("accepts valid telegram namespace", () => {
-    assert.doesNotThrow(() => validateUserId("telegram_123456789"));
+  // validateUserId now requires the argv namespace to equal the container's
+  // own identity (resolved from /tmp/current-identity.json or USER_ID). Tests
+  // bind USER_ID to the namespace they expect to be accepted, and clear it
+  // afterwards. The identity file is not present in the test environment, so
+  // the env-var fallback is exercised.
+  function withOwnIdentity(ownNamespace, fn) {
+    const prevUserId = process.env.USER_ID;
+    const prevInternal = process.env.INTERNAL_USER_ID;
+    // actorId uses ':' which validateUserId maps to '_' before comparing.
+    process.env.USER_ID = ownNamespace.replace(/_/, ":");
+    delete process.env.INTERNAL_USER_ID;
+    try {
+      fn();
+    } finally {
+      if (prevUserId === undefined) delete process.env.USER_ID;
+      else process.env.USER_ID = prevUserId;
+      if (prevInternal === undefined) delete process.env.INTERNAL_USER_ID;
+      else process.env.INTERNAL_USER_ID = prevInternal;
+    }
+  }
+
+  function expectExit(fn) {
+    const originalExit = process.exit;
+    let exitCode = null;
+    process.exit = (code) => {
+      exitCode = code;
+      throw new Error("process.exit called");
+    };
+    try {
+      assert.throws(fn, /process\.exit/);
+      assert.equal(exitCode, 1);
+    } finally {
+      process.exit = originalExit;
+    }
+  }
+
+  it("accepts valid telegram namespace when it matches own identity", () => {
+    withOwnIdentity("telegram_123456789", () => {
+      assert.doesNotThrow(() => validateUserId("telegram_123456789"));
+    });
   });
 
-  it("accepts valid slack namespace", () => {
-    assert.doesNotThrow(() => validateUserId("slack_sen-outlook"));
+  it("accepts valid slack namespace when it matches own identity", () => {
+    withOwnIdentity("slack_sen-outlook", () => {
+      assert.doesNotThrow(() => validateUserId("slack_sen-outlook"));
+    });
   });
 
-  it("accepts valid discord namespace", () => {
-    assert.doesNotThrow(() => validateUserId("discord_123456789012345678"));
+  it("accepts valid discord namespace when it matches own identity", () => {
+    withOwnIdentity("discord_123456789012345678", () => {
+      assert.doesNotThrow(() => validateUserId("discord_123456789012345678"));
+    });
   });
 
-  it("accepts valid line namespace", () => {
-    assert.doesNotThrow(() => validateUserId("line_U0000000000000000000000000000001"));
+  it("accepts valid line namespace when it matches own identity", () => {
+    withOwnIdentity("line_U0000000000000000000000000000001", () => {
+      assert.doesNotThrow(() => validateUserId("line_U0000000000000000000000000000001"));
+    });
   });
 
-  it("accepts valid slack namespace with uppercase ID", () => {
-    assert.doesNotThrow(() => validateUserId("slack_U0XXXXXXXX1"));
+  it("accepts valid slack namespace with uppercase ID when it matches own identity", () => {
+    withOwnIdentity("slack_U0XXXXXXXX1", () => {
+      assert.doesNotThrow(() => validateUserId("slack_U0XXXXXXXX1"));
+    });
   });
 
   it("rejects empty userId", () => {
-    // validateUserId calls process.exit, so we mock it
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
-    try {
-      assert.throws(() => validateUserId(""), /process\.exit/);
-      assert.equal(exitCode, 1);
-    } finally {
-      process.exit = originalExit;
-    }
+    withOwnIdentity("telegram_123456789", () => {
+      expectExit(() => validateUserId(""));
+    });
   });
 
   it("rejects default-user", () => {
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
-    try {
-      assert.throws(() => validateUserId("default-user"), /process\.exit/);
-      assert.equal(exitCode, 1);
-    } finally {
-      process.exit = originalExit;
-    }
+    withOwnIdentity("telegram_123456789", () => {
+      expectExit(() => validateUserId("default-user"));
+    });
   });
 
   it("rejects arbitrary namespace without channel prefix", () => {
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
-    try {
-      assert.throws(() => validateUserId("my-custom-id"), /process\.exit/);
-      assert.equal(exitCode, 1);
-    } finally {
-      process.exit = originalExit;
-    }
+    withOwnIdentity("telegram_123456789", () => {
+      expectExit(() => validateUserId("my-custom-id"));
+    });
   });
 
   it("rejects path traversal attempts", () => {
-    const originalExit = process.exit;
-    let exitCode = null;
-    process.exit = (code) => {
-      exitCode = code;
-      throw new Error("process.exit called");
-    };
+    withOwnIdentity("telegram_123456789", () => {
+      expectExit(() => validateUserId("../other_user"));
+    });
+  });
+
+  it("rejects a format-valid namespace that is not the container's own", () => {
+    // The core of the fix: a well-formed channel_identifier for another
+    // tenant must be refused even though it passes the regex.
+    withOwnIdentity("telegram_123456789", () => {
+      expectExit(() => validateUserId("telegram_987654321"));
+    });
+  });
+
+  it("rejects when the container has no resolvable identity", () => {
+    const prevUserId = process.env.USER_ID;
+    const prevInternal = process.env.INTERNAL_USER_ID;
+    delete process.env.USER_ID;
+    delete process.env.INTERNAL_USER_ID;
     try {
-      assert.throws(() => validateUserId("../other_user"), /process\.exit/);
-      assert.equal(exitCode, 1);
+      expectExit(() => validateUserId("telegram_123456789"));
     } finally {
-      process.exit = originalExit;
+      if (prevUserId !== undefined) process.env.USER_ID = prevUserId;
+      if (prevInternal !== undefined) process.env.INTERNAL_USER_ID = prevInternal;
     }
   });
 });

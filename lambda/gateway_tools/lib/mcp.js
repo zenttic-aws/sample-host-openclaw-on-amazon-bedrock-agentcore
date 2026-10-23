@@ -24,10 +24,10 @@ function toolNameFromContext(context) {
 }
 
 /**
- * Reserved sub-prefix that the Bedrock proxy uses to source system-prompt
- * files; see bridge/skills/s3-user-files/common.js SYSTEM_PREFIX. Mirrored
- * here so the gateway MCP write_file / delete_file surface cannot overwrite
- * those keys either.
+ * Reserved "_system/" filename prefix; see
+ * bridge/skills/s3-user-files/common.js SYSTEM_PREFIX. The proxy's sources
+ * live at "_system/<namespace>/" at the bucket root, outside the user prefix;
+ * this mirror keeps both tool surfaces refusing the same names.
  */
 const SYSTEM_PREFIX = "_system/";
 

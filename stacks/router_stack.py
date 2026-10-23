@@ -20,6 +20,7 @@ from aws_cdk import (
     aws_kms as kms,
     aws_lambda as _lambda,
     aws_logs as logs,
+    aws_sqs as sqs,
 )
 import cdk_nag
 import json
@@ -99,6 +100,23 @@ class RouterStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
+        # --- Dead letter queue for async self-invocations ---
+        # The Router Lambda invokes itself asynchronously (InvocationType=Event)
+        # to answer webhooks within the API Gateway 30s window. If the async
+        # invocation raises, Lambda would retry up to 2 more times by default
+        # and re-run the paid AgentCore agent turn each time. We set
+        # retry_attempts=0 below and route failed events to this DLQ for
+        # operator inspection instead of silent duplicate agent spend.
+        router_async_dlq = sqs.Queue(
+            self,
+            "RouterAsyncDLQ",
+            queue_name=namer.name("openclaw-router-async-dlq"),
+            retention_period=Duration.days(14),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+        )
+        self.router_async_dlq = router_async_dlq
+
         # --- Lambda Function ---
         self.router_fn = _lambda.Function(
             self,
@@ -115,6 +133,16 @@ class RouterStack(Stack):
             )],
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
+            # The Router self-invokes asynchronously (InvocationType=Event) to
+            # answer webhooks within the API Gateway 30s window. Lambda's
+            # default two async retries would re-run a failed invocation and
+            # re-execute the paid AgentCore agent turn each time (e.g. when a
+            # formatting bug raises after the agent reply arrived). Mirror the
+            # Cron Lambda (stacks/cron_stack.py) and disable retries, routing
+            # failed events to a DLQ for operator inspection instead.
+            retry_attempts=0,
+            dead_letter_queue_enabled=True,
+            dead_letter_queue=router_async_dlq,
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
@@ -241,18 +269,37 @@ class RouterStack(Stack):
             )
         )
 
-        # Secrets Manager (channel tokens)
-        self.router_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "secretsmanager:GetSecretValue",
-                    "secretsmanager:DescribeSecret",
-                ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+        # Secrets Manager — scoped to the exact channel-token and webhook
+        # validation secrets the Router Lambda actually reads. The names come
+        # in as constructor arguments and are already present as fixed env
+        # vars on the function, so an enumerated resource list is feasible.
+        # Must NOT include openclaw/cognito-password-secret, openclaw/gateway-token
+        # or openclaw/user/* — this function is internet-facing and those
+        # secrets would widen the blast radius of any webhook-parsing defect.
+        router_secret_names = [
+            telegram_token_secret_name,
+            slack_token_secret_name,
+            feishu_token_secret_name,
+            whatsapp_token_secret_name,
+            discord_token_secret_name,
+            line_token_secret_name,
+            webhook_secret_name,
+        ]
+        router_secret_resources = [
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+            for name in router_secret_names
+            if name
+        ]
+        if router_secret_resources:
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "secretsmanager:GetSecretValue",
+                        "secretsmanager:DescribeSecret",
+                    ],
+                    resources=router_secret_resources,
+                )
             )
-        )
 
         # KMS decrypt for secrets
         self.router_fn.add_to_role_policy(
@@ -306,13 +353,19 @@ class RouterStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "grant_read_write_data adds index wildcards and KMS wildcards "
-                    "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
-                    "prefix for image uploads.",
+                    "Secrets Manager resources are each a single secret with the "
+                    "mandatory '-*' Secrets Manager random suffix; the enumerated "
+                    "list covers only the channel/webhook secrets this Lambda reads. "
+                    "DynamoDB grant_read_write_data adds index wildcards and KMS "
+                    "wildcards for CMK-encrypted table. S3 PutObject scoped to "
+                    "*/_uploads/* prefix for image uploads.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                        *[
+                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+                            for name in router_secret_names
+                            if name
+                        ],
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
                         "Action::kms:GenerateDataKey*",

@@ -1381,6 +1381,7 @@ async function createCronForIdentity(identity, args = []) {
   const records = [];
   const errors = [];
   class Command { constructor(input) { this.input = input; } }
+  class QueryCommand extends Command {}
   const env = {
     AWS_REGION: "us-west-2", EVENTBRIDGE_SCHEDULE_GROUP: "group", CRON_LAMBDA_ARN: "cron",
     EVENTBRIDGE_ROLE_ARN: "scheduler-role", IDENTITY_TABLE_NAME: "identity", INTERNAL_USER_ID: "u1",
@@ -1396,8 +1397,14 @@ async function createCronForIdentity(identity, args = []) {
     } };
     if (name === "@aws-sdk/client-dynamodb") return { DynamoDBClient: class {} };
     if (name === "@aws-sdk/lib-dynamodb") return {
-      DynamoDBDocumentClient: { from: () => ({ async send(command) { records.push(command.input.Item); } }) },
-      PutCommand: Command,
+      DynamoDBDocumentClient: { from: () => ({ async send(command) {
+        // create.js counts the caller's CRON# records before creating one.
+        if (command instanceof QueryCommand) return { Items: records.slice(), Count: records.length };
+        records.push(command.input.Item);
+        return {};
+      } }) },
+      PutCommand: Command, GetCommand: Command, DeleteCommand: Command, UpdateCommand: Command,
+      QueryCommand,
     };
     if (name === "@aws-sdk/client-scheduler") return {
       SchedulerClient: class { async send(command) { schedules.push(command.input); return {}; } },

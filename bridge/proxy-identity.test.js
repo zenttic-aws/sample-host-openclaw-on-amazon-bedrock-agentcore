@@ -516,7 +516,7 @@ function buildIdentityText(actorId, channel, workspaceContents) {
           `\n### Workspace (UNTRUSTED): ${wf.label} (${wf.filename})\n` +
             `*Skipped — total workspace size cap reached.* ` +
             `The file lives under the operator-controlled ` +
-            `\`${namespace}/_system/\` prefix and is not fetched again here. ` +
+            `\`_system/${namespace}/\` prefix and is not fetched again here. ` +
             `If the user asks to inspect it, read it on demand.\n`,
         );
         continue;
@@ -541,7 +541,7 @@ function buildIdentityText(actorId, channel, workspaceContents) {
       fileSections.push(
         `\n### Workspace (UNTRUSTED): ${wf.label} (${wf.filename})\n` +
           `*Not yet seeded.* This user has no \`${wf.filename}\` under the ` +
-          `operator-controlled \`${namespace}/_system/\` prefix. ` +
+          `operator-controlled \`_system/${namespace}/\` prefix. ` +
           `This file is operator-sourced and is NOT writable through ` +
           `write_user_file; the proxy will seed a default on the next ` +
           `request. When the user provides ${wf.purpose}, save it to a ` +
@@ -639,7 +639,7 @@ describe("buildUserIdentityContext structure (sync subset)", () => {
   it("shows 'not yet seeded' when workspace files are empty", () => {
     const result = buildIdentityText("telegram:123456789", "telegram", {});
     assert.ok(result.includes("*Not yet seeded.*"));
-    assert.ok(result.includes("operator-controlled `telegram_123456789/_system/`"));
+    assert.ok(result.includes("operator-controlled `_system/telegram_123456789/`"));
   });
 
   it("renders Per-User Isolation Rules BEFORE the workspace file sections", () => {
@@ -816,7 +816,7 @@ describe("Workspace: total cap enforcement", () => {
     // not a user-facing read_user_file call (the sources are not writable
     // through the user-files skill anymore).
     assert.ok(
-      result.includes("operator-controlled `telegram_123456789/_system/`"),
+      result.includes("operator-controlled `_system/telegram_123456789/`"),
     );
     // Higher-priority files should still be present
     assert.ok(result.includes("Workspace (UNTRUSTED): Operating Instructions (AGENTS.md)"));

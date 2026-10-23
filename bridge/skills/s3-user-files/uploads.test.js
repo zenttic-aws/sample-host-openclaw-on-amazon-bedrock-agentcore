@@ -42,7 +42,7 @@ describe("buildKey with the _uploads/ prefix", () => {
     assert.equal(common.buildKey(USER, "notes.md"), `${USER}/notes.md`);
   });
 
-  it("rejects reserved system-prompt filenames (now sourced from <ns>/_system/)", () => {
+  it("rejects reserved system-prompt filenames (now sourced from _system/<ns>/)", () => {
     assert.throws(
       () => common.buildKey(USER, "IDENTITY.md"),
       /reserved system-prompt source/,
