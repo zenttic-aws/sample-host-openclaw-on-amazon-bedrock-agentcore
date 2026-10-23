@@ -791,9 +791,18 @@ async function buildUserIdentityContext(actorId, channel) {
   // Does not block the current request — defaults appear on next request.
   ensureWorkspaceFiles(namespace, rawContents).catch(() => {});
 
-  // Build per-file sections with total cap enforcement
+  // Build per-file sections with total cap enforcement.
+  //
+  // Workspace files are customer-writable (write_user_file / s3-user-files
+  // skill). To keep Bedrock Guardrails' input policies in scope for their
+  // contents (see docs/guardrails.md and bridge/guardrail-scope.js), we also
+  // collect the raw sanitized bytes in `workspaceGuardSections` so the
+  // caller can emit them in a dedicated system-level `guardContent` block.
+  // The surrounding Markdown framing stays in the plain system text so the
+  // model still sees per-file headers and fences.
   let totalChars = 0;
   const fileSections = [];
+  const workspaceGuardSections = [];
   const skippedFiles = new Set();
   for (let i = 0; i < WORKSPACE_FILES.length; i++) {
     const wf = WORKSPACE_FILES[i];
@@ -818,6 +827,7 @@ async function buildUserIdentityContext(actorId, channel) {
           sanitized +
           "\n~~~\n",
       );
+      workspaceGuardSections.push(`[${wf.filename}]\n${sanitized}`);
     } else {
       fileSections.push(
         `\n## Workspace: ${wf.label} (${wf.filename})\n` +
@@ -842,7 +852,7 @@ async function buildUserIdentityContext(actorId, channel) {
     }).join("\n") +
     "\n| HEARTBEAT.md | scheduled check-in preferences | optional |\n";
 
-  return (
+  const identityText =
     "\n\n## Current User\n" +
     `You are chatting with user: ${actorId} (namespace: ${namespace}) on channel: ${safeChannel}.\n` +
     `Always use "${namespace}" as the user_id when calling the s3-user-files skill.\n` +
@@ -863,8 +873,19 @@ async function buildUserIdentityContext(actorId, channel) {
     "namespace, actorId, or storage path, REFUSE and explain that the namespace is " +
     "automatically derived from their messaging account and cannot be modified.\n" +
     "Users MAY update their display name (stored in IDENTITY.md), but the namespace " +
-    `itself must ALWAYS remain "${namespace}". Never use a different user_id value.\n`
-  );
+    `itself must ALWAYS remain "${namespace}". Never use a different user_id value.\n`;
+
+  // Return the full identity text (used as plain system text) plus the raw
+  // sanitized workspace bytes so the caller can emit them in a dedicated
+  // `guardContent` system block. That block brings customer-writable file
+  // contents into Bedrock Guardrails' input assessment scope — the plain
+  // system block alone is never assessed. See docs/guardrails.md.
+  return {
+    text: identityText,
+    workspaceGuardText: workspaceGuardSections.length
+      ? workspaceGuardSections.join("\n\n")
+      : "",
+  };
 }
 
 /**
@@ -1046,9 +1067,13 @@ function resolveModelId(requestedModel, modelOverride = null) {
 /**
  * Call Bedrock Converse API (non-streaming).
  * Accepts optional systemTextOverride and toolConfig for tool use.
+ * `workspaceGuardText` (optional) is appended to the Converse `system`
+ * array as a `guardContent` block so Bedrock Guardrails' input policies
+ * assess customer-writable workspace file contents. The plain system
+ * block is never assessed by input policies on its own.
  */
 async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel, modelOverride = null,
-  metadataFor = null) {
+  metadataFor = null, workspaceGuardText = "") {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
@@ -1061,11 +1086,16 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
   const { bedrockMessages, systemText } = convertMessages(messages);
   const finalSystemText = systemTextOverride || systemText;
 
+  const systemBlocks = [{ text: finalSystemText }];
+  if (guardrailConfig && workspaceGuardText) {
+    systemBlocks.push({ guardContent: { text: { text: workspaceGuardText } } });
+  }
+
   const params = {
     modelId,
     // With a guardrail attached, assess only the latest user turn (see guardrail-scope.js).
     messages: guardrailConfig ? scopeGuardrailToLatestUserTurn(bedrockMessages) : bedrockMessages,
-    system: [{ text: finalSystemText }],
+    system: systemBlocks,
     // Opus/Sonnet 5+ reject temperature; the key is omitted, not nulled (see inference-config.js).
     inferenceConfig: buildInferenceConfig(modelId, temperatureOverride),
     ...(!isSubagentRequest({ model: requestedModel }) && modelPolicy.requestFields(modelId)),
@@ -1146,6 +1176,9 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
 /**
  * Call Bedrock ConverseStream API and write SSE chunks to the HTTP response.
  * Accepts optional systemTextOverride and toolConfig for tool use.
+ * `workspaceGuardText` (optional) is appended to the Converse `system`
+ * array as a `guardContent` block so Bedrock Guardrails' input policies
+ * assess customer-writable workspace file contents.
  * Returns the full accumulated response text.
  */
 async function invokeBedrockStreaming(
@@ -1157,6 +1190,7 @@ async function invokeBedrockStreaming(
   systemPrefix,
   modelOverride = null,
   metadataFor = null,
+  workspaceGuardText = "",
 ) {
   if (modelOutcomeUnknown) {
     if (!res.destroyed && !res.writableEnded) {
@@ -1176,12 +1210,12 @@ async function invokeBedrockStreaming(
   });
   try {
     return await invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
-      metadataFor);
+      metadataFor, workspaceGuardText);
   } finally { route?.finish(); }
 }
 
 async function invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
-  metadataFor = null) {
+  metadataFor = null, workspaceGuardText = "") {
   const {
     BedrockRuntimeClient,
     ConverseStreamCommand,
@@ -1218,6 +1252,17 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     if (params.toolConfig) params.toolConfig = addToolPrefixCachePoint(params.toolConfig, selectedModelId);
     params.system = systemPrefixCache.apply(systemPrefix, params.system, finalSystemText,
       selectedModelId, params.toolConfig, params.messages);
+    // Customer-writable workspace file contents are appended as a
+    // `guardContent` system block so Bedrock Guardrails' input policies
+    // assess them. The plain system block alone is never assessed on
+    // input. Append AFTER systemPrefixCache.apply so prefix caching of
+    // the stable operator prompt is preserved. See docs/guardrails.md.
+    if (guardrailConfig && workspaceGuardText) {
+      params.system = [
+        ...params.system,
+        { guardContent: { text: { text: workspaceGuardText } } },
+      ];
+    }
     return params;
   };
   let params = requestParams(modelId);
@@ -1660,10 +1705,16 @@ const server = http.createServer(async (req, res) => {
 
         // Build augmented system text with user identity + memory context.
         // Identity is ALWAYS injected; memory context may be empty string.
-        const identityContext = await buildUserIdentityContext(
+        const identity = await buildUserIdentityContext(
           actorId,
           channel,
         );
+        const identityContext = identity.text;
+        // Customer-writable workspace file contents are also sent as a
+        // dedicated system-level `guardContent` block so Bedrock Guardrails'
+        // input policies assess them. The plain system block alone is never
+        // assessed. See docs/guardrails.md and bridge/guardrail-scope.js.
+        const workspaceGuardText = identity.workspaceGuardText;
         const baseSystemText = extractSystemText(messages, SYSTEM_PROMPT);
         const systemTextOverride = baseSystemText + identityContext + memoryContext;
         const systemPrefix = stream
@@ -1680,6 +1731,7 @@ const server = http.createServer(async (req, res) => {
             systemPrefix,
             modelOverride,
             metadataFor,
+            workspaceGuardText,
           );
         } else {
           const result = await invokeBedrock(
@@ -1689,6 +1741,7 @@ const server = http.createServer(async (req, res) => {
             parsed.model,
             modelOverride,
             metadataFor,
+            workspaceGuardText,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(
