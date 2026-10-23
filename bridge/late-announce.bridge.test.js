@@ -300,7 +300,8 @@ describe("async cron hold", () => {
     const box = {
       fs: { existsSync: () => false }, stateStorage: { DEFAULT_MOUNT: "/mnt/workspace" },
       cronJobs: jobs, osRandomUUID: () => "boot-1", CRON_JOB_BUDGET_MS: 45 * 60 * 1000,
-      cronJobStoreInstance: null, console: quiet, Date,
+      cronJobStoreInstance: null, console: quiet, Date, Object, Number,
+      v2Lifecycle: { assertBinding() {}, checkpoint() {} },
       setTimeout: (callback, delay) => {
         const timer = { callback, delay, cleared: false, unref() {} };
         timers.push(timer);
