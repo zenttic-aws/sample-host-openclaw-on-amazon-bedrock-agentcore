@@ -1714,8 +1714,25 @@ def handle_telegram(body):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "telegram")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # The bind code is a bearer credential whose redemption bypasses the
+    # allowlist, so it must only be emitted into a verified 1:1 chat with the
+    # requesting identity. Anywhere else (group/supergroup/channel) we refuse
+    # and tell the user to DM the bot instead — the code is NEVER generated
+    # or disclosed in that reply.
     if _is_link_command(text):
+        chat_type = str(message.get("chat", {}).get("type", ""))
+        if chat_type != "private" or str(chat_id) != str(user_id_tg):
+            logger.warning(
+                "Telegram: refusing link command in non-private chat (type=%s)", chat_type,
+            )
+            send_telegram_message(
+                chat_id,
+                "For your security, account linking is only available in a direct "
+                "message. Please DM me the word `link` from a 1:1 chat.",
+                token,
+            )
+            return
         code = create_bind_code(resolved_user_id)
         if not code:
             send_telegram_message(chat_id, "Account linking requires identity reconciliation.", token)
@@ -1911,8 +1928,28 @@ def handle_slack(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "slack")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # Slack delivers `app_mention` events from public/private channels and
+    # strips the `<@BOT>` prefix, so a group `@bot link` would otherwise reach
+    # this branch. The bind code is a bearer credential that bypasses the
+    # allowlist on redemption, so we only emit it into a direct-message channel
+    # (`channel_id` starts with "D", i.e. an `im` conversation) and never on an
+    # `app_mention`. In any other context we refuse and ask the user to DM the
+    # bot — the code is NEVER generated or disclosed in that reply.
     if _is_link_command(text):
+        is_dm = event_type == "message" and isinstance(channel_id, str) and channel_id.startswith("D")
+        if not is_dm:
+            logger.warning(
+                "Slack: refusing link command in non-DM context (event_type=%s channel=%s)",
+                event_type, (channel_id[:1] if isinstance(channel_id, str) else "?"),
+            )
+            send_slack_message(
+                channel_id,
+                "For your security, account linking is only available in a direct "
+                "message. Please open a DM with me and send `link` there.",
+                bot_token,
+            )
+            return {"statusCode": 200, "body": "ok"}
         code = create_bind_code(resolved_user_id)
         if not code:
             send_slack_message(channel_id, "Account linking requires identity reconciliation.", bot_token)
@@ -2080,8 +2117,23 @@ def handle_feishu(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "feishu")
 
-    # Handle link-accounts command
+    # Handle link-accounts command.
+    # Feishu reports `chat_type` on the inbound message (p2p vs. group). The
+    # bind code is a bearer credential that bypasses the allowlist on
+    # redemption, so we only emit it in a 1:1 (p2p) chat. In a group we refuse
+    # and ask the user to DM the bot — the code is NEVER generated or
+    # disclosed in that reply.
     if _is_link_command(text):
+        if chat_type != "p2p":
+            logger.warning(
+                "Feishu: refusing link command in non-p2p chat (chat_type=%s)", chat_type,
+            )
+            send_feishu_message(
+                chat_id,
+                "For your security, account linking is only available in a direct "
+                "(1:1) chat. Please message me directly and send `link` there.",
+            )
+            return {"statusCode": 200, "body": "ok"}
         bind_code = create_bind_code(resolved_user_id)
         if not bind_code:
             send_feishu_message(chat_id, "Account linking requires identity reconciliation.")
