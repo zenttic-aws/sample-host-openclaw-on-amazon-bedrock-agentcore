@@ -584,7 +584,7 @@ describe("buildSessionPolicy Secrets Manager", () => {
     ({ buildSessionPolicy } = require("./scoped-credentials"));
   });
 
-  it("includes Secrets Manager actions always in statement 1 with Resource *", () => {
+  it("scopes Secrets Manager actions to the user's own namespace (not Resource *)", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -596,14 +596,21 @@ describe("buildSessionPolicy Secrets Manager", () => {
     const parsed = JSON.parse(policy);
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt, "Secrets Manager actions should exist");
-    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
+    assert.equal(
+      smStmt.Resource,
+      "arn:aws:secretsmanager:us-west-2:123456789012:secret:openclaw/user/telegram_12345/*",
+      "Secrets Manager must be scoped to the user's own namespace, never wildcard",
+    );
     assert.ok(smStmt.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt.Action.includes("secretsmanager:CreateSecret"));
     assert.ok(smStmt.Action.includes("secretsmanager:DeleteSecret"));
     assert.ok(smStmt.Action.includes("secretsmanager:TagResource"), "TagResource needed for api-keys skill");
+    // Must NOT allow reading other users' secrets (e.g. the shared Cognito HMAC
+    // key, which is how the cross-user token-minting attack exfiltrated it).
+    assert.notEqual(smStmt.Resource, "*");
   });
 
-  it("includes ListSecrets in the Secrets Manager statement with wildcard resource", () => {
+  it("includes ListSecrets in a separate statement with wildcard resource (AWS API limitation)", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -614,11 +621,12 @@ describe("buildSessionPolicy Secrets Manager", () => {
     const parsed = JSON.parse(policy);
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:ListSecrets"));
     assert.ok(smStmt, "Secrets Manager statement with ListSecrets should exist");
+    assert.equal(smStmt.Action.length, 1, "ListSecrets must be isolated from the scoped read/write statement");
     const resources = Array.isArray(smStmt.Resource) ? smStmt.Resource : [smStmt.Resource];
     assert.ok(resources.includes("*"), "Resource array should include wildcard for ListSecrets");
   });
 
-  it("includes Secrets Manager actions even when region/account not provided", () => {
+  it("scopes Secrets Manager actions with a wildcard partition when region/account not provided", () => {
     const policy = buildSessionPolicy({
       bucket: "openclaw-user-files-123-us-west-2",
       namespace: "telegram_12345",
@@ -627,10 +635,14 @@ describe("buildSessionPolicy Secrets Manager", () => {
     const parsed = JSON.parse(policy);
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt, "Secrets Manager actions should exist even without region/account");
-    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
+    assert.equal(
+      smStmt.Resource,
+      "arn:aws:secretsmanager:*:*:secret:openclaw/user/telegram_12345/*",
+      "Namespace must still appear in the ARN when region/account are unknown",
+    );
   });
 
-  it("Secrets Manager resource is always wildcard regardless of namespace", () => {
+  it("Secrets Manager resource always carries the caller's namespace", () => {
     const policy = buildSessionPolicy({
       bucket: "test-bucket",
       namespace: "slack_abc-def",
@@ -641,7 +653,10 @@ describe("buildSessionPolicy Secrets Manager", () => {
     const parsed = JSON.parse(policy);
     const smStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("secretsmanager:GetSecretValue"));
     assert.ok(smStmt, "Secrets Manager actions should exist");
-    assert.equal(smStmt.Resource, "*", "Secrets Manager resource should be wildcard");
+    assert.equal(
+      smStmt.Resource,
+      "arn:aws:secretsmanager:ap-southeast-2:999888777666:secret:openclaw/user/slack_abc-def/*",
+    );
   });
 });
 

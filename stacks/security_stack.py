@@ -168,12 +168,20 @@ class SecurityStack(Stack):
             ),
         )
 
-        # --- HMAC secret for deriving Cognito user passwords -----------------
+        # --- Legacy shared HMAC secret for Cognito passwords ------------------
+        # DEPRECATED: previously the Bedrock proxy derived every Cognito user's
+        # password as HMAC-SHA256(this-secret, actorId), which let any process
+        # that learned this one key compute every other user's password. The
+        # bridge now generates a per-user password with crypto.randomBytes on
+        # first use and persists it at openclaw/user/<namespace>/cognito. The
+        # secret below is retained only for upgrade compatibility and is no
+        # longer read by the runtime; it can be deleted in a future cleanup.
         self.cognito_password_secret = secretsmanager.Secret(
             self,
             "CognitoPasswordSecret",
             secret_name=namer.name("openclaw/cognito-password-secret"),
-            description="HMAC secret for deriving Cognito user passwords",
+            description="DEPRECATED — formerly used to derive Cognito user "
+            "passwords; no longer read by the runtime.",
             encryption_key=self.cmk,
             generate_secret_string=secretsmanager.SecretStringGenerator(
                 password_length=64,
@@ -220,8 +228,10 @@ class SecurityStack(Stack):
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-COG1",
-                    reason="Passwords are HMAC-derived by the proxy, not user-chosen. "
-                    "Complexity requirements are unnecessary for deterministic passwords.",
+                    reason="Users are service identities (e.g. telegram:12345). "
+                    "Each user's password is generated with crypto.randomBytes and "
+                    "stored per-user in Secrets Manager; the pool's complexity rules "
+                    "are therefore trivially satisfied and do not add real strength.",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-COG2",
@@ -239,8 +249,9 @@ class SecurityStack(Stack):
                     "credential and adaptive-auth checks on sign-in). This pool has no "
                     "user-facing sign-in: self sign-up is off, and the only client is the "
                     "bridge, which provisions users and authenticates them via "
-                    "ADMIN_USER_PASSWORD_AUTH with HMAC-derived passwords. Same rationale "
-                    "as COG3, which Plus-tier threat protection replaces.",
+                    "ADMIN_USER_PASSWORD_AUTH with per-user random passwords stored in "
+                    "Secrets Manager. Same rationale as COG3, which Plus-tier threat "
+                    "protection replaces.",
                 ),
             ],
         )

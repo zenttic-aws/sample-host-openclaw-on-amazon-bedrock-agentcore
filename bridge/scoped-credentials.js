@@ -131,18 +131,42 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
         Action: "s3:ListBucket",
         Resource: `arn:aws:s3:::${bucket}`,
       },
-      // Scheduler, DynamoDB, SecretsManager, KMS, PassRole — allowed by the
-      // execution role; no further restriction needed in the session policy.
-      // Application-level namespace enforcement in skill scripts provides isolation.
+      // Scheduler, DynamoDB, KMS, PassRole — allowed by the execution role;
+      // no further restriction needed in the session policy. Application-
+      // level namespace enforcement in skill scripts provides isolation.
       {
         Effect: "Allow",
         Action: [
           "scheduler:*",
           "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
           "kms:Decrypt", "kms:GenerateDataKey",
-          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
           "iam:PassRole",
         ],
+        Resource: "*",
+      },
+      // Secrets Manager — scoped to the user's own namespace. The agent must
+      // never be able to read a secret belonging to a different user (e.g.
+      // another user's Cognito password at openclaw/user/<other>/cognito or
+      // their stored API keys at openclaw/user/<other>/*).
+      {
+        Effect: "Allow",
+        Action: [
+          "secretsmanager:GetSecretValue",
+          "secretsmanager:PutSecretValue",
+          "secretsmanager:CreateSecret",
+          "secretsmanager:DeleteSecret",
+          "secretsmanager:DescribeSecret",
+          "secretsmanager:TagResource",
+        ],
+        Resource: region && account
+          ? `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`
+          : `arn:aws:secretsmanager:*:*:secret:openclaw/user/${namespace}/*`,
+      },
+      // ListSecrets does not support resource-level scoping (AWS API
+      // limitation); results are filtered by prefix in the manage_secret skill.
+      {
+        Effect: "Allow",
+        Action: ["secretsmanager:ListSecrets"],
         Resource: "*",
       },
     ],

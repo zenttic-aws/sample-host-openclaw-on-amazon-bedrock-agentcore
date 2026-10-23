@@ -5,7 +5,6 @@
  */
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const crypto = require("crypto");
 
 const gw = require("./gateway-mcp");
 const { createCognitoTokenProvider } = require("./cognito-token");
@@ -37,7 +36,6 @@ describe("gateway-mcp.applyGatewayMcp", () => {
       connectionTimeoutMs: 10000,
       supportsParallelToolCalls: true,
     });
-    // Everything else is preserved.
     assert.deepEqual(out.models, BASE_CONFIG.models);
     assert.deepEqual(out.tools, BASE_CONFIG.tools);
   });
@@ -57,91 +55,215 @@ describe("gateway-mcp.applyGatewayMcp", () => {
 });
 
 describe("cognito-token.createCognitoTokenProvider", () => {
-  // Fake command classes so the test runs without @aws-sdk installed.
   const commands = {};
-  for (const n of ["CognitoIdentityProviderClient", "AdminGetUserCommand", "AdminCreateUserCommand", "AdminSetUserPasswordCommand", "AdminInitiateAuthCommand"]) {
+  for (const n of [
+    "CognitoIdentityProviderClient",
+    "AdminGetUserCommand",
+    "AdminCreateUserCommand",
+    "AdminSetUserPasswordCommand",
+    "AdminInitiateAuthCommand",
+  ]) {
     commands[n] = class {
-      constructor(input) {
-        this.input = input;
-      }
+      constructor(input) { this.input = input; }
     };
     Object.defineProperty(commands[n], "name", { value: n });
   }
-  const cfg = { userPoolId: "us-west-2_POOL", clientId: "client", passwordSecret: "s3cret", region: "us-west-2", commands };
+  const secretsCommands = {};
+  for (const n of ["SecretsManagerClient", "GetSecretValueCommand", "CreateSecretCommand", "PutSecretValueCommand"]) {
+    secretsCommands[n] = class {
+      constructor(input) { this.input = input; }
+    };
+    Object.defineProperty(secretsCommands[n], "name", { value: n });
+  }
 
-  it("derives the same HMAC password the proxy used to derive inline", () => {
-    const provider = createCognitoTokenProvider(cfg);
-    const expected = crypto.createHmac("sha256", "s3cret").update("telegram:123").digest("base64url").slice(0, 32);
-    assert.equal(provider.derivePassword("telegram:123"), expected);
-    assert.equal(provider.derivePassword("telegram:123").length, 32);
-  });
-
-  it("returns null when not configured and caches tokens until 60 s before expiry", async () => {
-    assert.equal(await createCognitoTokenProvider({ ...cfg, clientId: "" }).getIdToken("a"), null);
-
+  function makeSecretsStore(initial = {}) {
+    const store = new Map(Object.entries(initial));
     const sent = [];
     const client = {
+      async send(cmd) {
+        sent.push(cmd);
+        const name = cmd.constructor.name;
+        if (name === "GetSecretValueCommand") {
+          const value = store.get(cmd.input.SecretId);
+          if (value === undefined) {
+            throw Object.assign(new Error("not found"), { name: "ResourceNotFoundException" });
+          }
+          return { SecretString: value };
+        }
+        if (name === "CreateSecretCommand") {
+          if (store.has(cmd.input.Name)) {
+            throw Object.assign(new Error("exists"), { name: "ResourceExistsException" });
+          }
+          store.set(cmd.input.Name, cmd.input.SecretString);
+          return {};
+        }
+        if (name === "PutSecretValueCommand") {
+          store.set(cmd.input.SecretId, cmd.input.SecretString);
+          return {};
+        }
+        return {};
+      },
+    };
+    return { client, store, sent };
+  }
+
+  const cfg = {
+    userPoolId: "us-west-2_POOL",
+    clientId: "client",
+    region: "us-west-2",
+    commands,
+    secretsCommands,
+  };
+
+  it("returns null when not configured and caches tokens until 60 s before expiry", async () => {
+    const sm = makeSecretsStore();
+    assert.equal(
+      await createCognitoTokenProvider({ ...cfg, clientId: "", secretsClient: sm.client }).getIdToken("a"),
+      null,
+    );
+
+    const sentCognito = [];
+    const client = {
       send: async (cmd) => {
-        sent.push(cmd.constructor.name);
+        sentCognito.push(cmd.constructor.name);
         if (cmd.constructor.name === "AdminGetUserCommand") return {};
+        if (cmd.constructor.name === "AdminSetUserPasswordCommand") return {};
         if (cmd.constructor.name === "AdminInitiateAuthCommand") {
           return {
-            AuthenticationResult: { IdToken: `tok${sent.length}`, AccessToken: `acc${sent.length}`, ExpiresIn: 3600 },
+            AuthenticationResult: {
+              IdToken: `tok${sentCognito.length}`,
+              AccessToken: `acc${sentCognito.length}`,
+              ExpiresIn: 3600,
+            },
           };
         }
         return {};
       },
     };
-    const provider = createCognitoTokenProvider({ ...cfg, client, log: () => {} });
+    const provider = createCognitoTokenProvider({ ...cfg, client, secretsClient: sm.client, log: () => {} });
     const first = await provider.getIdToken("telegram:1");
     assert.match(first.token, /^tok/);
     assert.ok(first.expiresAt > Date.now() + 3500 * 1000);
     const second = await provider.getIdToken("telegram:1");
     assert.equal(second, first, "cached");
-    // Both token types come from the same authentication and share the cache.
     const access = await provider.getAccessToken("telegram:1");
     assert.match(access.token, /^acc/);
     assert.equal(access.expiresAt, first.expiresAt);
-    assert.equal(sent.filter((n) => n === "AdminInitiateAuthCommand").length, 1, "no extra auth for the access token");
+    assert.equal(
+      sentCognito.filter((n) => n === "AdminInitiateAuthCommand").length,
+      1,
+      "no extra auth for the access token",
+    );
     const forced = await provider.getIdToken("telegram:1", { force: true });
     assert.notEqual(forced.token, first.token, "force bypasses the cache");
-    assert.deepEqual(
-      sent.filter((n) => n === "AdminInitiateAuthCommand").length,
+    assert.equal(
+      sentCognito.filter((n) => n === "AdminInitiateAuthCommand").length,
       2,
     );
+    // After the first provisioning the per-user secret must exist.
+    assert.equal(sm.store.get("openclaw/user/telegram_1/cognito")?.length > 0, true);
   });
 
   it("getAccessToken refuses to hand out an empty bearer", async () => {
+    const sm = makeSecretsStore({ "openclaw/user/telegram_1/cognito": "stored-pw" });
     const client = {
       send: async (cmd) => {
-        if (cmd.constructor.name === "AdminInitiateAuthCommand") return { AuthenticationResult: { IdToken: "t", ExpiresIn: 3600 } };
+        if (cmd.constructor.name === "AdminInitiateAuthCommand") {
+          return { AuthenticationResult: { IdToken: "t", ExpiresIn: 3600 } };
+        }
         return {};
       },
     };
-    const provider = createCognitoTokenProvider({ ...cfg, client, log: () => {} });
+    const provider = createCognitoTokenProvider({ ...cfg, client, secretsClient: sm.client, log: () => {} });
     await assert.rejects(provider.getAccessToken("telegram:1"), /no AccessToken/);
-    assert.equal(await createCognitoTokenProvider({ ...cfg, clientId: "" }).getAccessToken("a"), null);
+    const sm2 = makeSecretsStore();
+    assert.equal(
+      await createCognitoTokenProvider({ ...cfg, clientId: "", secretsClient: sm2.client }).getAccessToken("a"),
+      null,
+    );
   });
 
-  it("provisions a missing user with a permanent password before authenticating", async () => {
+  it("provisions a missing user with a per-user random password stored in Secrets Manager", async () => {
+    const sm = makeSecretsStore();
     const sent = [];
     const client = {
       send: async (cmd) => {
         sent.push(cmd);
         const n = cmd.constructor.name;
-        if (n === "AdminGetUserCommand") throw Object.assign(new Error("nf"), { name: "UserNotFoundException" });
-        if (n === "AdminInitiateAuthCommand") return { AuthenticationResult: { IdToken: "t", ExpiresIn: 3600 } };
+        if (n === "AdminGetUserCommand") {
+          throw Object.assign(new Error("nf"), { name: "UserNotFoundException" });
+        }
+        if (n === "AdminInitiateAuthCommand") {
+          return { AuthenticationResult: { IdToken: "t", ExpiresIn: 3600 } };
+        }
         return {};
       },
     };
-    const provider = createCognitoTokenProvider({ ...cfg, client, log: () => {} });
+    const provider = createCognitoTokenProvider({ ...cfg, client, secretsClient: sm.client, log: () => {} });
     await provider.getIdToken("slack:U1");
     const names = sent.map((c) => c.constructor.name);
-    assert.deepEqual(names, ["AdminGetUserCommand", "AdminCreateUserCommand", "AdminSetUserPasswordCommand", "AdminInitiateAuthCommand"]);
+    assert.deepEqual(names, [
+      "AdminGetUserCommand",
+      "AdminCreateUserCommand",
+      "AdminSetUserPasswordCommand",
+      "AdminInitiateAuthCommand",
+    ]);
     const setPw = sent[2].input;
     assert.equal(setPw.Permanent, true);
-    assert.equal(setPw.Password, provider.derivePassword("slack:U1"));
+    const stored = sm.store.get("openclaw/user/slack_U1/cognito");
+    assert.equal(typeof stored, "string");
+    assert.equal(stored.length > 16, true, "random password should be long");
+    assert.equal(setPw.Password, stored, "stored password must match the one set on Cognito");
     assert.equal(sent[3].input.AuthFlow, "ADMIN_USER_PASSWORD_AUTH");
-    assert.equal(sent[3].input.AuthParameters.PASSWORD, provider.derivePassword("slack:U1"));
+    assert.equal(sent[3].input.AuthParameters.PASSWORD, stored);
+  });
+
+  it("does NOT derive the password from a shared key: two users get different passwords", async () => {
+    const sm = makeSecretsStore();
+    const client = {
+      send: async (cmd) => {
+        const n = cmd.constructor.name;
+        if (n === "AdminGetUserCommand") {
+          throw Object.assign(new Error("nf"), { name: "UserNotFoundException" });
+        }
+        if (n === "AdminInitiateAuthCommand") {
+          return { AuthenticationResult: { IdToken: "t", ExpiresIn: 3600 } };
+        }
+        return {};
+      },
+    };
+    const provider = createCognitoTokenProvider({ ...cfg, client, secretsClient: sm.client, log: () => {} });
+    await provider.getIdToken("telegram:a");
+    await provider.getIdToken("telegram:b");
+    const pwA = sm.store.get("openclaw/user/telegram_a/cognito");
+    const pwB = sm.store.get("openclaw/user/telegram_b/cognito");
+    assert.equal(typeof pwA, "string");
+    assert.equal(typeof pwB, "string");
+    assert.notEqual(pwA, pwB, "two users must have independently generated passwords");
+  });
+
+  it("rotates the password when a Cognito user exists but no stored secret", async () => {
+    // Simulates a legacy user from the old HMAC-derived scheme.
+    const sm = makeSecretsStore();
+    const sent = [];
+    const client = {
+      send: async (cmd) => {
+        sent.push(cmd.constructor.name);
+        const n = cmd.constructor.name;
+        if (n === "AdminGetUserCommand") return {}; // user exists
+        if (n === "AdminInitiateAuthCommand") {
+          return { AuthenticationResult: { IdToken: "t", ExpiresIn: 3600 } };
+        }
+        return {};
+      },
+    };
+    const provider = createCognitoTokenProvider({ ...cfg, client, secretsClient: sm.client, log: () => {} });
+    await provider.getIdToken("telegram:legacy");
+    assert.deepEqual(sent, [
+      "AdminGetUserCommand",
+      "AdminSetUserPasswordCommand",
+      "AdminInitiateAuthCommand",
+    ]);
+    assert.equal(typeof sm.store.get("openclaw/user/telegram_legacy/cognito"), "string");
   });
 });

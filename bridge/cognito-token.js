@@ -1,51 +1,75 @@
 /**
  * Per-user Cognito token minting, shared by the Bedrock proxy
- * (agentcore-proxy.js, where it originated; it uses the ID token) and the
- * contract server (agentcore-contract.js, which uses the ACCESS token as the
- * bearer for the AgentCore Gateway MCP server entry in openclaw.json).
+ * (agentcore-proxy.js) and the contract server (agentcore-contract.js, which
+ * uses the ACCESS token as the bearer for the AgentCore Gateway MCP server
+ * entry in openclaw.json).
  *
- * The Gateway's CUSTOM_JWT authorizer accepts only the access token: an ID
- * token is refused with 403 "insufficient_scope" (verified live 2026-09-24).
- * One ADMIN_USER_PASSWORD_AUTH call returns both, so they are cached together.
+ * One Cognito user per actorId ("telegram:123"). The password is generated
+ * once with crypto.randomBytes and persisted in Secrets Manager at
+ * `openclaw/user/<namespace>/cognito` (one secret per user). The password is
+ * NEVER derived from a shared key: a previous design derived it as
+ * HMAC-SHA256(COGNITO_PASSWORD_SECRET, actorId), which meant any process that
+ * learned the single HMAC key could compute every user's password and mint a
+ * token for an arbitrary actorId. Per-user secrets break that cross-user
+ * token minting path.
  *
- * One Cognito user per actorId ("telegram:123"), created on first use with a
- * password derived as HMAC-SHA256(COGNITO_PASSWORD_SECRET, actorId). Both
- * callers MUST derive the password identically, which is why this lives in
- * one module.
+ * Access to the per-user secret is further restricted by the agent's STS
+ * session policy, which only permits secretsmanager:GetSecretValue on
+ * `openclaw/user/<its-own-namespace>/*`, so even reading the proxy's
+ * credentials from a sibling process grants nothing beyond the bound user's
+ * own secret.
  */
 "use strict";
 
 const crypto = require("crypto");
 
+function actorToNamespace(actorId) {
+  return String(actorId || "").replace(/:/g, "_");
+}
+
+function defaultSecretId(actorId) {
+  return "openclaw/user/" + actorToNamespace(actorId) + "/cognito";
+}
+
+function generateRandomPassword() {
+  // 24 random bytes -> 32 base64url chars. Appended "!1" guarantees the
+  // Cognito pool's "symbols" and "numbers" character classes even if its
+  // password policy is strict.
+  return crypto.randomBytes(24).toString("base64url") + "!1";
+}
+
 function createCognitoTokenProvider(config) {
   const {
     userPoolId,
     clientId,
-    passwordSecret,
     region,
     client, // injectable CognitoIdentityProviderClient (tests)
-    commands, // injectable command classes (tests)
+    commands, // injectable Cognito command classes (tests)
+    secretsClient, // injectable SecretsManagerClient (tests)
+    secretsCommands, // injectable Secrets Manager command classes (tests)
+    secretId = defaultSecretId,
+    generatePassword = generateRandomPassword,
     log = console.log,
   } = config;
 
   let _client = client || null;
   let _commands = commands || null;
+  let _secretsClient = secretsClient || null;
+  let _secretsCommands = secretsCommands || null;
+
   function sdk() {
     if (!_commands) _commands = require("@aws-sdk/client-cognito-identity-provider");
     return _commands;
   }
-  const tokenCache = new Map(); // actorId -> { id: {token, expiresAt, expiresIn}, access: {...} }
-
-  function isConfigured() {
-    return Boolean(userPoolId && clientId && passwordSecret);
+  function smSdk() {
+    if (!_secretsCommands) _secretsCommands = require("@aws-sdk/client-secrets-manager");
+    return _secretsCommands;
   }
 
-  function derivePassword(actorId) {
-    return crypto
-      .createHmac("sha256", passwordSecret)
-      .update(actorId)
-      .digest("base64url")
-      .slice(0, 32);
+  const tokenCache = new Map();
+
+  function isConfigured() {
+    return Boolean(userPoolId && clientId);
   }
 
   function getClient() {
@@ -55,22 +79,66 @@ function createCognitoTokenProvider(config) {
     return _client;
   }
 
+  function getSecretsClient() {
+    if (!_secretsClient) {
+      _secretsClient = new (smSdk().SecretsManagerClient)({ region });
+    }
+    return _secretsClient;
+  }
+
+  async function fetchStoredPassword(actorId) {
+    const { GetSecretValueCommand } = smSdk();
+    try {
+      const resp = await getSecretsClient().send(
+        new GetSecretValueCommand({ SecretId: secretId(actorId) }),
+      );
+      return resp.SecretString || null;
+    } catch (err) {
+      if (err && (err.name === "ResourceNotFoundException" || err.$metadata?.httpStatusCode === 404)) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  async function storePassword(actorId, password) {
+    const { CreateSecretCommand, PutSecretValueCommand } = smSdk();
+    const sId = secretId(actorId);
+    try {
+      await getSecretsClient().send(
+        new CreateSecretCommand({ Name: sId, SecretString: password }),
+      );
+    } catch (err) {
+      if (err && err.name === "ResourceExistsException") {
+        await getSecretsClient().send(
+          new PutSecretValueCommand({ SecretId: sId, SecretString: password }),
+        );
+      } else {
+        throw err;
+      }
+    }
+  }
+
   async function ensureUser(actorId) {
-    const { AdminGetUserCommand, AdminCreateUserCommand, AdminSetUserPasswordCommand } = sdk();
+    const {
+      AdminGetUserCommand,
+      AdminCreateUserCommand,
+      AdminSetUserPasswordCommand,
+    } = sdk();
     const c = getClient();
+    let userExists = true;
     try {
       await c.send(new AdminGetUserCommand({ UserPoolId: userPoolId, Username: actorId }));
     } catch (err) {
       if (err.name !== "UserNotFoundException") throw err;
-      const password = derivePassword(actorId);
-      await c.send(
-        new AdminCreateUserCommand({
-          UserPoolId: userPoolId,
-          Username: actorId,
-          MessageAction: "SUPPRESS",
-          TemporaryPassword: password,
-        }),
-      );
+      userExists = false;
+    }
+    if (userExists) {
+      const stored = await fetchStoredPassword(actorId);
+      if (stored) return stored;
+      // User exists but no per-user secret (legacy or externally created) —
+      // rotate to a fresh random password and persist it.
+      const password = generatePassword();
       await c.send(
         new AdminSetUserPasswordCommand({
           UserPoolId: userPoolId,
@@ -79,28 +147,45 @@ function createCognitoTokenProvider(config) {
           Permanent: true,
         }),
       );
-      log(`[cognito] user provisioned: ${actorId}`);
+      await storePassword(actorId, password);
+      log("[cognito] user password rotated: " + actorId);
+      return password;
     }
+    const password = generatePassword();
+    await c.send(
+      new AdminCreateUserCommand({
+        UserPoolId: userPoolId,
+        Username: actorId,
+        MessageAction: "SUPPRESS",
+        TemporaryPassword: password,
+      }),
+    );
+    await c.send(
+      new AdminSetUserPasswordCommand({
+        UserPoolId: userPoolId,
+        Username: actorId,
+        Password: password,
+        Permanent: true,
+      }),
+    );
+    await storePassword(actorId, password);
+    log("[cognito] user provisioned: " + actorId);
+    return password;
   }
 
-  /**
-   * Authenticate actorId and cache both tokens (until 60 s before expiry;
-   * `force` bypasses the cache). Returns the cache entry or null when Cognito
-   * is not configured.
-   */
   async function authenticate(actorId, { force = false } = {}) {
     if (!isConfigured()) return null;
     const cached = tokenCache.get(actorId);
     if (!force && cached && cached.expiresAt > Date.now()) return cached;
 
-    await ensureUser(actorId);
+    const password = await ensureUser(actorId);
     const { AdminInitiateAuthCommand } = sdk();
     const response = await getClient().send(
       new AdminInitiateAuthCommand({
         UserPoolId: userPoolId,
         ClientId: clientId,
         AuthFlow: "ADMIN_USER_PASSWORD_AUTH",
-        AuthParameters: { USERNAME: actorId, PASSWORD: derivePassword(actorId) },
+        AuthParameters: { USERNAME: actorId, PASSWORD: password },
       }),
     );
     const result = response.AuthenticationResult;
@@ -112,21 +197,15 @@ function createCognitoTokenProvider(config) {
       access: { token: result.AccessToken, expiresAt, expiresIn },
     };
     tokenCache.set(actorId, entry);
-    log(`[cognito] token acquired for ${actorId} (expires in ${expiresIn}s)`);
+    log("[cognito] token acquired for " + actorId + " (expires in " + expiresIn + "s)");
     return entry;
   }
 
-  /** `{ token, expiresAt, expiresIn }` with the ID token (aud = client id). */
   async function getIdToken(actorId, opts) {
     const entry = await authenticate(actorId, opts);
     return entry ? entry.id : null;
   }
 
-  /**
-   * `{ token, expiresAt, expiresIn }` with the ACCESS token (client_id = client
-   * id, scope aws.cognito.signin.user.admin) — the only token type the
-   * AgentCore Gateway accepts as a bearer.
-   */
   async function getAccessToken(actorId, opts) {
     const entry = await authenticate(actorId, opts);
     if (!entry) return null;
@@ -134,7 +213,14 @@ function createCognitoTokenProvider(config) {
     return entry.access;
   }
 
-  return { isConfigured, derivePassword, ensureUser, getIdToken, getAccessToken, _cache: tokenCache };
+  return {
+    isConfigured,
+    ensureUser,
+    getIdToken,
+    getAccessToken,
+    _cache: tokenCache,
+    _secretId: secretId,
+  };
 }
 
-module.exports = { createCognitoTokenProvider };
+module.exports = { createCognitoTokenProvider, defaultSecretId, generateRandomPassword };

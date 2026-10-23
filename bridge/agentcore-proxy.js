@@ -67,10 +67,13 @@ if (temperatureOverride.invalid !== undefined) {
   console.log("[proxy] BEDROCK_TEMPERATURE=%s applied to all models", String(temperatureOverride.value));
 }
 
-// Cognito identity configuration
+// Cognito identity configuration. Per-user Cognito passwords are stored in
+// Secrets Manager at openclaw/user/<namespace>/cognito (one secret per user)
+// and fetched via the proxy's execution-role credentials; no shared password
+// secret is placed in this process' environment anymore (dropping the
+// cross-user token-minting path exploited by sibling-process environ reads).
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
-const COGNITO_PASSWORD_SECRET = process.env.COGNITO_PASSWORD_SECRET || "";
 
 // Diagnostic state — exposed via /health for observability (container stdout not in CloudWatch)
 let lastIdentityDiag = null;
@@ -405,16 +408,15 @@ function extractSessionMetadata(parsed, headers) {
   return { sessionId, actorId, channel, idSource, trigger: "chat" };
 }
 
-// Per-user Cognito ID tokens (user provisioning, HMAC-derived password,
-// cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
-// both processes derive the same password for the same actorId.
+// Per-user Cognito ID tokens (user provisioning + per-user random password
+// stored in Secrets Manager at openclaw/user/<namespace>/cognito, with a
+// token cache). Shared with agentcore-contract.js via bridge/cognito-token.js.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
 const { reconcileToolHistory } = require("./tool-history");
 const { readBody } = require("./read-body");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   userPoolId: COGNITO_USER_POOL_ID,
   clientId: COGNITO_CLIENT_ID,
-  passwordSecret: COGNITO_PASSWORD_SECRET,
   region: AWS_REGION,
   log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[proxy] Cognito")),
 });
