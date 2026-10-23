@@ -61,7 +61,7 @@ describe("buildSessionPolicy", () => {
     );
   });
 
-  it("ListBucket included in S3 statement without Condition block", () => {
+  it("ListBucket included in S3 statement with namespace prefix Condition", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_99999",
@@ -73,7 +73,18 @@ describe("buildSessionPolicy", () => {
       (s) => s.Action && (Array.isArray(s.Action) ? s.Action.includes("s3:ListBucket") : s.Action === "s3:ListBucket")
     );
     assert.ok(listStmt, "should have ListBucket statement");
-    assert.equal(listStmt.Condition, undefined, "ListBucket should have no Condition block");
+    assert.ok(listStmt.Condition, "ListBucket should have a Condition block");
+    const prefixes = listStmt.Condition.StringLike && listStmt.Condition.StringLike["s3:prefix"];
+    assert.ok(Array.isArray(prefixes), "s3:prefix condition should be an array");
+    assert.ok(
+      prefixes.includes("telegram_99999/*"),
+      `s3:prefix should include namespace/*, got: ${JSON.stringify(prefixes)}`,
+    );
+    // Must not allow listing other namespaces or the bucket root.
+    assert.ok(
+      !prefixes.some((p) => p === "*" || p === ""),
+      `s3:prefix must not allow wildcard/root, got: ${JSON.stringify(prefixes)}`,
+    );
   });
 
   it("includes KMS decrypt permission always in statement 1 with Resource *", () => {

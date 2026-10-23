@@ -140,6 +140,14 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
         Effect: "Allow",
         Action: "s3:ListBucket",
         Resource: `arn:aws:s3:::${bucket}`,
+        // Restrict ListObjectsV2 to this user's namespace: without this
+        // condition s3:ListBucket would enumerate every tenant's object
+        // keys (incl. _uploads/ filenames and agent-state files such as
+        // IDENTITY.md/MEMORY.md), even though object reads are already
+        // prefix-scoped above.
+        Condition: {
+          StringLike: { "s3:prefix": [`${namespace}/*`, `${namespace}/`] },
+        },
       },
       // Scheduler, DynamoDB, KMS, PassRole — allowed by the execution role;
       // application-level checks in skill scripts enforce namespace isolation.
