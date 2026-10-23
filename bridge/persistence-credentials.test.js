@@ -178,6 +178,7 @@ function failureRuntime(t, p) {
       return { model_outcome_unknown: false };
     },
     verifyV2Resources: async () => {}, updateIdentityFile() {}, TELEGRAM_BOT_TOKEN: null,
+    assertChannelOwnership: async () => ({ decision: "allow", reason: "self_channel" }),
     OPENCLAW_PORT: 18789, GATEWAY_TOKEN: "test", buildBridgeText: (message) => message,
     extractTextFromContent: (text) => text,
     gatewayTurn: async () => {

@@ -320,6 +320,7 @@ test("handleV2Invocation bounds an async job by its own deadline, not a caller b
     checkProxyHealth: async () => ({ model_outcome_unknown: false }),
     verifyV2Resources: async () => {},
     updateIdentityFile: (...args) => { seen.trigger = args[5].trigger; },
+    assertChannelOwnership: async () => ({ decision: "allow", reason: "self_channel" }),
     gatewayTurn: async ({ deadline }) => { seen.deadline = deadline; return { phase: "completed", response: "ok", runId: "r" }; },
     v2Lifecycle: {
       assertBinding() {}, checkpoint() {}, fail: async () => {},
