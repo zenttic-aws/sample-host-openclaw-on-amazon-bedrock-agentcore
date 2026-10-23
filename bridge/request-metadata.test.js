@@ -128,6 +128,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     crypto: require("node:crypto"), Date, structuredClone, process: { env },
     fs: { readFileSync: () => { if (identity === undefined) throw new Error("ENOENT"); return JSON.stringify(identity); } },
     BOUND_ACTOR_ID: bound, sessionMap: new Map(),
+    VALID_ACTOR_ID: /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/,
     console: { log() {}, error() {}, warn() {}, debug() {} },
     http: { createServer(callback) { handler = callback; return {}; } },
     modelPolicy: { ...policy, createStreamingRoute: (options) =>
@@ -234,23 +235,24 @@ test("non-streaming Converse requests carry it too, on every retry", async () =>
   }
 });
 
-test("without an identity file the environment identity is used with the proxy's own session", async () => {
+test("without an identity file the proxy refuses to serve (no fallback to environment identity)", async () => {
+  // The identity file is a required per-turn signal from the contract server
+  // for the bound actor. If it is absent, the resolver fails closed rather
+  // than falling back to an environment-only identity derivation.
   const app = proxy({ identity: undefined });
-  await app.chat(MAIN);
-  const metadata = app.requests[0].input.requestMetadata;
-  assert.equal(metadata["openclaw.actor_id"], "telegram:1001");
-  assert.equal(metadata["openclaw.id_source"], "environment");
-  assert.equal(metadata["openclaw.trigger"], "chat");
-  assert.match(metadata["openclaw.session_id"], /^ses-/);
+  const status = await app.chat(MAIN);
+  assert.equal(status, 502);
+  assert.equal(app.requests.length, 0);
 });
 
-test("an unbound proxy with no identity sends default-user, marked unbound", async () => {
+test("an unbound proxy refuses to serve requests (fail closed, no identity derivation)", async () => {
+  // Identity resolution is now fail-closed: the proxy never consults request
+  // data to derive the actor, and refuses to serve requests whose bound
+  // actor is missing. There is no legitimate "default-user" / fallback path.
   const app = proxy({ identity: undefined, env: {}, bound: "" });
-  await app.chat(MAIN);
-  const metadata = app.requests[0].input.requestMetadata;
-  assert.equal(metadata["openclaw.actor_id"], "default-user");
-  assert.equal(metadata["openclaw.identity"], "unbound");
-  assert.equal(metadata["openclaw.id_source"], "fallback");
+  const status = await app.chat(MAIN);
+  assert.equal(status, 502);
+  assert.equal(app.requests.length, 0);
 });
 
 test("message content never reaches requestMetadata", async () => {
