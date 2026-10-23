@@ -301,6 +301,16 @@ _BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
 _MALFORMED_TEXT_BLOCK_RE = re.compile(
     r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
 )
+# Prefix of a (possibly malformed) content-block fragment, anchored at '[{'.
+_BLOCK_PREFIX_RE = re.compile(r'\[\{\s*"type"\s*:')
+
+# Resource bounds to keep repair cost linear and bounded even on
+# attacker-influenced model output. See CWE-407 (algorithmic complexity).
+# Must stay in sync with the Router copy (lambda/router/index.py).
+_EXTRACT_MAX_INPUT_CHARS = 64 * 1024
+_EXTRACT_WINDOW_CHARS = 8 * 1024
+_EXTRACT_MAX_CANDIDATES = 1024
+_EXTRACT_TIME_BUDGET_SECONDS = 1.0
 
 
 def _extract_text_from_content_blocks(text):
@@ -313,22 +323,44 @@ def _extract_text_from_content_blocks(text):
 
     Scans for '[{' positions and attempts JSON parse at each to handle
     complex nested/escaped content blocks from subagent responses.
+
+    The repair logic is bounded: inputs over _EXTRACT_MAX_INPUT_CHARS are
+    returned unchanged, the regex fallback looks only _EXTRACT_WINDOW_CHARS
+    ahead per candidate, and the loop honours a candidate count and wall-
+    clock budget. This keeps worst-case cost O(n) in the input length
+    instead of O(n²) when the model (or an injected tool/web result) emits
+    many '[{' tokens.
     """
     if not text or not isinstance(text, str):
         return text
+    # Attacker-influenced model output can trigger a quadratic rescan in the
+    # regex fallback below. Skip repair entirely on oversized inputs — the
+    # downstream formatter/chunker handles unparsed content safely.
+    if len(text) > _EXTRACT_MAX_INPUT_CHARS:
+        return text
     result = text
     decoder = json.JSONDecoder(strict=False)
+    deadline = time.monotonic() + _EXTRACT_TIME_BUDGET_SECONDS
     for _ in range(10):
         prev = result
         # Scan for all '[{' positions and try to parse JSON arrays
         rebuilt = []
         i = 0
-        while i < len(result):
+        candidates = 0
+        length = len(result)
+        while i < length:
             pos = result.find("[{", i)
             if pos == -1:
                 rebuilt.append(result[i:])
                 break
             rebuilt.append(result[i:pos])
+            candidates += 1
+            # Stop repairing when the per-call candidate cap or wall-clock
+            # budget is exhausted. Preserve the remainder verbatim rather
+            # than silently dropping it.
+            if candidates > _EXTRACT_MAX_CANDIDATES or time.monotonic() > deadline:
+                rebuilt.append(result[pos:])
+                break
             # Try to parse a JSON array starting at pos
             try:
                 blocks, end = decoder.raw_decode(result, pos)
@@ -351,25 +383,45 @@ def _extract_text_from_content_blocks(text):
             # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
             # runs to the end of the string is dropped (a partial stream tail).
             # A closed but malformed array keeps the text around it.
-            remainder = result[pos:]
-            if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
-                close = _BLOCK_CLOSE_RE.search(remainder)
+            #
+            # IMPORTANT: Use a fixed-size look-ahead window and operate on the
+            # original string (via pos/endpos) rather than slicing result[pos:].
+            # Slicing is O(n) per candidate and the previous `i = pos + 1`
+            # advance made the scan O(n²) in the attacker-influenced input.
+            window_end = min(length, pos + _EXTRACT_WINDOW_CHARS)
+            looks_like_block = (
+                _BLOCK_PREFIX_RE.match(result, pos) is not None
+                or result[pos:window_end].strip() == "[{"
+            )
+            if looks_like_block:
+                close = _BLOCK_CLOSE_RE.search(result, pos, window_end)
                 if close is None:
-                    # Truncated content block JSON at the tail — skip the rest
-                    break
-                span = remainder[:close.end()]
-                texts = _MALFORMED_TEXT_BLOCK_RE.findall(span)
+                    if window_end >= length:
+                        # Truncated content block JSON at the tail — skip the rest
+                        break
+                    # No close within the look-ahead window. Treat this '[{'
+                    # as literal text and keep scanning past it so the window
+                    # does not get rescanned for every subsequent position.
+                    rebuilt.append("[{")
+                    i = pos + 2
+                    continue
+                texts = _MALFORMED_TEXT_BLOCK_RE.findall(result[pos:close.end()])
                 if texts:
                     try:
                         rebuilt.append("".join(json.loads('"' + t + '"') for t in texts))
-                        i = pos + close.end()
+                        i = close.end()
                         continue
                     except (json.JSONDecodeError, ValueError):
                         pass
-            rebuilt.append("[")
-            i = pos + 1
+            # The '[{' did not open a content block. Emit it verbatim and
+            # advance past both characters — advancing by only one would let
+            # the next iteration re-examine the same '[{' pair.
+            rebuilt.append("[{")
+            i = pos + 2
         result = "".join(rebuilt)
         if result == prev:
+            break
+        if time.monotonic() > deadline:
             break
     return result
 
