@@ -168,8 +168,27 @@ function extractSessionMetadata(parsed, headers) {
     if (BOUND_ACTOR_ID && identity.actorId !== BOUND_ACTOR_ID) {
       throw new Error("Proxy canonical actor changed");
     }
+    // The identity file is written by the trusted contract once per turn, but
+    // `/tmp` is world-writable inside the microVM. Treat the whole record as
+    // part of the binding: validate every sibling we forward to Bedrock
+    // `requestMetadata` against the proxy's own allowlists, and refuse any
+    // value that does not match — the same guarantee as the actorId pin.
+    const rawChannel = identity.channel == null ? "unknown" : identity.channel;
+    if (typeof rawChannel !== "string" || !VALID_CHANNELS.has(rawChannel)) {
+      throw new Error("Proxy canonical actor changed");
+    }
+    if (identity.sessionId !== undefined && identity.sessionId !== null &&
+        identity.sessionId !== "" &&
+        (typeof identity.sessionId !== "string" ||
+          !RUNTIME_SESSION_ID.test(identity.sessionId))) {
+      throw new Error("Proxy canonical actor changed");
+    }
+    if (identity.trigger !== undefined && identity.trigger !== null &&
+        identity.trigger !== "chat" && identity.trigger !== "cron") {
+      throw new Error("Proxy canonical actor changed");
+    }
     actorId = identity.actorId;
-    channel = identity.channel || "unknown";
+    channel = rawChannel;
     idSource = "identity-file";
   }
   const modelOverride = idSource === "identity-file" &&
@@ -779,8 +798,15 @@ const VALID_CHANNELS = new Set([
   "discord",
   "whatsapp",
   "line",
+  "feishu",
   "unknown",
 ]);
+
+// Bedrock's requestMetadata charset: identifiers only, up to 128 characters.
+// The identity file is written by the trusted contract so legitimate values
+// stay inside this set; a mutated file that strays out of it is treated as
+// a canonical-actor change and refused.
+const RUNTIME_SESSION_ID = /^[A-Za-z0-9:_@$#=/+,.-]{1,128}$/;
 
 async function retrieveMemoryContext(_actorId, _lastUserText) {
   // Stub — memory retrieval not yet implemented.
