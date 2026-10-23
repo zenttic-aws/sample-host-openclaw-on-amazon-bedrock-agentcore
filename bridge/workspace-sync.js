@@ -309,9 +309,15 @@ async function snapshotSqliteToFile(dbPath) {
   if (!sqlite || typeof sqlite.backup !== "function") {
     throw new Error("node:sqlite backup API unavailable on this Node runtime");
   }
+  // Unique-per-call staging name. The PID+ms discriminators are not sufficient
+  // alone: periodic save, change-flush and cleanup/SIGTERM saves share one event
+  // loop, and two of them can enter this line within the same millisecond on
+  // the same database path. A random suffix (see also state-storage.js:228)
+  // keeps each snapshot in its own file so one path's cleanup cannot delete or
+  // overwrite the file another path is still hashing/streaming.
   const stagePath = path.join(
     path.dirname(dbPath),
-    `.${path.basename(dbPath)}.${process.pid}-${Date.now()}.sqlite-snapshot`,
+    `.${path.basename(dbPath)}.${process.pid}-${Date.now()}-${crypto.randomUUID()}.sqlite-snapshot`,
   );
   const source = new sqlite.DatabaseSync(dbPath, { readOnly: true });
   try {
@@ -1149,7 +1155,41 @@ function contentHash(content) {
  *
  * @returns {Promise<"uploaded"|"unchanged"|"skipped"|"missing">}
  */
+// Per-relative-path serialization. All upload entry points (saveWorkspace,
+// runChangeFlush/uploadBatch, saveFile, cleanup) funnel through uploadStateFile;
+// holding one promise per relative path there means the periodic save, the
+// change-driven flush and the SIGTERM/cleanup save never run two concurrent
+// snapshots of the same database, which is what let two SQLite backups write
+// into the same staging file and let the hash-then-stream window on the large
+// (gzip) path produce an object whose body disagreed with its sha256 metadata.
+const _uploadInFlight = new Map();
+
 async function uploadStateFile(namespace, relativePath, { force = false } = {}) {
+  // Serialise overlapping saves of the same relative path (periodic save vs
+  // change flush vs cleanup). The second caller awaits the first and returns
+  // its outcome; we do not run a second snapshot in parallel. A forcing caller
+  // never coalesces onto a non-forcing in-flight run (which could legitimately
+  // short-circuit on an "unchanged" hash and skip the actual upload); it
+  // waits until the in-flight run (and any forced run that queued behind it)
+  // finishes, then runs its own forced pass.
+  if (!force) {
+    const inFlight = _uploadInFlight.get(relativePath);
+    if (inFlight) return inFlight;
+  } else {
+    while (_uploadInFlight.has(relativePath)) {
+      try { await _uploadInFlight.get(relativePath); } catch { /* this caller will retry */ }
+    }
+  }
+  const run = (async () => uploadStateFileLocked(namespace, relativePath, { force }))();
+  _uploadInFlight.set(relativePath, run);
+  try {
+    return await run;
+  } finally {
+    if (_uploadInFlight.get(relativePath) === run) _uploadInFlight.delete(relativePath);
+  }
+}
+
+async function uploadStateFileLocked(namespace, relativePath, { force = false } = {}) {
   assertNamespaceBound(namespace);
   if (!uploadsAllowed()) { warnGated("File upload"); return "skipped"; }
   if (normalizeRelativePath(relativePath) !== relativePath) throw new Error("Invalid state file path");
@@ -1258,11 +1298,22 @@ async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
       return "uploaded";
     }
     // Large database: never in memory whole.
+    const statAtHash = fs.statSync(stagePath);
     const hash = await hashFile(stagePath);
     if (!force && _uploadedHashes.get(relativePath) === hash) return "unchanged";
     scanForCredentials(relativePath, readFileHead(stagePath, 64 * 1024));
     const started = Date.now();
-    const { bytes, parts } = await uploadCompressedFile(key, stagePath, { hash, size });
+    // Pass the size/mtime captured at hash time so uploadCompressedFile can
+    // confirm the staged file still matches right before CompleteMultipartUpload.
+    // That guarantees the body uploaded to S3 is the exact bytes we hashed,
+    // closing the hash-then-reread window (if some other code path mutates or
+    // unlinks this staging file the upload is aborted rather than publishing
+    // an object whose body disagrees with its sha256 metadata).
+    const { bytes, parts } = await uploadCompressedFile(key, stagePath, {
+      hash,
+      size,
+      verify: { size: statAtHash.size, mtimeMs: statAtHash.mtimeMs },
+    });
     _uploadedHashes.set(relativePath, hash);
     _lastLargeUploadAt.set(relativePath, Date.now());
     console.log(
@@ -1285,10 +1336,32 @@ async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
  *
  * @returns {Promise<{ bytes: number, parts: number }>} compressed bytes sent
  */
-async function uploadCompressedFile(key, filePath, { hash, size }) {
+async function uploadCompressedFile(key, filePath, { hash, size, verify } = {}) {
   assertRestoreReady();
   const s3 = getS3Client();
   const sdk = getS3Sdk();
+  // Confirm the staged bytes we hashed are still on disk unchanged. If another
+  // concurrent save path mutated or unlinked the staging file between hashFile()
+  // and here, abort rather than publishing an S3 object whose body contradicts
+  // the sha256 we store in its metadata (which would make the next restore
+  // reject the object with "sha256 mismatch after download").
+  const assertStageUnchanged = () => {
+    if (!verify) return;
+    let cur;
+    try {
+      cur = fs.statSync(filePath);
+    } catch (err) {
+      throw new Error(
+        `Staged snapshot ${path.basename(filePath)} disappeared before upload completed: ${err.message}`,
+      );
+    }
+    if (cur.size !== verify.size || cur.mtimeMs !== verify.mtimeMs) {
+      throw new Error(
+        `Staged snapshot ${path.basename(filePath)} changed under us before upload completed ` +
+          `(size ${verify.size}->${cur.size}, mtimeMs ${verify.mtimeMs}->${cur.mtimeMs}); aborting`,
+      );
+    }
+  };
   const base = {
     Bucket: BUCKET,
     Key: key,
@@ -1340,6 +1413,8 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
       }
     }
     const tail = Buffer.concat(pending);
+    // The staged bytes we hashed must still be the exact bytes we just streamed.
+    assertStageUnchanged();
     assertRestoreReady();
     getS3Client();
     if (!uploadId) {
@@ -1347,6 +1422,7 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
       return { bytes: total, parts: 1 };
     }
     if (tail.length > 0) await sendPart(tail);
+    assertStageUnchanged();
     assertRestoreReady();
     getS3Client();
     await s3.send(new sdk.CompleteMultipartUploadCommand({
