@@ -47,7 +47,7 @@ async function main() {
     process.exit(1);
   }
 
-  const ebScheduleName = buildScheduleName(userId, scheduleId);
+  const ebScheduleName = record.ebName || buildScheduleName(userId, scheduleId);
   const schedulerClient = new SchedulerClient({ region: REGION });
 
   // Delete from EventBridge

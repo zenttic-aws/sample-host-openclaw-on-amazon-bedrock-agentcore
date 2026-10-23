@@ -120,8 +120,8 @@ Users can send photos alongside text messages. The system supports JPEG, PNG, GI
 By default, each channel creates a separate user identity. Link an unowned second channel to the canonical user before independently registering it. Existing independent owners are not merged:
 
 1. **On your first channel** (e.g., Telegram), send: `link`
-   - The bot responds with an 8-character code (e.g., `A1B2C3D4`) valid for 10 minutes
-2. **On your second channel** (e.g., Slack), send: `link A1B2C3D4`
+   - The bot responds with a high-entropy code (~100-bit, 20-character base32) valid for 10 minutes
+2. **On your second channel** (e.g., Slack), send: `link <code>`
    - The bot confirms the accounts are linked
 
 After linking, both channels route to the same user, the same AgentCore session, and the same conversation history. The bind code is stored in DynamoDB with a 10-minute TTL and deleted after use.
@@ -315,7 +315,7 @@ The agent runs with OpenClaw's **full tool profile** enabled, giving it access t
 |---|---|
 | `eventbridge-cron` | Cron scheduling via EventBridge Scheduler — create, update, and delete recurring tasks |
 | `s3-user-files` | Per-user file storage (S3-backed) — read, write, list, and delete files |
-| `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills. Runtime installs are recorded per user (`~/.openclaw/runtime-skills.json`); activation awaits `reinstallFromManifest` before `USER_READY`, and failed or invalid restoration blocks readiness |
+| `clawhub-manage` | ClawHub skill installer — install, uninstall, and list community skills. Runtime installs are recorded per user (`~/.openclaw/runtime-skills.json`); activation awaits `reinstallFromManifest` before `USER_READY`. A failed or invalid restoration is logged, surfaced via `list.js` and does not block readiness; entries that fail repeatedly are quarantined (`disabled: true`) and corrupt manifests are rewritten clean so a single bad entry cannot permanently lock a user out |
 | `api-keys` | Secure API key management — dual-mode storage with native file-based or AWS Secrets Manager backend (see [API Key Management](#api-key-management)) |
 | `agentcore-browser` | Headless Chromium browser — navigate, screenshot, interact with web pages (optional, see [Browser Support](#browser-support-optional)) |
 
