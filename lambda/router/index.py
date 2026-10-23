@@ -1046,6 +1046,20 @@ def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30):
             notified = True
 
 
+def _escape_slack_text(text):
+    """Neutralize Slack control characters per Slack's documented escaping rules.
+
+    Replaces ``&`` with ``&amp;``, ``<`` with ``&lt;``, and ``>`` with ``&gt;`` so
+    that attacker-influenced content (e.g. model output) cannot inject mrkdwn link
+    syntax (``<url|label>``) or broadcast/user mention tokens (``<!channel>``,
+    ``<!here>``, ``<@U...>``, ``<!subteam^ID>``) into chat.postMessage ``text``.
+    See https://api.slack.com/reference/surfaces/formatting#escaping.
+    """
+    if not isinstance(text, str):
+        return text
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def send_slack_message(channel_id, text, bot_token):
     """Send a message via Slack Web API."""
     if not bot_token:
@@ -1054,7 +1068,7 @@ def send_slack_message(channel_id, text, bot_token):
     url = "https://slack.com/api/chat.postMessage"
     data = json.dumps({
         "channel": channel_id,
-        "text": text,
+        "text": _escape_slack_text(text),
     }).encode()
     req = urllib_request.Request(
         url,
