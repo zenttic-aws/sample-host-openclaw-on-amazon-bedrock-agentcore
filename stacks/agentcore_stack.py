@@ -87,14 +87,26 @@ class AgentCoreStack(Stack):
         # Deterministic ARN avoids CDK circular dependency when the role
         # references itself in its trust policy and inline policy.
         execution_role_arn_str = f"arn:aws:iam::{account}:role/{execution_role_name}"
+        # Trust policy: AgentCore Runtime (bedrock-agentcore) assumes this role.
+        # Confused-deputy guards (aws:SourceAccount / aws:SourceArn) match the
+        # pattern used by the Gateway role (stacks/gateway_stack.py) and the
+        # AgentCore Runtime trust-policy recommendation. The previously trusted
+        # ecs-tasks.amazonaws.com and bedrock.amazonaws.com principals were
+        # dropped: no deployment path in this stack passes the role to those
+        # services, and leaving them unconditioned trusts the services from
+        # any account.
         self.execution_role = iam.Role(
             self,
             "OpenClawExecutionRole",
             role_name=execution_role_name,
-            assumed_by=iam.CompositePrincipal(
-                iam.ServicePrincipal("ecs-tasks.amazonaws.com"),
-                iam.ServicePrincipal("bedrock.amazonaws.com"),
-                iam.ServicePrincipal("bedrock-agentcore.amazonaws.com"),
+            assumed_by=iam.ServicePrincipal(
+                "bedrock-agentcore.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": account},
+                    "ArnLike": {
+                        "aws:SourceArn": f"arn:aws:bedrock-agentcore:{region}:{account}:runtime/*"
+                    },
+                },
             ),
         )
 
@@ -220,6 +232,9 @@ class AgentCoreStack(Stack):
                 conditions={
                     "ArnEquals": {
                         "aws:PrincipalArn": execution_role_arn_str,
+                    },
+                    "StringEquals": {
+                        "aws:PrincipalAccount": account,
                     },
                     "StringLike": {
                         "sts:RoleSessionName": "scoped-*"
