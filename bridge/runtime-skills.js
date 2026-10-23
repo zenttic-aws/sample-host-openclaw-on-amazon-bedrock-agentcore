@@ -24,6 +24,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { execFile } = require("child_process");
 
 /** Where ClawHub installs skills and where OpenClaw looks for them. */
@@ -68,6 +69,77 @@ function isValidVersion(version) {
   return typeof version === "string" && version.length <= 64 && VERSION_RE.test(version);
 }
 
+// Integrity values recorded in the manifest: lowercase hex sha256 of the
+// installed skill tree (see computeSkillIntegrity). Validated on read/write
+// to keep anything else out of the manifest.
+const INTEGRITY_RE = /^sha256:[0-9a-f]{64}$/;
+function isValidIntegrity(value) {
+  return typeof value === "string" && INTEGRITY_RE.test(value);
+}
+
+// Subpaths inside <skillsDir>/<slug> that MUST NOT contribute to the
+// integrity hash: clawhub writes install metadata there (installedAt
+// timestamp, cached registry responses) which legitimately changes between
+// otherwise-identical installs of the same version.
+const INTEGRITY_EXCLUDE_DIRS = new Set([".clawhub", ".clawdhub"]);
+
+/**
+ * sha256 of the on-disk skill tree at `<skillsDir>/<slug>`. Returns
+ * `"sha256:<hex>"` or null when the skill directory is missing / unreadable.
+ * The hash covers every regular file's relative POSIX path, its size and its
+ * content; symlinks contribute their target string; .clawhub/.clawdhub
+ * metadata directories (install timestamps, caches) are deliberately
+ * excluded so two installs of the same version produce the same digest.
+ * Fail-closed: any I/O error during the walk returns null so the caller
+ * treats the install as unverifiable.
+ */
+function computeSkillIntegrity(slug, skillsDir = SKILLS_DIR) {
+  if (!isValidSlug(slug)) return null;
+  const root = path.join(skillsDir, slug);
+  let rootStat;
+  try {
+    rootStat = fs.lstatSync(root);
+  } catch {
+    return null;
+  }
+  if (!rootStat.isDirectory()) return null;
+  const hash = crypto.createHash("sha256");
+  const stack = ["."];
+  try {
+    while (stack.length) {
+      const rel = stack.pop();
+      const abs = path.join(root, rel);
+      const st = fs.lstatSync(abs);
+      if (st.isDirectory()) {
+        const entries = fs.readdirSync(abs).sort();
+        for (const name of entries) {
+          if (rel === "." && INTEGRITY_EXCLUDE_DIRS.has(name)) continue;
+          stack.push(path.posix.join(rel === "." ? "" : rel, name));
+        }
+        continue;
+      }
+      if (st.isSymbolicLink()) {
+        const target = fs.readlinkSync(abs);
+        hash.update(`L\0${rel}\0${target}\0`);
+        continue;
+      }
+      if (st.isFile()) {
+        const content = fs.readFileSync(abs);
+        hash.update(`F\0${rel}\0${content.length}\0`);
+        hash.update(content);
+        hash.update("\0");
+        continue;
+      }
+      // Sockets, devices, fifos: not expected inside a skill tree. Record
+      // their type so an unexpected addition changes the digest.
+      hash.update(`X\0${rel}\0${st.mode}\0`);
+    }
+  } catch {
+    return null;
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
 /** The OpenClaw state dir as the gateway (and its exec children) see it. */
 function resolveStateDir(env = process.env) {
   const explicit = (env.OPENCLAW_STATE_DIR || "").trim();
@@ -89,7 +161,7 @@ function emptyManifest() {
  * entries that fail slug/version validation are dropped (counted in
  * `invalid`) so nothing unvalidated ever reaches the CLI.
  *
- * @returns {{ version: number, skills: Record<string, {version: string|null, installedAt?: string}>, corrupt: boolean, invalid: number }}
+ * @returns {{ version: number, skills: Record<string, {version: string|null, integrity: string|null, installedAt?: string}>, corrupt: boolean, invalid: number }}
  */
 function readManifest(file = manifestPath(), { log = console } = {}) {
   const result = { ...emptyManifest(), corrupt: false, invalid: 0 };
@@ -128,8 +200,15 @@ function readManifest(file = manifestPath(), { log = console } = {}) {
       log.warn(`[runtime-skills] Dropping manifest entry ${slug}: invalid version ${JSON.stringify(version)}`);
       continue;
     }
+    const integrity = entry && typeof entry === "object" ? entry.integrity : undefined;
+    if (integrity !== null && integrity !== undefined && !isValidIntegrity(integrity)) {
+      result.invalid++;
+      log.warn(`[runtime-skills] Dropping manifest entry ${slug}: invalid integrity ${JSON.stringify(integrity)}`);
+      continue;
+    }
     result.skills[slug] = {
       version: isValidVersion(version) ? version : null,
+      integrity: isValidIntegrity(integrity) ? integrity : null,
       ...(entry && typeof entry.installedAt === "string" ? { installedAt: entry.installedAt } : {}),
     };
   }
@@ -144,6 +223,7 @@ function writeManifest(file, manifest) {
     if (!isValidSlug(slug)) continue;
     out.skills[slug] = {
       version: isValidVersion(entry?.version) ? entry.version : null,
+      integrity: isValidIntegrity(entry?.integrity) ? entry.integrity : null,
       ...(entry?.installedAt ? { installedAt: entry.installedAt } : {}),
     };
   }
@@ -176,12 +256,26 @@ function mirrorManifest(file, mountStateDir = DEFAULT_MOUNT_STATE_DIR, { log = c
   }
 }
 
-/** Record a runtime install. `version` may be null (unpinned: latest on reinstall). */
+/**
+ * Record a runtime install.
+ *
+ * `opts.integrity` is a `sha256:<hex>` digest of the installed skill tree
+ * (see computeSkillIntegrity). Required for a reproducible, verified
+ * reinstall; stored as null when the caller cannot compute it, in which case
+ * `reinstallFromManifest` will refuse the entry rather than silently
+ * downloading whatever the registry currently serves.
+ *
+ * `version` is the semver clawhub recorded in origin.json. May be null
+ * (git-backed install, unreadable origin.json, or a non-semver value); the
+ * reinstall path refuses null-version entries fail-closed for the same
+ * reason.
+ */
 function recordInstall(file, slug, version, opts = {}) {
   const validSlug = validateSkillName(slug);
   const manifest = readManifest(file, opts);
   manifest.skills[validSlug] = {
     version: isValidVersion(version) ? version : null,
+    integrity: isValidIntegrity(opts && opts.integrity) ? opts.integrity : null,
     installedAt: new Date().toISOString(),
   };
   return writeManifest(file, manifest);
@@ -385,9 +479,31 @@ async function reinstallFromManifest({
 
   for (const [slug, entry] of entries) {
     const version = entry.version || null;
+    const expectedIntegrity = entry.integrity || null;
     if (isSkillPresent(slug, skillsDir)) {
       summary.present++;
       summary.results.push({ slug, version, status: "present" });
+      continue;
+    }
+    // Fail-closed when the manifest cannot drive a reproducible install:
+    // without a pinned semver `clawhub install` would silently resolve
+    // whatever the registry currently serves as "latest", and without a
+    // recorded integrity we have nothing to compare the downloaded tree to.
+    // Either case means the user's one-time consent to install a specific
+    // artifact cannot be honoured at cold start, so we refuse rather than
+    // auto-fetch new upstream code.
+    if (!version) {
+      summary.failed++;
+      const msg = `skill "${slug}" is recorded without a pinned version; refusing to reinstall "latest" at cold start. Run install_skill ${slug} manually to re-approve a specific version.`;
+      summary.results.push({ slug, version, status: "failed", error: msg });
+      log.warn(`[runtime-skills] ${msg}`);
+      continue;
+    }
+    if (!expectedIntegrity) {
+      summary.failed++;
+      const msg = `skill "${slug}" is recorded without an integrity digest; refusing to reinstall without a trust anchor. Run install_skill ${slug} manually to re-approve the current artifact.`;
+      summary.results.push({ slug, version, status: "failed", error: msg });
+      log.warn(`[runtime-skills] ${msg}`);
       continue;
     }
     let args;
@@ -405,14 +521,30 @@ async function reinstallFromManifest({
       if (!isSkillPresent(slug, skillsDir)) {
         throw new Error(`clawhub exited 0 but ${path.join(skillsDir, slug, "SKILL.md")} is missing`);
       }
+      // Integrity check: the downloaded tree must hash to exactly what the
+      // user approved at the first, interactive install. If the registry
+      // served a different artifact (compromised slug, mutable release,
+      // tampering in transit) we remove the installed directory and fail
+      // the entry so OpenClaw does not load the mismatched skill.
+      const actualIntegrity = computeSkillIntegrity(slug, skillsDir);
+      if (actualIntegrity !== expectedIntegrity) {
+        try {
+          fs.rmSync(path.join(skillsDir, slug), { recursive: true, force: true });
+        } catch (rmErr) {
+          log.warn(`[runtime-skills] Could not clean up ${slug} after integrity mismatch: ${rmErr.message}`);
+        }
+        throw new Error(
+          `integrity mismatch for ${slug}@${version}: expected ${expectedIntegrity}, got ${actualIntegrity || "<unreadable>"} \u2014 the registry served a different artifact than the one you approved; refusing to load it.`,
+        );
+      }
       summary.reinstalled++;
-      summary.results.push({ slug, version, status: "reinstalled" });
-      log.log(`[runtime-skills] Reinstalled ${slug}${version ? `@${version}` : ""} in ${Date.now() - started}ms`);
+      summary.results.push({ slug, version, status: "reinstalled", integrity: expectedIntegrity });
+      log.log(`[runtime-skills] Reinstalled ${slug}@${version} (integrity verified) in ${Date.now() - started}ms`);
     } catch (err) {
       const detail = String(err.stderr || err.stdout || err.message || err).trim().split("\n").slice(-3).join(" | ");
       summary.failed++;
       summary.results.push({ slug, version, status: "failed", error: detail });
-      log.warn(`[runtime-skills] Reinstall of ${slug}${version ? `@${version}` : ""} failed after ${Date.now() - started}ms: ${detail}`);
+      log.warn(`[runtime-skills] Reinstall of ${slug}@${version} failed after ${Date.now() - started}ms: ${detail}`);
     }
   }
   return summary;
@@ -426,6 +558,8 @@ module.exports = {
   validateSkillName,
   isValidSlug,
   isValidVersion,
+  isValidIntegrity,
+  computeSkillIntegrity,
   resolveStateDir,
   manifestPath,
   readManifest,

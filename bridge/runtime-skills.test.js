@@ -43,6 +43,22 @@ function placeSkill(skillsDir, slug, { version } = {}) {
   }
 }
 
+/**
+ * The integrity digest of the fixed-content skill tree that `placeSkill`
+ * writes for `slug` (and that the test's fakeRunner reproduces on reinstall).
+ * Placing the skill in a scratch dir, hashing it and removing it keeps the
+ * integrity computation itself under test instead of hard-coding a digest.
+ */
+function integrityOfPlacedSkill(slug) {
+  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), "rs-digest-"));
+  try {
+    placeSkill(scratch, slug, { version: "9.9.9" });
+    return rs.computeSkillIntegrity(slug, scratch);
+  } finally {
+    fs.rmSync(scratch, { recursive: true, force: true });
+  }
+}
+
 describe("runtime-skills.validateSkillName / isValidVersion", () => {
   it("accepts ClawHub slugs and lowercases them", () => {
     assert.equal(rs.validateSkillName("baidu-search"), "baidu-search");
@@ -213,7 +229,10 @@ describe("runtime-skills manifest read/write", () => {
       skills: { ok: { version: "1.0.0" }, "@bad/slug": { version: "1.0.0" }, weird: { version: "not-semver" } },
     });
     const raw = JSON.parse(fs.readFileSync(file, "utf8"));
-    assert.deepEqual(raw.skills, { ok: { version: "1.0.0" }, weird: { version: null } });
+    assert.deepEqual(raw.skills, {
+      ok: { version: "1.0.0", integrity: null },
+      weird: { version: null, integrity: null },
+    });
   });
 });
 
@@ -367,9 +386,11 @@ describe("runtime-skills.reinstallFromManifest", () => {
     return { run, calls };
   }
 
-  it("reinstalls every recorded skill that is missing, pinned to the recorded version, and logs a count", async () => {
-    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
-    rs.recordInstall(manifestFile, "beta", null, { log: quietLog });
+  it("reinstalls every recorded skill that is missing, pinned to the recorded version, verifies integrity and logs a count", async () => {
+    const alphaDigest = integrityOfPlacedSkill("alpha");
+    const betaDigest = integrityOfPlacedSkill("beta");
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity: alphaDigest, log: quietLog });
+    rs.recordInstall(manifestFile, "beta", "2.0.0", { integrity: betaDigest, log: quietLog });
     const { run, calls } = fakeRunner();
     const log = collectingLog();
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log });
@@ -379,18 +400,63 @@ describe("runtime-skills.reinstallFromManifest", () => {
     );
     assert.deepEqual(calls, [
       ["install", "alpha", "--version", "1.0.0", "--no-input", "--workdir", skillsDir, "--dir", skillsDir],
-      ["install", "beta", "--no-input", "--workdir", skillsDir, "--dir", skillsDir],
+      ["install", "beta", "--version", "2.0.0", "--no-input", "--workdir", skillsDir, "--dir", skillsDir],
     ]);
     for (const args of calls) assert.equal(args.includes("--force"), false);
     assert.equal(rs.isSkillPresent("alpha", skillsDir), true);
     assert.equal(rs.isSkillPresent("beta", skillsDir), true);
-    assert.equal(log.lines.filter((l) => /Reinstalled alpha@1\.0\.0/.test(l)).length, 1);
-    assert.equal(log.lines.filter((l) => /Reinstalled beta /.test(l)).length, 1);
+    assert.equal(log.lines.filter((l) => /Reinstalled alpha@1\.0\.0 \(integrity verified\)/.test(l)).length, 1);
+    assert.equal(log.lines.filter((l) => /Reinstalled beta@2\.0\.0 \(integrity verified\)/.test(l)).length, 1);
+  });
+
+  it("refuses to reinstall manifest entries that have no pinned version (fail-closed, no clawhub call)", async () => {
+    const alphaDigest = integrityOfPlacedSkill("alpha");
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity: alphaDigest, log: quietLog });
+    rs.recordInstall(manifestFile, "unpinned", null, { log: quietLog });
+    const { run, calls } = fakeRunner();
+    const log = collectingLog();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log });
+    assert.equal(r.total, 2);
+    assert.equal(r.reinstalled, 1);
+    assert.equal(r.failed, 1);
+    assert.deepEqual(calls.map((a) => a[1]), ["alpha"]);
+    const failed = r.results.find((x) => x.status === "failed");
+    assert.equal(failed.slug, "unpinned");
+    assert.match(failed.error, /without a pinned version/);
+    assert.equal(rs.isSkillPresent("unpinned", skillsDir), false);
+  });
+
+  it("refuses to reinstall manifest entries that have no recorded integrity digest (fail-closed, no clawhub call)", async () => {
+    rs.recordInstall(manifestFile, "legacy", "1.0.0", { log: quietLog }); // no integrity
+    const { run, calls } = fakeRunner();
+    const log = collectingLog();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log });
+    assert.equal(r.failed, 1);
+    assert.deepEqual(calls, []);
+    assert.match(r.results[0].error, /without an integrity digest/);
+    assert.ok(log.lines.some((l) => /without an integrity digest/.test(l)));
+  });
+
+  it("fails the reinstall and removes the installed dir when the downloaded tree does not match the recorded digest", async () => {
+    // Record an integrity for a different content than fakeRunner will install.
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", {
+      integrity: "sha256:" + "0".repeat(64),
+      log: quietLog,
+    });
+    const { run } = fakeRunner();
+    const log = collectingLog();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log });
+    assert.equal(r.failed, 1);
+    assert.equal(r.reinstalled, 0);
+    assert.match(r.results[0].error, /integrity mismatch/);
+    assert.equal(rs.isSkillPresent("alpha", skillsDir), false, "mismatched skill directory must be removed so it cannot be loaded");
   });
 
   it("skips skills already on disk without calling clawhub", async () => {
-    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
-    rs.recordInstall(manifestFile, "beta", "2.0.0", { log: quietLog });
+    const alphaDigest = integrityOfPlacedSkill("alpha");
+    const betaDigest = integrityOfPlacedSkill("beta");
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity: alphaDigest, log: quietLog });
+    rs.recordInstall(manifestFile, "beta", "2.0.0", { integrity: betaDigest, log: quietLog });
     placeSkill(skillsDir, "alpha", { version: "1.0.0" });
     const { run, calls } = fakeRunner();
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
@@ -401,9 +467,12 @@ describe("runtime-skills.reinstallFromManifest", () => {
   });
 
   it("one failing skill does not stop the others, is logged, and stays in the manifest for next time", async () => {
-    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
-    rs.recordInstall(manifestFile, "flagged", "1.0.0", { log: quietLog });
-    rs.recordInstall(manifestFile, "gamma", "3.0.0", { log: quietLog });
+    const alphaDigest = integrityOfPlacedSkill("alpha");
+    const flaggedDigest = integrityOfPlacedSkill("flagged");
+    const gammaDigest = integrityOfPlacedSkill("gamma");
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity: alphaDigest, log: quietLog });
+    rs.recordInstall(manifestFile, "flagged", "1.0.0", { integrity: flaggedDigest, log: quietLog });
+    rs.recordInstall(manifestFile, "gamma", "3.0.0", { integrity: gammaDigest, log: quietLog });
     const before = fs.readFileSync(manifestFile, "utf8");
     const { run, calls } = fakeRunner({ failing: ["flagged"] });
     const log = collectingLog();
@@ -421,7 +490,8 @@ describe("runtime-skills.reinstallFromManifest", () => {
   });
 
   it("counts a zero exit that left no SKILL.md behind as a failure", async () => {
-    rs.recordInstall(manifestFile, "ghost", "1.0.0", { log: quietLog });
+    const ghostDigest = integrityOfPlacedSkill("ghost");
+    rs.recordInstall(manifestFile, "ghost", "1.0.0", { integrity: ghostDigest, log: quietLog });
     const { run } = fakeRunner({ noFiles: ["ghost"] });
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
     assert.equal(r.failed, 1);
@@ -447,9 +517,17 @@ describe("runtime-skills.reinstallFromManifest", () => {
 
   it("invalid manifest entries never reach the runner and are counted", async () => {
     fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
+    const goodIntegrity = integrityOfPlacedSkill("good");
     fs.writeFileSync(
       manifestFile,
-      JSON.stringify({ version: 1, skills: { good: { version: "1.0.0" }, "@evil/slug": { version: "1.0.0" }, bad: { version: "1.0.0; rm -rf /" } } }),
+      JSON.stringify({
+        version: 1,
+        skills: {
+          good: { version: "1.0.0", integrity: goodIntegrity },
+          "@evil/slug": { version: "1.0.0", integrity: goodIntegrity },
+          bad: { version: "1.0.0; rm -rf /", integrity: goodIntegrity },
+        },
+      }),
     );
     const { run, calls } = fakeRunner();
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
@@ -459,7 +537,8 @@ describe("runtime-skills.reinstallFromManifest", () => {
   });
 
   it("a runner that throws synchronously-shaped errors without stderr still yields a summary", async () => {
-    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
+    const alphaDigest = integrityOfPlacedSkill("alpha");
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { integrity: alphaDigest, log: quietLog });
     const run = async () => {
       throw new Error("spawn clawhub ENOENT");
     };

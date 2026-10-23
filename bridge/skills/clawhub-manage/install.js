@@ -38,6 +38,7 @@ if (runtimeSkills.isSkillPresent(skillName)) {
 }
 
 let installedVersion = null;
+let installedIntegrity = null;
 try {
   const output = execFileSync("clawhub", runtimeSkills.installArgs(skillName), {
     encoding: "utf-8",
@@ -49,6 +50,7 @@ try {
     throw new Error(`clawhub reported success but ${runtimeSkills.SKILLS_DIR}/${skillName}/SKILL.md is missing`);
   }
   installedVersion = runtimeSkills.readInstalledVersion(skillName);
+  installedIntegrity = runtimeSkills.computeSkillIntegrity(skillName);
   console.log(`Successfully installed skill: ${skillName}${installedVersion ? ` (v${installedVersion})` : ""}`);
   if (output.trim()) console.log(output.trim());
 } catch (err) {
@@ -68,13 +70,30 @@ try {
 
 // Record the install so it comes back after a cold start. A manifest write
 // failure must not be reported as an install failure — the skill IS on disk —
-// but the user needs to know it will not persist.
+// but the user needs to know it will not persist. The reinstall path
+// (reinstallFromManifest) refuses entries without a pinned version AND a
+// recorded integrity digest, so when we can't resolve either we omit the
+// entry rather than silently setting up an unverified auto-update.
+if (!installedVersion || !installedIntegrity) {
+  const missing = [
+    !installedVersion ? "a pinned version (clawhub recorded no semver in .clawhub/origin.json)" : null,
+    !installedIntegrity ? "an integrity digest of the installed files" : null,
+  ].filter(Boolean).join(" and ");
+  console.error(
+    `Warning: installed "${skillName}" but did not record it for automatic reinstall \u2014 ` +
+      `could not determine ${missing}. The skill is usable in this session; it will be gone after ` +
+      "the next cold start unless you install it again.",
+  );
+  process.exit(0);
+}
+
 try {
-  runtimeSkills.recordInstall(manifestFile, skillName, installedVersion);
+  runtimeSkills.recordInstall(manifestFile, skillName, installedVersion, { integrity: installedIntegrity });
   runtimeSkills.mirrorManifest(manifestFile);
   console.log(
     "\nOpenClaw loads the skill when it next refreshes its skill list (on file change, or at the latest " +
-      "at the next session start). It is reinstalled automatically a few seconds after each new session starts.",
+      "at the next session start). It is reinstalled automatically a few seconds after each new session starts, " +
+      "and the bridge verifies the reinstalled files against the integrity digest recorded now before loading them.",
   );
 } catch (err) {
   console.error(
