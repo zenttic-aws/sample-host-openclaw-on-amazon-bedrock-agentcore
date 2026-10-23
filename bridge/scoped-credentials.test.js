@@ -30,7 +30,23 @@ describe("buildSessionPolicy", () => {
     const parsed = JSON.parse(policy);
     assert.equal(parsed.Version, "2012-10-17");
     assert.ok(Array.isArray(parsed.Statement));
-    assert.equal(parsed.Statement.length, 3, "should have 3 statements (S3 object, S3 list, services)");
+    assert.equal(parsed.Statement.length, 4, "should have 4 statements (S3 object, _system Deny, S3 list, services)");
+  });
+
+  it("explicitly denies writes to the reserved _system/ sub-prefix", () => {
+    const policy = buildSessionPolicy({
+      bucket: "my-bucket",
+      namespace: "telegram_42",
+      cmkArn: "arn:aws:kms:us-west-2:123:key/abc-123",
+    });
+    const parsed = JSON.parse(policy);
+    const denyStmt = parsed.Statement.find(
+      (s) => s.Effect === "Deny" && Array.isArray(s.Action) && s.Action.includes("s3:PutObject"),
+    );
+    assert.ok(denyStmt, "should have Deny statement for _system/ writes");
+    assert.equal(denyStmt.Resource, "arn:aws:s3:::my-bucket/telegram_42/_system/*");
+    assert.ok(denyStmt.Action.includes("s3:PutObject"));
+    assert.ok(denyStmt.Action.includes("s3:DeleteObject"));
   });
 
   it("S3 object actions scoped to namespace/* only", () => {

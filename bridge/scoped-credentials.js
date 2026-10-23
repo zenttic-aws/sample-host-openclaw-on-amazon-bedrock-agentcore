@@ -116,6 +116,17 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
   // permissions the role doesn't have. So we only need S3 namespace scoping here.
   // DynamoDB/Scheduler/SecretsManager scoping is enforced at the application level
   // (skill scripts validate namespace before every operation).
+  //
+  // The explicit Deny on the "_system/" sub-prefix mirrors the reserved-name
+  // denylist in bridge/skills/s3-user-files/common.js and
+  // lambda/gateway_tools/lib/mcp.js. The six workspace Markdown files the
+  // Bedrock proxy concatenates into the Converse `system` block (AGENTS.md,
+  // SOUL.md, USER.md, IDENTITY.md, TOOLS.md, MEMORY.md) live under
+  // "<namespace>/_system/" and must not be writable by scoped user sessions
+  // or by any process that holds these STS credentials; otherwise the user
+  // (or an indirect prompt injection) can plant permanent, guardrail-exempt
+  // system-role instructions. GetObject is left allowed so the proxy can
+  // still bootstrap from the same credential profile.
   const policy = {
     Version: "2012-10-17",
     Statement: [
@@ -125,6 +136,11 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
         // as multipart uploads and aborts a failed one so no billed parts linger.
         Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
         Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
+      },
+      {
+        Effect: "Deny",
+        Action: ["s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+        Resource: `arn:aws:s3:::${bucket}/${namespace}/_system/*`,
       },
       {
         Effect: "Allow",

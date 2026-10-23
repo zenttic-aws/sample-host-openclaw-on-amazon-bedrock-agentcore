@@ -995,6 +995,11 @@ function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
     // Also upload to S3 so the proxy's system prompt injection picks it up.
     // The proxy reads AGENTS.md from S3 (not local filesystem), so without
     // this sync the proxy would inject the stale 156-byte default template.
+    // Publish to the reserved "<namespace>/_system/" sub-prefix: the user-
+    // writable surfaces (bridge/skills/s3-user-files/common.js SYSTEM_PREFIX,
+    // lambda/gateway_tools/lib/mcp.js SYSTEM_PREFIX) and the scoped STS
+    // session policy (bridge/scoped-credentials.js) all refuse this prefix,
+    // so a user cannot overwrite the key the proxy reads from.
     const namespace = currentNamespace;
     const bucket = process.env.S3_USER_FILES_BUCKET;
     if (bucket && namespace) {
@@ -1006,7 +1011,7 @@ function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
           const s3 = workspaceSync.getS3Client();
           await s3.send(new PutObjectCommand({
             Bucket: bucket,
-            Key: `${namespace}/AGENTS.md`,
+            Key: `${namespace}/_system/AGENTS.md`,
             Body: agentsContent,
             ContentType: "text/markdown",
           }), { abortSignal: activationScope.signal });

@@ -36,20 +36,65 @@ function sanitize(str) {
 // list.js prints; any further "/" or ".." is still flattened by sanitize().
 const UPLOADS_PREFIX = "_uploads/";
 
+// Reserved sub-prefix inside each namespace that the proxy uses to source
+// system-prompt files (AGENTS.md, SOUL.md, USER.md, IDENTITY.md, TOOLS.md,
+// MEMORY.md). The scoped STS session policy denies PutObject/DeleteObject on
+// this prefix (bridge/scoped-credentials.js), and buildKey/sanitizeFilename
+// refuse it so neither the user-files skill nor the gateway write_file tool
+// can plant persistent system-role instructions. See
+// bridge/agentcore-proxy.js (readUserFileFromS3) for the trusted readers.
+const SYSTEM_PREFIX = "_system/";
+
+// Filenames the Bedrock proxy concatenates verbatim into the Converse `system`
+// text block (bridge/agentcore-proxy.js WORKSPACE_FILES). Any writer surface
+// that lets a user-authored string reach these keys becomes a persistent
+// prompt-injection channel that the Bedrock guardrail never sees, so these
+// names are refused by both skill surfaces. Keep in sync with WORKSPACE_FILES
+// in bridge/agentcore-proxy.js and sanitizeFilename in
+// lambda/gateway_tools/lib/mcp.js.
+const RESERVED_SYSTEM_FILENAMES = new Set([
+  "AGENTS.md",
+  "SOUL.md",
+  "USER.md",
+  "IDENTITY.md",
+  "TOOLS.md",
+  "MEMORY.md",
+]);
+
+function isReservedSystemFilename(name) {
+  return RESERVED_SYSTEM_FILENAMES.has(name);
+}
+
 /**
  * Build the S3 key from userId and optional filename.
  * Returns "sanitized_userId/", "sanitized_userId/sanitized_filename", or
  * "sanitized_userId/_uploads/sanitized_name" for router-stored uploads.
+ * Refuses the reserved _system/ sub-prefix and the six reserved
+ * system-prompt filenames so the user-files skill cannot overwrite the
+ * sources the proxy injects into the Converse `system` block.
  */
 function buildKey(userId, filename) {
   const prefix = sanitize(userId);
   if (!filename) return `${prefix}/`;
+  if (filename.startsWith(SYSTEM_PREFIX) || filename === "_system") {
+    throw new Error(
+      `Invalid filename: "${filename}" — "${SYSTEM_PREFIX}" is reserved for system-prompt sources and is not user-writable.`,
+    );
+  }
   if (filename.startsWith(UPLOADS_PREFIX)) {
     const name = sanitize(filename.slice(UPLOADS_PREFIX.length));
     if (!name) throw new Error("Invalid filename: empty name after _uploads/");
     return `${prefix}/${UPLOADS_PREFIX}${name}`;
   }
-  return `${prefix}/${sanitize(filename)}`;
+  const sanitized = sanitize(filename);
+  if (isReservedSystemFilename(sanitized)) {
+    throw new Error(
+      `Invalid filename: "${sanitized}" is a reserved system-prompt source ` +
+        `and is not writable through the user-files skill. The proxy sources ` +
+        `it from "<namespace>/${SYSTEM_PREFIX}${sanitized}", which is not user-writable.`,
+    );
+  }
+  return `${prefix}/${sanitized}`;
 }
 
 // download_user_file refuses objects above this size (Telegram uploads are
@@ -130,4 +175,7 @@ module.exports = {
   validateUserId,
   validateBucket,
   streamToString,
+  SYSTEM_PREFIX,
+  RESERVED_SYSTEM_FILENAMES,
+  isReservedSystemFilename,
 };

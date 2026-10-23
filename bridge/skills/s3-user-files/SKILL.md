@@ -108,6 +108,18 @@ When a user sends a Markdown (`.md`) file or a ZIP (`.zip`) archive, the router 
 - Files are isolated per user via S3 key prefix: `{user_id}/{filename}`
 - user_id uses underscores (e.g., `telegram_12345`) — colons are replaced
 - Content encrypted at rest via S3 server-side encryption
+
+## Reserved filenames (NOT writable through this skill)
+
+The filenames `AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`,
+and `MEMORY.md` are reserved for workspace files that the Bedrock proxy
+concatenates into the model's system prompt. They are sourced from the
+reserved sub-prefix `{user_id}/_system/` and are not writable through
+`write_user_file`, `delete_user_file`, or the gateway MCP `write_file` /
+`delete_file` tools; attempts return an error. Any `write_user_file` call
+that targets one of these filenames (or the `_system/` sub-prefix) is
+refused by `buildKey`. Store user notes under a different filename
+(e.g. `notes.md`, `preferences.md`).
 - Bucket enforces SSL-only access
 - Path traversal attempts are sanitized (removes `..`, restricts characters)
 - Never use `default_user` as user_id — scripts reject it with an error
