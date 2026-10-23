@@ -272,6 +272,7 @@ test("handleV2Invocation bounds an async job by its own deadline, not a caller b
     proxyModelOutcomeUnknown: false, activeTaskCount: 0, lastActivityTime: 0, RUNTIME_PLATFORM: "V2",
     OPENCLAW_PORT: 1, GATEWAY_TOKEN: "t", TELEGRAM_BOT_TOKEN: "", activationScope: { signal: undefined },
     lateAnnounces: null, payloadModelOverride: () => null, buildBridgeText: (m) => m, extractTextFromContent: (x) => x,
+    knownDeliveryRoutes: new Set(), routeTripleKey: () => null,
     checkProxyHealth: async () => ({ model_outcome_unknown: false }),
     verifyV2Resources: async () => {},
     updateIdentityFile: (...args) => { seen.trigger = args[5].trigger; },
