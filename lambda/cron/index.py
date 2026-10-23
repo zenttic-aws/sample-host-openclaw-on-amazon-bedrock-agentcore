@@ -5,6 +5,7 @@ if cold, sends the cron message, and delivers the response to the user's
 channel (Telegram, Slack or Feishu).
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -1127,22 +1128,63 @@ ASYNC_STATUS_TIMEOUT_SECONDS = 60
 _SCHEDULED_TIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z")
 
 
-def async_job_id(event, now=None):
-    """Execution name and contract jobId: <scheduleId>-<scheduled fire time>.
+def async_job_id(job, now=None):
+    """Execution name and contract jobId, tenant-scoped by the verified owner.
 
-    One fire of one schedule always maps to the same name, so a repeated
-    invocation cannot start a second run (Step Functions rejects the name).
-    Schedules created by the eventbridge-cron skill pass the scheduled time;
-    older schedules fall back to the invocation time rounded down to the minute.
+    The name is `<scheduleId>-<ownerHash>-<stamp>` where ``ownerHash`` is derived
+    from the verified ``userId`` and ``scheduleId``. Including the owner in the
+    name makes the Step Functions execution-name namespace tenant-scoped: two
+    different tenants cannot collide on the same name, so one tenant cannot
+    silently suppress another tenant's scheduled fire by pre-reserving a name.
+    One fire of one schedule for one owner still always maps to the same name,
+    so a repeated invocation cannot start a second run.
+
+    ``job`` is the verified result of :func:`verify_cron_event`. The stamp is
+    derived from the invocation time rounded down to the minute: a payload
+    ``scheduledTime`` is deliberately ignored so a caller cannot pick the slot
+    they reserve. EventBridge Scheduler fires within seconds of the scheduled
+    time, so the minute-rounded invocation time matches the schedule's fire.
+    Step Functions execution names are limited to 80 characters.
     """
-    schedule = re.sub(r"[^A-Za-z0-9_-]", "", str(event.get("scheduleId") or ""))[:48] or "unknown"
-    match = _SCHEDULED_TIME_RE.fullmatch(str(event.get("scheduledTime") or ""))
-    if match:
-        parts = match.groups()
-        stamp = "".join(parts[:3]) + "T" + "".join(parts[3:]) + "Z"
-    else:
-        stamp = time.strftime("%Y%m%dT%H%M00Z", time.gmtime(time.time() if now is None else now))
-    return f"{schedule}-{stamp}"
+    now = time.time() if now is None else now
+    user_id = str(job.get("userId") or "")
+    raw_schedule = str(job.get("scheduleId") or "")
+    schedule = re.sub(r"[^A-Za-z0-9_-]", "", raw_schedule)[:48] or "unknown"
+    stamp = time.strftime("%Y%m%dT%H%M00Z", time.gmtime(now))
+    # 12 hex chars = 48 bits, ample for separating tenants on one state machine
+    # while keeping the 80-char Step Functions execution-name limit (48+1+12+1+16=78).
+    owner_hash = hashlib.sha256(f"{user_id}|{raw_schedule}".encode("utf-8")).hexdigest()[:12]
+    return f"{schedule}-{owner_hash}-{stamp}"
+
+
+def _existing_execution_belongs_to(job, name):
+    """Best-effort ownership check for an ``ExecutionAlreadyExists`` collision.
+
+    The verified owner is already baked into the execution name, so a
+    cross-tenant collision is cryptographically improbable; this is defence in
+    depth. Returns True when the existing execution's input names the same
+    verified owner, False when it names a different owner, and None when the
+    check cannot be performed (treated as "unknown, trust the hash").
+    """
+    sm_arn = CRON_ASYNC_STATE_MACHINE_ARN
+    marker = ":stateMachine:"
+    if marker not in sm_arn:
+        return None
+    prefix, _, sm_name = sm_arn.partition(marker)
+    execution_arn = f"{prefix}:execution:{sm_name}:{name}"
+    try:
+        description = sfn_client.describe_execution(executionArn=execution_arn)
+    except ClientError as e:
+        logger.warning("describe_execution for %s failed: %s", name, e.response.get("Error", {}).get("Code"))
+        return None
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning("describe_execution for %s failed: %s", name, type(e).__name__)
+        return None
+    try:
+        existing = json.loads(description.get("input") or "{}")
+    except (TypeError, ValueError):
+        return False
+    return existing.get("userId") == job["userId"] and existing.get("scheduleId") == job["scheduleId"]
 
 
 def launch_async(event):
@@ -1150,13 +1192,35 @@ def launch_async(event):
     job, error = verify_cron_event(event)
     if error:
         return error
-    name = async_job_id(event)
-    state = {key: event[key] for key in ASYNC_EVENT_FIELDS if event.get(key) is not None}
+    name = async_job_id(job)
+    # Build the state machine input from the verified job, not the raw event,
+    # so the identity, channel and schedule carried into the state machine are
+    # the server-authoritative values rather than whatever the payload claimed.
+    state = {key: job[key] for key in ASYNC_EVENT_FIELDS if job.get(key) is not None}
+    # Preserve passthrough fields the verified job does not carry (channelActorId
+    # is a legacy alias for actorId; scheduledTime is informational for the
+    # downstream phases). Taking them from the raw event is safe because
+    # downstream phases re-verify the state and use job["actorId"]/job["userId"].
+    for key in ("channelActorId", "scheduledTime"):
+        if event.get(key) is not None and key not in state:
+            state[key] = event[key]
     state.update({"cronPhase": "start", "jobId": name})
     try:
         sfn_client.start_execution(stateMachineArn=CRON_ASYNC_STATE_MACHINE_ARN, name=name, input=json.dumps(state))
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ExecutionAlreadyExists":
+            same_owner = _existing_execution_belongs_to(job, name)
+            if same_owner is False:
+                # Different owner holds this name: the owner hash in the name
+                # makes this cryptographically improbable, so if it ever fires
+                # it is a signal worth alarming on. Match the
+                # openclaw-scheduled-task-failures alarm pattern.
+                logger.error(
+                    "Scheduled task %s did not complete: execution name %s is held by a different owner",
+                    job["scheduleId"], name,
+                )
+                deliver_failure(job, "name_collision")
+                return {"statusCode": 409, "body": "Execution name collision"}
             logger.warning("Scheduled task %s already started for this fire time; not starting it again",
                            job["scheduleId"])
             return {"statusCode": 200, "body": "Already started"}

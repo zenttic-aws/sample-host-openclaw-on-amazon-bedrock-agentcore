@@ -51,7 +51,8 @@ def _payloads(module):
 
 
 def _state(**extra):
-    return {**cron_event(), "scheduleName": "Desk", "jobId": "schedule123-20261019T084700Z", **extra}
+    return {**cron_event(), "scheduleName": "Desk",
+            "jobId": "schedule123-410e6ba40e0a-20261019T084700Z", **extra}
 
 
 def _sent(module):
@@ -64,16 +65,30 @@ FAILED = "[Scheduled: Desk] " + "Your scheduled task did not return a result thi
 
 # --- execution name / jobId ----------------------------------------------------
 
-def test_job_id_is_the_schedule_and_its_scheduled_fire_time():
+def test_job_id_includes_the_verified_owner_and_the_scheduled_fire_time():
     module = _lambda()
-    event = {**cron_event(), "scheduledTime": "2026-10-19T08:47:00Z"}
-    assert module.async_job_id(event) == "schedule123-20261019T084700Z"
-    # Older schedules carry no scheduled time: the invocation time, to the minute.
+    # The verified `job` (not the raw event) feeds async_job_id: the owner hash
+    # keeps the Step Functions execution-name namespace tenant-scoped so one
+    # user cannot pre-reserve another user's slot.
     fired = time.mktime((2026, 10, 19, 8, 47, 4, 0, 0, 0)) - time.timezone
-    assert module.async_job_id(cron_event(), now=fired) == "schedule123-20261019T084700Z"
+    job = {**cron_event(), "userId": USER}
+    assert module.async_job_id(job, now=fired) == "schedule123-410e6ba40e0a-20261019T084700Z"
+    # The payload scheduledTime is not trusted as the idempotency stamp: the
+    # invocation time (rounded to the minute) wins so an attacker cannot pick
+    # the slot they reserve by inserting a literal future scheduledTime.
+    attacker = {**job, "scheduledTime": "2099-01-01T00:00:00Z"}
+    assert module.async_job_id(attacker, now=fired) == "schedule123-410e6ba40e0a-20261019T084700Z"
+    # A different owner for the same scheduleId gets a different execution name.
+    other = module.async_job_id({**job, "userId": "someone-else"}, now=fired)
+    assert other.startswith("schedule123-") and other.endswith("-20261019T084700Z")
+    assert other != "schedule123-410e6ba40e0a-20261019T084700Z"
     # Only characters Step Functions accepts in an execution name.
-    name = module.async_job_id({"scheduleId": "a:b/c d#e", "scheduledTime": "bogus"}, now=fired)
-    assert name == "abcde-20261019T084700Z"
+    name = module.async_job_id({"userId": "", "scheduleId": "a:b/c d#e"}, now=fired)
+    assert name == "abcde-2fac9b260459-20261019T084700Z"
+    # Step Functions caps execution names at 80 characters.
+    assert len(name) <= 80
+    long_name = module.async_job_id({"userId": "u" * 200, "scheduleId": "s" * 200}, now=fired)
+    assert len(long_name) <= 80
 
 
 def test_new_schedules_pass_their_scheduled_fire_time():
@@ -88,23 +103,45 @@ def test_new_schedules_pass_their_scheduled_fire_time():
 def test_launch_starts_one_named_execution_and_does_not_run_the_turn():
     module = _lambda()
     event = {**cron_event(), "scheduleName": "Desk", "scheduledTime": "2026-10-19T08:47:00Z"}
-    assert module.handler(event, Context())["statusCode"] == 202
+    fired = time.mktime((2026, 10, 19, 8, 47, 4, 0, 0, 0)) - time.timezone
+    with patch.object(module.time, "time", return_value=fired):
+        assert module.handler(event, Context())["statusCode"] == 202
     (call,) = module.sfn_client.start_execution.call_args_list
     assert call.kwargs["stateMachineArn"] == SM_ARN
-    assert call.kwargs["name"] == "schedule123-20261019T084700Z"
+    assert call.kwargs["name"] == "schedule123-410e6ba40e0a-20261019T084700Z"
     state = json.loads(call.kwargs["input"])
     assert state["cronPhase"] == "start" and state["jobId"] == call.kwargs["name"]
     assert state["message"] == "hi" and state["channelTarget"] == "123"
+    # The state carries the server-authoritative userId, not the stale payload one.
+    assert state["userId"] == USER
     assert module.agentcore_client.calls == []
     assert _sent(module) == []
 
 
-def test_a_repeated_fire_does_not_start_a_second_run():
+def test_a_repeated_fire_from_the_same_owner_does_not_start_a_second_run():
     module = _lambda()
     module.sfn_client.start_execution.side_effect = ClientError(
         {"Error": {"Code": "ExecutionAlreadyExists", "Message": "exists"}}, "StartExecution")
+    # describe_execution shows the collision belongs to the same verified owner.
+    module.sfn_client.describe_execution.return_value = {
+        "input": json.dumps({"userId": USER, "scheduleId": "schedule123"})
+    }
     assert module.handler({**cron_event(), "scheduleName": "Desk"}, Context())["statusCode"] == 200
     assert _sent(module) == []
+
+
+def test_a_collision_from_a_different_owner_alarms_and_delivers_the_failure(caplog):
+    module = _lambda()
+    module.sfn_client.start_execution.side_effect = ClientError(
+        {"Error": {"Code": "ExecutionAlreadyExists", "Message": "exists"}}, "StartExecution")
+    module.sfn_client.describe_execution.return_value = {
+        "input": json.dumps({"userId": "someone-else", "scheduleId": "schedule123"})
+    }
+    with caplog.at_level(logging.ERROR):
+        out = module.handler({**cron_event(), "scheduleName": "Desk"}, Context())
+    assert out["statusCode"] == 409
+    assert _sent(module) == [FAILED]
+    assert "did not complete" in caplog.text
 
 
 def test_a_failed_start_sends_the_failure_notice(caplog):
