@@ -143,7 +143,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     extractImageReferences: (text) => ({ cleanText: text, images: [] }),
     getCognitoToken: async () => null,
     retrieveMemoryContext: async () => "",
-    buildUserIdentityContext: async () => "",
+    buildUserIdentityContext: async () => ({ text: "", workspaceGuardText: "" }),
     extractSystemText: require("./system-messages").extractSystemText,
     scopeGuardrailToLatestUserTurn: require("./guardrail-scope").scopeGuardrailToLatestUserTurn,
     reconcileToolHistory: require("./tool-history").reconcileToolHistory,
