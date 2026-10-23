@@ -14,12 +14,14 @@ Path routing:
   POST /webhook/line      — LINE Messaging API webhook (disabled until configured)
 """
 
+import base64
 import hashlib
 import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -523,13 +525,65 @@ def get_or_create_session(user_id):
 # Cross-channel binding
 # ---------------------------------------------------------------------------
 
+def _generate_bind_code():
+    """CSPRNG bind code: 20 uppercase base32 chars (~100 bits of entropy).
+
+    Produces an alnum code that remains compatible with ``_is_bind_command``
+    parsing. 100 bits of entropy is safe without an application-layer attempt
+    limiter against the 10-minute TTL and real chat-platform throughput.
+    """
+    # 13 random bytes -> 21 base32 chars; take 20 for a tidy length.
+    raw = secrets.token_bytes(13)
+    return base64.b32encode(raw).decode("ascii").rstrip("=")[:20]
+
+
+def _invalidate_previous_bind_code(user_id):
+    """Best-effort: delete any outstanding BIND code previously issued to user.
+
+    Caps outstanding bind codes per user to one by resolving a per-user pointer
+    item (``USER#<id> / BIND_POINTER``) that records the most recently issued
+    code and deleting the matching ``BIND#<code>`` item. Any failure here is
+    non-fatal: the new code will be written regardless and the stale code will
+    expire via its own TTL.
+    """
+    pointer_key = {"PK": f"USER#{user_id}", "SK": "BIND_POINTER"}
+    try:
+        resp = identity_table.get_item(Key=pointer_key, ConsistentRead=True)
+    except ClientError as e:
+        logger.warning("create_bind_code: pointer lookup failed for %s: %s", user_id, e)
+        return
+    prev = (resp.get("Item") or {}).get("code")
+    if not prev:
+        return
+    try:
+        identity_table.delete_item(
+            Key={"PK": f"BIND#{prev}", "SK": "BIND"},
+            ConditionExpression="userId = :user",
+            ExpressionAttributeValues={":user": user_id},
+        )
+    except ClientError as e:
+        # ConditionalCheckFailed just means the code was already redeemed or
+        # expired/evicted; nothing to clean up.
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            logger.warning("create_bind_code: stale code delete failed for %s: %s", user_id, e)
+
+
 def create_bind_code(user_id):
-    """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    """Generate a high-entropy bind code and store it in DynamoDB with TTL.
+
+    The code is a 20-character uppercase base32 string generated from a CSPRNG
+    (~100 bits of entropy), replacing the former 8-hex-char code whose 32-bit
+    keyspace was only safe behind an application-layer attempt limiter. Any
+    previous outstanding bind code issued to the same user is invalidated so
+    at most one code is live per user at a time.
+    """
     try:
         route = _binding_route(user_id)
     except RouteUnavailable:
         return None
-    code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
+    # Cap outstanding codes per user to one: delete any prior live code first.
+    _invalidate_previous_bind_code(user_id)
+    code = _generate_bind_code()
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -546,6 +600,19 @@ def create_bind_code(user_id):
         },
         ConditionExpression="attribute_not_exists(PK)",
     )
+    try:
+        identity_table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": "BIND_POINTER",
+                "userId": user_id,
+                "code": code,
+                "createdAt": now_iso,
+                "ttl": ttl,
+            },
+        )
+    except ClientError as e:
+        logger.warning("create_bind_code: pointer write failed for %s: %s", user_id, e)
     return code
 
 
@@ -590,6 +657,19 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
                 or item.get("sessionId") != route.session_id):
             return None, False
         link_actor(IDENTITY_TABLE_NAME, identity_client, channel_key, user_id, current, owner, code, display_name, route)
+
+        # Clear the per-user BIND_POINTER so the user is immediately eligible
+        # to request a fresh code. The underlying BIND# item is deleted inside
+        # link_actor's transact_write_items; the pointer is best-effort state.
+        try:
+            identity_table.delete_item(
+                Key={"PK": f"USER#{user_id}", "SK": "BIND_POINTER"},
+                ConditionExpression="code = :code",
+                ExpressionAttributeValues={":code": code},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                logger.warning("redeem_bind_code: pointer cleanup failed for %s: %s", user_id, e)
 
         logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
         return user_id, True
@@ -1553,13 +1633,18 @@ def _upload_document_to_s3(data, namespace, kind):
 # ---------------------------------------------------------------------------
 
 def _is_bind_command(text):
-    """Check if the message is a bind-code command (e.g. 'link ABCD1234')."""
+    """Check if the message is a bind-code command (e.g. 'link ABCD1234...').
+
+    Accepts alphanumeric bind codes between 8 and 32 characters: the current
+    issuer emits a 20-char base32 code (~100 bits of entropy); the 8-char
+    lower bound retains compatibility with any still-outstanding legacy codes.
+    """
     if not text:
         return False, ""
     parts = text.strip().split()
     if len(parts) == 2 and parts[0].lower() in ("link", "bind"):
         code = parts[1].strip().upper()
-        if len(code) == 8 and code.isalnum():
+        if 8 <= len(code) <= 32 and code.isalnum():
             return True, code
     return False, ""
 
