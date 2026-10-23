@@ -16,7 +16,7 @@ from urllib import request as urllib_request
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from runtime_routing import admit_route, is_unknown_outcome, resolve_route
+from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
 import whatsapp
 import line_channel
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
@@ -162,8 +162,28 @@ def _get_feishu_tenant_token():
 # DynamoDB session management (reuse pattern from router Lambda)
 # ---------------------------------------------------------------------------
 
+def _is_user_disabled(user_id):
+    """Operator kill switch: USER#<id>/PROFILE.status == "DISABLED" blocks routing."""
+    try:
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
+    except Exception as e:
+        # Fail closed: an unreadable profile must not grant service.
+        logger.error("User status read failed for %s: %s", user_id, e)
+        return True
+    return profile.get("status") == "DISABLED"
+
+
 def get_or_create_session(user_id):
-    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation.
+
+    Honours the operator kill switch: a USER#<id>/PROFILE record with
+    ``status == "DISABLED"`` short-circuits scheduled routing before any
+    AgentCore invocation.
+    """
+    if _is_user_disabled(user_id):
+        raise RouteUnavailable("User is administratively disabled")
     return resolve_route(identity_table, user_id)
 
 
