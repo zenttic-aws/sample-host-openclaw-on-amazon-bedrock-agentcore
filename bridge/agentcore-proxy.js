@@ -359,9 +359,13 @@ function extractSessionMetadata(parsed, headers) {
   }
 
   // 5b. Validate actorId format to prevent prompt injection.
-  // Only allow channel:alphanumeric patterns or known fallback values.
+  // Only allow channel:alphanumeric patterns or known fallback values. The
+  // body is capped at 37 characters so the derived namespace
+  // (actorId.replace(':', '_')) stays within 46 characters — the maximum
+  // width that fits inside EventBridge schedule names without truncation
+  // (see bridge/skills/eventbridge-cron/common.js buildScheduleName).
   const VALID_ACTOR_ID =
-    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,37}$/;
   if (actorId !== "default-user" && !VALID_ACTOR_ID.test(actorId)) {
     console.warn(
       `[proxy] WARNING: actorId "${actorId.slice(0, 80)}" failed validation — falling back to default-user.`,
