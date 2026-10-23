@@ -1752,7 +1752,19 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       manifestFile: runtimeSkills.manifestPath(OPENCLAW_DIR), log: console, run: runRuntimeSkillInstall,
     });
     checkpoint();
-    if (skills.failed || skills.corrupt || skills.invalid) throw new Error("Required runtime skills could not be restored");
+    // Previously any failed/corrupt/invalid summary threw and blocked
+    // USER_READY, which turned a single unresolvable manifest entry (prompt-
+    // injected bad slug, upstream unpublish, clawhub.ai outage) into a
+    // persistent, operator-only-recoverable lockout. The reinstall now
+    // self-heals (rewriting corrupt/invalid manifests and quarantining entries
+    // that fail repeatedly — see runtime-skills.js), so we only surface the
+    // outcome here and let activation proceed. `list.js` reports the
+    // pending/failed entries to the user.
+    if (skills.failed || skills.quarantined || skills.corrupt || skills.invalid) {
+      console.warn(
+        `[contract] Runtime skill restoration incomplete — continuing activation (failed=${skills.failed || 0} quarantined=${skills.quarantined || 0} corrupt=${skills.corrupt ? 1 : 0} invalid=${skills.invalid || 0} reinstalled=${skills.reinstalled || 0} present=${skills.present || 0} total=${skills.total || 0})`,
+      );
+    }
     activationScope.mark("skills");
     logActivationPhase("config_skills_ready");
 
