@@ -12,7 +12,7 @@ const {
   buildScheduleName,
   getCronRecord,
   deleteCronRecord,
-  extractChannelInfo,
+  resolveOwnerInternalUserId,
 } = require("./common");
 
 async function main() {
@@ -27,28 +27,18 @@ async function main() {
     process.exit(1);
   }
 
-  // Look up real userId from DynamoDB
-  const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-  const { DynamoDBDocumentClient, GetCommand } = require("@aws-sdk/lib-dynamodb");
-  const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
-
-  let realUserId = null;
+  // Derive the DynamoDB partition-key owner from the container's own
+  // identity (INTERNAL_USER_ID) — not from argv. validateUserId has already
+  // asserted that argv[2] names this container's owner, so this is
+  // defence in depth against a prompt-injected LLM supplying a victim
+  // namespace on the command line. Fall back to argv userId when
+  // INTERNAL_USER_ID is not set (older deployments).
+  let lookupUserId;
   try {
-    const { channel, channelTarget } = extractChannelInfo(userId);
-    const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
-    const channelKey = `${channel}:${channelTarget}`;
-    const resp = await docClient.send(new GetCommand({
-      TableName: IDENTITY_TABLE_NAME,
-      Key: { PK: `CHANNEL#${channelKey}`, SK: "PROFILE" },
-    }));
-    if (resp.Item) {
-      realUserId = resp.Item.userId;
-    }
+    lookupUserId = resolveOwnerInternalUserId();
   } catch (err) {
-    // Fall through
+    lookupUserId = userId;
   }
-
-  const lookupUserId = realUserId || userId;
 
   // Verify the schedule exists for this user
   const record = await getCronRecord(lookupUserId, scheduleId);

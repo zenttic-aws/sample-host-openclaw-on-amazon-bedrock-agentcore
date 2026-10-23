@@ -30,7 +30,7 @@ describe("buildSessionPolicy", () => {
     const parsed = JSON.parse(policy);
     assert.equal(parsed.Version, "2012-10-17");
     assert.ok(Array.isArray(parsed.Statement));
-    assert.equal(parsed.Statement.length, 3, "should have 3 statements (S3 object, S3 list, services)");
+    assert.equal(parsed.Statement.length, 5, "should have 5 statements (S3 object, S3 list, scheduler, dynamo, misc)");
   });
 
   it("S3 object actions scoped to namespace/* only", () => {
@@ -168,20 +168,27 @@ describe("buildSessionPolicy", () => {
     );
   });
 
-  it("includes DynamoDB actions in statement 1 with Resource *", () => {
+    it("scopes DynamoDB to the identity table ARN when provided", () => {
+    const identityTableArn = "arn:aws:dynamodb:us-west-2:123456789012:table/openclaw-identity";
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
-      identityTableArn: "arn:aws:dynamodb:us-west-2:123456789012:table/openclaw-identity",
+      identityTableArn,
     });
 
     const parsed = JSON.parse(policy);
     const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
     assert.ok(dynamoStmt, "should have DynamoDB actions");
-    assert.equal(dynamoStmt.Resource, "*", "DynamoDB resource should be wildcard");
+    const resources = Array.isArray(dynamoStmt.Resource) ? dynamoStmt.Resource : [dynamoStmt.Resource];
+    assert.ok(resources.includes(identityTableArn), `DynamoDB resource should include table ARN, got: ${resources}`);
+    assert.ok(
+      resources.some((r) => r === `${identityTableArn}/index/*`),
+      "DynamoDB resource should include GSI index ARN",
+    );
+    assert.ok(!resources.includes("*"), "DynamoDB resource must not be wildcard when table ARN is provided");
   });
 
-  it("includes DynamoDB actions even when identityTableArn not provided", () => {
+  it("falls back to wildcard DynamoDB resource when identityTableArn is not provided", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -190,10 +197,10 @@ describe("buildSessionPolicy", () => {
     const parsed = JSON.parse(policy);
     const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
     assert.ok(dynamoStmt, "should have DynamoDB actions");
-    assert.equal(dynamoStmt.Resource, "*", "DynamoDB resource should be wildcard");
+    assert.equal(dynamoStmt.Resource, "*", "DynamoDB resource is wildcard only when ARN is unknown");
   });
 
-  it("DynamoDB has no Condition block regardless of parameters", () => {
+  it("adds a dynamodb:LeadingKeys condition pinning the owner's partition key", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
@@ -205,45 +212,56 @@ describe("buildSessionPolicy", () => {
     const parsed = JSON.parse(policy);
     const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
     assert.ok(dynamoStmt, "should have DynamoDB actions");
-    assert.equal(dynamoStmt.Condition, undefined, "DynamoDB should have no Condition block");
+    assert.ok(dynamoStmt.Condition, "DynamoDB statement should carry a Condition block");
+    const leadingKeys = dynamoStmt.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"];
+    assert.deepEqual(leadingKeys, ["USER#user_abc123"],
+      "LeadingKeys must pin the DynamoDB partition key to USER#<internalUserId>");
   });
 
-  it("no Condition block even when actorId equals internalUserId", () => {
+  it("omits the LeadingKeys condition when internalUserId is unknown", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
       actorId: "telegram:12345",
-      internalUserId: "telegram:12345",
+      identityTableArn: "arn:aws:dynamodb:us-west-2:123456789012:table/openclaw-identity",
     });
 
     const parsed = JSON.parse(policy);
     const dynamoStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
-    assert.equal(dynamoStmt.Condition, undefined, "DynamoDB should have no Condition block");
+    assert.equal(dynamoStmt.Condition, undefined,
+      "LeadingKeys condition requires internalUserId; otherwise rely on resource ARN only");
   });
 
-  it("includes scheduler:* in statement 1 with Resource *", () => {
+  it("scopes scheduler to the schedule group ARN when provided", () => {
+    const scheduleGroupArn = "arn:aws:scheduler:us-west-2:123456789012:schedule-group/openclaw-cron";
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
-      scheduleGroupArn: "arn:aws:scheduler:us-west-2:123456789012:schedule-group/openclaw-cron",
+      scheduleGroupArn,
     });
 
     const parsed = JSON.parse(policy);
-    const ebStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("scheduler:*"));
+    const ebStmt = parsed.Statement.find((s) => s.Action === "scheduler:*");
     assert.ok(ebStmt, "should have scheduler:* action");
-    assert.equal(ebStmt.Resource, "*", "scheduler resource should be wildcard");
+    const resources = Array.isArray(ebStmt.Resource) ? ebStmt.Resource : [ebStmt.Resource];
+    assert.ok(
+      resources.some((r) => r === "arn:aws:scheduler:us-west-2:123456789012:schedule/openclaw-cron/*"),
+      `scheduler resource should include per-schedule ARN, got: ${resources}`,
+    );
+    assert.ok(resources.includes(scheduleGroupArn), "scheduler resource should include schedule-group ARN");
+    assert.ok(!resources.includes("*"), "scheduler resource must not be wildcard when ARN is provided");
   });
 
-  it("scheduler:* always present regardless of scheduleGroupArn", () => {
+  it("falls back to wildcard scheduler resource when scheduleGroupArn is not provided", () => {
     const policy = buildSessionPolicy({
       bucket: "my-bucket",
       namespace: "telegram_12345",
     });
 
     const parsed = JSON.parse(policy);
-    const ebStmt = parsed.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("scheduler:*"));
+    const ebStmt = parsed.Statement.find((s) => s.Action === "scheduler:*");
     assert.ok(ebStmt, "should have scheduler:* action even without scheduleGroupArn");
-    assert.equal(ebStmt.Resource, "*", "scheduler resource should be wildcard");
+    assert.equal(ebStmt.Resource, "*", "scheduler resource is wildcard only when ARN is unknown");
   });
 });
 
@@ -336,26 +354,40 @@ describe("createScopedCredentials", () => {
     assert.equal(input.DurationSeconds, 3600);
   });
 
-  it("includes DynamoDB and scheduler actions with Resource * regardless of env vars", async () => {
+  it("scopes DynamoDB and scheduler to concrete ARNs when env vars are set", async () => {
     process.env.IDENTITY_TABLE_NAME = "openclaw-identity";
     process.env.EVENTBRIDGE_SCHEDULE_GROUP = "openclaw-cron";
 
     await createScopedCredentials("telegram_12345", {
       stsClient: _mockStsClient,
+      internalUserId: "user_abc123",
     });
 
     const input = _mockStsClient.send.mock.calls[0].arguments[0].input;
     const policy = JSON.parse(input.Policy);
 
-    // DynamoDB should be in statement 1 with Resource "*"
     const dynamoStmt = policy.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("dynamodb:GetItem"));
     assert.ok(dynamoStmt, "should have DynamoDB actions");
-    assert.equal(dynamoStmt.Resource, "*", "DynamoDB resource should be wildcard");
+    const dynamoResources = Array.isArray(dynamoStmt.Resource) ? dynamoStmt.Resource : [dynamoStmt.Resource];
+    assert.ok(
+      dynamoResources.some((r) => r.endsWith(":table/openclaw-identity")),
+      "DynamoDB resource should include the identity table ARN",
+    );
+    assert.ok(!dynamoResources.includes("*"), "DynamoDB resource must not be wildcard");
+    assert.deepEqual(
+      dynamoStmt.Condition["ForAllValues:StringLike"]["dynamodb:LeadingKeys"],
+      ["USER#user_abc123"],
+      "LeadingKeys must pin the DynamoDB partition key to the owner",
+    );
 
-    // Scheduler should be in statement 1 with Resource "*"
-    const ebStmt = policy.Statement.find((s) => Array.isArray(s.Action) && s.Action.includes("scheduler:*"));
+    const ebStmt = policy.Statement.find((s) => s.Action === "scheduler:*");
     assert.ok(ebStmt, "should have scheduler actions");
-    assert.equal(ebStmt.Resource, "*", "scheduler resource should be wildcard");
+    const schedulerResources = Array.isArray(ebStmt.Resource) ? ebStmt.Resource : [ebStmt.Resource];
+    assert.ok(
+      schedulerResources.some((r) => r.endsWith(":schedule/openclaw-cron/*")),
+      "scheduler resource should include per-schedule ARN",
+    );
+    assert.ok(!schedulerResources.includes("*"), "scheduler resource must not be wildcard");
 
     delete process.env.IDENTITY_TABLE_NAME;
     delete process.env.EVENTBRIDGE_SCHEDULE_GROUP;

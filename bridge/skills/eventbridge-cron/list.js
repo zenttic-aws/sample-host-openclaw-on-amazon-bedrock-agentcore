@@ -7,7 +7,7 @@ const {
   validateUserId,
   validateEnv,
   listCronRecords,
-  extractChannelInfo,
+  resolveOwnerInternalUserId,
 } = require("./common");
 
 const DAY_NAMES = { "1": "Sunday", "2": "Monday", "3": "Tuesday", "4": "Wednesday", "5": "Thursday", "6": "Friday", "7": "Saturday",
@@ -77,29 +77,20 @@ async function main() {
   validateUserId(userId);
   validateEnv();
 
-  // Look up real userId from DynamoDB using channel info
-  const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
-  const { DynamoDBDocumentClient, GetCommand } = require("@aws-sdk/lib-dynamodb");
-  const REGION = process.env.AWS_REGION;
-  const IDENTITY_TABLE_NAME = process.env.IDENTITY_TABLE_NAME;
-
-  let realUserId = null;
+  // Derive the DynamoDB partition-key owner from the container's own
+  // identity (INTERNAL_USER_ID, set by agentcore-contract.js at container
+  // init) — never from argv. validateUserId has already asserted that
+  // argv[2] names this container's owner, so this is defence in depth.
+  // Fall back to the (validated) argv userId when INTERNAL_USER_ID is
+  // not set (older deployments).
+  let lookupUserId;
   try {
-    const { channel, channelTarget } = extractChannelInfo(userId);
-    const docClient = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }));
-    const channelKey = `${channel}:${channelTarget}`;
-    const resp = await docClient.send(new GetCommand({
-      TableName: IDENTITY_TABLE_NAME,
-      Key: { PK: `CHANNEL#${channelKey}`, SK: "PROFILE" },
-    }));
-    if (resp.Item) {
-      realUserId = resp.Item.userId;
-    }
+    lookupUserId = resolveOwnerInternalUserId();
   } catch (err) {
-    // Fall through to using userId as-is
+    lookupUserId = userId;
   }
 
-  const records = await listCronRecords(realUserId || userId);
+  const records = await listCronRecords(lookupUserId);
 
   if (records.length === 0) {
     console.log("No scheduled tasks found.");
