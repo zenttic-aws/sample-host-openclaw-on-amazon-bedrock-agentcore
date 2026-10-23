@@ -94,7 +94,8 @@ test("linked-channel delivery changes retain the canonical actor and namespace",
   assert.equal((await app.request({ "x-openclaw-actor-id": "discord:foreign" })).status, 200);
   assert.deepEqual(app.cognito, ["slack:owner"]);
   assert.ok(app.s3.length > 0);
-  assert.ok(app.s3.every((request) => request.Key.startsWith("slack_owner/")));
+  assert.ok(app.s3.every((request) => request.Key.startsWith("slack_owner/") ||
+    request.Key.startsWith("_system/slack_owner/")));
   assert.equal(app.model.length, 1);
 });
 
@@ -115,7 +116,8 @@ test("an unbound legacy proxy retains the original identity and Cognito path", a
   const app = proxy(null);
   assert.equal((await app.request({ "x-openclaw-actor-id": "telegram:legacy" })).status, 200);
   assert.deepEqual(app.cognito, ["telegram:legacy"]);
-  assert.ok(app.s3.every((request) => request.Key.startsWith("telegram_legacy/")));
+  assert.ok(app.s3.every((request) => request.Key.startsWith("telegram_legacy/") ||
+    request.Key.startsWith("_system/telegram_legacy/")));
 });
 
 test("a neutral auth factory cannot adopt its first caller, and a bound factory rejects foreign actors", async () => {
