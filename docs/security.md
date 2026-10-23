@@ -23,7 +23,7 @@ Running an AI agent with tool access (bash, web fetch, file operations) on a loc
 | **Network exposure** | Open ports, direct internet exposure | VPC private subnets, no public IPs on containers, 7+ VPC endpoints keep traffic on AWS backbone |
 | **Abuse / runaway costs** | No budget controls | Hourly and daily token and cost alarms (defaults 5M tokens and $30 per hour, 18M tokens and $100 per day), anomaly detection. Alarms notify only subscribers of the `openclaw-alarms` SNS topic |
 | **Audit trail** | None or manual log review | CloudTrail (most accounts already have one; optional dedicated trail available), CloudWatch access logs, Bedrock invocation logging |
-| **Lateral movement** | Full host access, all env vars | STS scoped credentials + tool deny list + credential env var blocklist; V2 activation fails closed if credentials are unavailable |
+| **Lateral movement** | Full host access, all env vars | Per-user Firecracker microVM is the enforced boundary; STS scoped credentials, tool deny list and credential env var blocklist are defence-in-depth; V2 activation fails closed if credentials are unavailable |
 | **OS / container CVEs** | Manual patching | ECR image scanning on push, managed runtime, multi-stage Docker build (no build tools in runtime) |
 | **DDoS / abuse** | Direct exposure, no rate limits | API Gateway throttling (burst 50, sustained 100 req/s), webhook signature validation |
 | **Secret rotation** | Manual, often forgotten | Secrets Manager with 15-min cache TTL; scoped credentials checked before turns and persistence operations, refreshed when remaining validity is insufficient |
@@ -82,7 +82,7 @@ The Router API Gateway HTTP API uses explicit routes — only three paths are ex
 
 ### 3.4 Per-User Isolation (Zero Trust)
 
-This is the most critical security layer. Even if the AI agent is instructed to access another user's data, STS session policies and the credential env var blocklist make it impossible.
+**Enforced boundary: the per-user AgentCore Firecracker microVM.** The STS session policy and the credential-env blocklist below are defence-in-depth hardening of the AWS SDK/CLI surface inside that microVM — they are *not*, on their own, a tenant-isolation mechanism. The OpenClaw child currently runs as root in the same PID namespace as the contract server, so an attacker who achieves code execution through the agent's `exec` tool can read `/proc/1/environ` or reach the container credential endpoint directly and recover the full execution-role credentials. Cross-user isolation holds because each user gets a dedicated microVM, not because a stripped child environment keeps the ambient credentials out of reach.
 
 #### AgentCore MicroVM Isolation
 
@@ -104,21 +104,27 @@ During user activation, the contract server calls `STS:AssumeRole` on the execut
 
 Implementation: `bridge/scoped-credentials.js` — `buildSessionPolicy()` constructs the JSON policy, `createScopedCredentials()` calls STS.
 
-#### Credential Environment Blocklist
+#### Credential Environment Blocklist (defence-in-depth)
 
-Seven AWS credential environment variables are explicitly stripped from the OpenClaw child process:
+Every AWS credential source the SDK/CLI consults is explicitly stripped from the OpenClaw child process so a model-emitted `aws` command defaults to the scoped `credential_process` file rather than to the container's execution role:
 
 ```
 AWS_ACCESS_KEY_ID
 AWS_SECRET_ACCESS_KEY
 AWS_SESSION_TOKEN
+AWS_SECURITY_TOKEN
 AWS_CONTAINER_CREDENTIALS_RELATIVE_URI
 AWS_CONTAINER_CREDENTIALS_FULL_URI
+AWS_CONTAINER_AUTHORIZATION_TOKEN
+AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE
 AWS_WEB_IDENTITY_TOKEN_FILE
 AWS_ROLE_ARN
+AWS_ROLE_SESSION_NAME
+AWS_SHARED_CREDENTIALS_FILE
+AWS_PROFILE
 ```
 
-OpenClaw receives credentials only via `AWS_CONFIG_FILE` pointing to a `credential_process` that reads the scoped credential file.
+OpenClaw receives credentials only via `AWS_CONFIG_FILE` pointing to a `credential_process` that reads the scoped credential file. This filter prevents accidental ambient-credential pickup by the SDK; it does **not** prevent a root process in the same container from re-reading those variables from `/proc/1/environ` or from querying the container credential endpoint. See the module header of `bridge/scoped-credentials.js` for the container-level controls (dedicated uid, hidepid / PID namespace, iptables owner-match on the credential endpoint) required to make this an enforced boundary.
 
 #### Trust Policy Condition
 
