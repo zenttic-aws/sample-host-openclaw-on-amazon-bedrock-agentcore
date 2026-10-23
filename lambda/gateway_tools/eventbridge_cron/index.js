@@ -22,6 +22,70 @@ const { toolNameFromContext, withErrorEnvelope, logToolCall } = require("../lib/
 
 // --- Validation (same rules as bridge/skills/eventbridge-cron/common.js) ---
 
+// Minimum allowed interval, in minutes, between two consecutive fires. The
+// EventBridge Scheduler target invokes a full AgentCore/Bedrock agent turn per
+// fire, so sub-5-minute cadences are disallowed on every surface.
+const MIN_INTERVAL_MINUTES = 5;
+
+/**
+ * Compute the minimum interval (in minutes between two consecutive fires)
+ * that the given cron Minutes field would produce. Only a small set of
+ * well-understood shapes is supported; anything else throws so the caller
+ * cannot smuggle an every-minute expression (`0-59`, `0/1`, `0,1,2,...`, ...)
+ * past an exact-string denylist.
+ *
+ * Supported shapes:
+ *   - `*` or `*/1`           -> 1 minute
+ *   - `*\/N` (step on "*")    -> N minutes
+ *   - a single integer 0..59 -> 60 minutes (once per hour)
+ *   - an explicit comma list of integers 0..59 (circular min gap)
+ *
+ * Rejected (unsupported) shapes include ranges like `0-59` or `10-20`, and
+ * steps on an explicit range like `0-59/5`, because they are easy ways to
+ * fire every minute while bypassing a naive denylist.
+ */
+function cronMinuteMinInterval(field) {
+  if (typeof field !== "string" || field.length === 0) {
+    throw new Error("cron() minute field is required");
+  }
+  if (field === "*") return 1;
+  const stepStar = field.match(/^\*\/(\d+)$/);
+  if (stepStar) {
+    const n = parseInt(stepStar[1], 10);
+    if (!Number.isInteger(n) || n < 1 || n > 59) {
+      throw new Error(`Unsupported cron minute field "${field}"`);
+    }
+    return n;
+  }
+  if (/^\d+$/.test(field)) {
+    const n = parseInt(field, 10);
+    if (n < 0 || n > 59) throw new Error(`Unsupported cron minute field "${field}"`);
+    return 60;
+  }
+  if (/^\d+(,\d+)+$/.test(field)) {
+    const parts = field.split(",").map((p) => parseInt(p, 10));
+    for (const n of parts) {
+      if (!Number.isInteger(n) || n < 0 || n > 59) {
+        throw new Error(`Unsupported cron minute field "${field}"`);
+      }
+    }
+    const sorted = Array.from(new Set(parts)).sort((a, b) => a - b);
+    if (sorted.length !== parts.length) {
+      throw new Error(`Unsupported cron minute field "${field}"`);
+    }
+    if (sorted.length === 1) return 60;
+    let min = 60 + sorted[0] - sorted[sorted.length - 1]; // circular wrap
+    for (let i = 1; i < sorted.length; i++) {
+      const gap = sorted[i] - sorted[i - 1];
+      if (gap < min) min = gap;
+    }
+    return min;
+  }
+  // Ranges, step-on-range, mixed lists, and anything exotic are rejected: a
+  // positive allowlist, not a denylist, is the whole point of this guard.
+  throw new Error(`Unsupported cron minute field "${field}"`);
+}
+
 function validateExpression(expression) {
   if (typeof expression !== "string") throw new Error("expression is required");
   const atMatch = expression.match(/^at\((\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\)$/);
@@ -33,7 +97,9 @@ function validateExpression(expression) {
   }
   if (/^rate\(\d+\s+(minute|minutes|hour|hours|day|days)\)$/.test(expression)) {
     const m = expression.match(/^rate\((\d+)\s+(minute|minutes)\)$/);
-    if (m && parseInt(m[1], 10) < 5) throw new Error("Minimum rate interval is 5 minutes");
+    if (m && parseInt(m[1], 10) < MIN_INTERVAL_MINUTES) {
+      throw new Error(`Minimum rate interval is ${MIN_INTERVAL_MINUTES} minutes`);
+    }
     return;
   }
   const cronMatch = expression.match(/^cron\((.+)\)$/);
@@ -42,8 +108,22 @@ function validateExpression(expression) {
     if (fields.length !== 6) {
       throw new Error(`cron() expression must have exactly 6 fields, got ${fields.length}`);
     }
-    if (fields[0] === "*" || fields[0] === "*/1") {
-      throw new Error("Every-minute cron expressions are not allowed (minimum 5 minutes)");
+    let interval;
+    try {
+      interval = cronMinuteMinInterval(fields[0]);
+    } catch (err) {
+      // Keep the historical "Every-minute" wording so callers (and tests) that
+      // match on it still see the same signal for the most common bypass.
+      throw new Error(
+        `Every-minute or unsupported cron minute field "${fields[0]}" is not allowed ` +
+        `(minimum ${MIN_INTERVAL_MINUTES} minutes). Use "*/N" with N>=${MIN_INTERVAL_MINUTES}, ` +
+        `a single minute (e.g. "0"), or an explicit comma list whose gaps are all >=${MIN_INTERVAL_MINUTES}.`,
+      );
+    }
+    if (interval < MIN_INTERVAL_MINUTES) {
+      throw new Error(
+        `Every-minute cron expressions are not allowed (minimum ${MIN_INTERVAL_MINUTES} minutes).`,
+      );
     }
     return;
   }
@@ -71,6 +151,12 @@ function buildScheduleName(namespace, scheduleId) {
   const max = 64 - prefix.length - suffix.length;
   return `${prefix}${namespace.length > max ? namespace.slice(0, max) : namespace}${suffix}`;
 }
+
+// Hard cap on how many CRON# records a single OpenClaw user may own at once.
+// Each schedule fire warms the user's AgentCore session and runs a full agent
+// turn (shared cron-executor Lambda concurrency + Bedrock throughput), so the
+// gateway surface refuses to allocate more than this many per caller.
+const MAX_SCHEDULES_PER_USER = 20;
 
 function createHandler(deps = {}) {
   const env = {
@@ -135,6 +221,29 @@ function createHandler(deps = {}) {
         typeof args.schedule_name === "string" && args.schedule_name ? args.schedule_name : "";
       const { scheduler, schedulerCmds, ddb, ddbCmds } = clients();
       const userId = await resolveInternalUserId(identity.actorId);
+
+      // Per-caller schedule quota. CWE-770: each schedule the caller owns can
+      // fire up to once every MIN_INTERVAL_MINUTES minutes and run a full
+      // agent turn, so cap how many we will allocate at once. Count only the
+      // caller's own `USER#<userId>` / `CRON#` records.
+      const existing = await ddb.send(
+        new ddbCmds.QueryCommand({
+          TableName: env.tableName,
+          KeyConditionExpression: "PK = :pk AND begins_with(SK, :sk)",
+          ExpressionAttributeValues: { ":pk": `USER#${userId}`, ":sk": "CRON#" },
+          Select: "COUNT",
+        }),
+      );
+      const count = typeof existing.Count === "number"
+        ? existing.Count
+        : (existing.Items ? existing.Items.length : 0);
+      if (count >= MAX_SCHEDULES_PER_USER) {
+        throw new Error(
+          `Schedule quota exceeded: this user already owns ${count} schedules ` +
+          `(max ${MAX_SCHEDULES_PER_USER}). Delete an existing schedule before creating another.`,
+        );
+      }
+
       const { channel, channelTarget } = channelInfo(identity.actorId);
       const scheduleId = newId();
       const ebName = buildScheduleName(identity.namespace, scheduleId);
@@ -347,4 +456,4 @@ async function handler(event, context) {
   return _handler(event, context);
 }
 
-module.exports = { handler, createHandler, validateExpression, validateTimezone, buildScheduleName };
+module.exports = { handler, createHandler, validateExpression, validateTimezone, buildScheduleName, cronMinuteMinInterval, MAX_SCHEDULES_PER_USER, MIN_INTERVAL_MINUTES };
