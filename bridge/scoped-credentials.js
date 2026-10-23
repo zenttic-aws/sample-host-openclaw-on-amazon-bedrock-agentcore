@@ -82,15 +82,29 @@ const FORWARDED_ENV_KEYS = [
 ];
 
 /**
- * Build an IAM session policy JSON string that scopes S3 access to a user's namespace.
+ * Build an IAM session policy JSON string that scopes each AWS service the
+ * OpenClaw agent can call to the single user's namespace. This policy is
+ * passed to STS AssumeRole and INTERSECTS with the execution role, so each
+ * statement here is a hard upper bound on what the in-microVM agent can do.
+ *
+ * Session policies have a 2048-byte packed limit, so we scope resources
+ * explicitly and keep action lists tight. ListSecrets is omitted on
+ * purpose: it cannot be resource-scoped (AWS API limitation) and would
+ * re-introduce cross-tenant discovery; the api-keys skill names secrets
+ * deterministically under `openclaw/user/{namespace}/` and does not need
+ * ListSecrets to Put/Get/Delete.
  *
  * @param {object} opts
  * @param {string} opts.bucket - S3 bucket name
  * @param {string} opts.namespace - User namespace (e.g. "telegram_12345")
- * @param {string} [opts.cmkArn] - KMS CMK ARN for encrypted bucket
+ * @param {string} [opts.actorId] - External actor id (e.g. "telegram:12345")
+ * @param {string} [opts.internalUserId] - Internal user id (e.g. "user_abc123")
+ * @param {string} [opts.cmkArn] - KMS CMK ARN for encrypted bucket/table
  * @param {string} [opts.eventbridgeRoleArn] - EventBridge scheduler role ARN for iam:PassRole
- * @param {string} [opts.identityTableArn] - DynamoDB identity table ARN (scopes DynamoDB access)
- * @param {string} [opts.scheduleGroupArn] - EventBridge schedule group ARN (scopes scheduler access)
+ * @param {string} [opts.identityTableArn] - DynamoDB identity table ARN
+ * @param {string} [opts.scheduleGroupArn] - EventBridge schedule group ARN
+ * @param {string} [opts.region] - AWS region (for Secrets Manager ARN)
+ * @param {string} [opts.account] - AWS account id (for Secrets Manager ARN)
  * @returns {string} JSON policy document
  */
 function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn, eventbridgeRoleArn, identityTableArn, scheduleGroupArn, region, account }) {
@@ -102,52 +116,124 @@ function buildSessionPolicy({ bucket, namespace, actorId, internalUserId, cmkArn
   // - ListSchedules operates on the schedule-group resource
   const scheduleCrudArn = scheduleGroupArn
     ? scheduleGroupArn.replace(":schedule-group/", ":schedule/") + "/*"
-    : "*";
-  const scheduleListArn = scheduleGroupArn || "*";
+    : null;
+  const scheduleListArn = scheduleGroupArn || null;
 
   // DynamoDB resources: table + GSI indexes
   const dynamoResources = identityTableArn
     ? [identityTableArn, `${identityTableArn}/index/*`]
-    : "*";
+    : null;
 
-  // Build a minimal session policy that fits within the 2048-byte AWS packed limit.
-  // The execution role (attached to the runtime) provides the broad permissions.
-  // This session policy only RESTRICTS to the user's namespace — it cannot grant
-  // permissions the role doesn't have. So we only need S3 namespace scoping here.
-  // DynamoDB/Scheduler/SecretsManager scoping is enforced at the application level
-  // (skill scripts validate namespace before every operation).
-  const policy = {
-    Version: "2012-10-17",
-    Statement: [
-      {
-        Effect: "Allow",
-        // AbortMultipartUpload: workspace-sync uploads large SQLite snapshots
-        // as multipart uploads and aborts a failed one so no billed parts linger.
-        Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
-        Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
-      },
-      {
-        Effect: "Allow",
-        Action: "s3:ListBucket",
-        Resource: `arn:aws:s3:::${bucket}`,
-      },
-      // Scheduler, DynamoDB, SecretsManager, KMS, PassRole — allowed by the
-      // execution role; no further restriction needed in the session policy.
-      // Application-level namespace enforcement in skill scripts provides isolation.
-      {
-        Effect: "Allow",
-        Action: [
-          "scheduler:*",
-          "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem", "dynamodb:DeleteItem", "dynamodb:Query",
-          "kms:Decrypt", "kms:GenerateDataKey",
-          "secretsmanager:GetSecretValue", "secretsmanager:PutSecretValue", "secretsmanager:CreateSecret", "secretsmanager:DeleteSecret", "secretsmanager:ListSecrets", "secretsmanager:TagResource",
-          "iam:PassRole",
-        ],
-        Resource: "*",
-      },
-    ],
-  };
+  // Per-user Secrets Manager ARN prefix. The execution role allows
+  // `arn:aws:secretsmanager:*:*:secret:openclaw/user/*`; this session policy
+  // narrows to the one namespace.
+  const secretsNamespaceArn = (region && account)
+    ? `arn:aws:secretsmanager:${region}:${account}:secret:openclaw/user/${namespace}/*`
+    : `arn:aws:secretsmanager:*:*:secret:openclaw/user/${namespace}/*`;
 
+  // DynamoDB LeadingKeys the agent is allowed to touch on the shared identity
+  // table. These are the only partition keys a user legitimately needs:
+  //   - USER#<internalUserId>: own profile, CRON#, SESSION# records
+  //   - USER#<actorId>: own user-scoped records keyed by external actor id
+  //   - CHANNEL#<actorId>: own channel binding and allowlist
+  const leadingKeys = [];
+  if (internalUserId) leadingKeys.push(`USER#${internalUserId}`);
+  if (actorId) {
+    leadingKeys.push(`USER#${actorId}`);
+    leadingKeys.push(`CHANNEL#${actorId}`);
+  }
+
+  const statements = [
+    {
+      Effect: "Allow",
+      // AbortMultipartUpload: workspace-sync uploads large SQLite snapshots
+      // as multipart uploads and aborts a failed one so no billed parts linger.
+      Action: ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload"],
+      Resource: `arn:aws:s3:::${bucket}/${namespace}/*`,
+    },
+    {
+      Effect: "Allow",
+      Action: "s3:ListBucket",
+      Resource: `arn:aws:s3:::${bucket}`,
+    },
+    // Secrets Manager: per-user API-key secrets only. CreateSecret/DeleteSecret/
+    // TagResource remain available but can only touch the user's own namespace.
+    // ListSecrets is intentionally omitted (it has no resource-level support
+    // and would expose other tenants' secret names).
+    {
+      Effect: "Allow",
+      Action: [
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DeleteSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:TagResource",
+      ],
+      Resource: secretsNamespaceArn,
+    },
+  ];
+
+  // DynamoDB: identity table only, with a LeadingKeys condition so the agent
+  // can only read/write its own partitions. If we do not know the table ARN or
+  // have no identity keys, omit the statement entirely rather than widen to "*".
+  if (dynamoResources && leadingKeys.length > 0) {
+    statements.push({
+      Effect: "Allow",
+      Action: [
+        "dynamodb:GetItem",
+        "dynamodb:PutItem",
+        "dynamodb:UpdateItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+      ],
+      Resource: dynamoResources,
+      Condition: {
+        "ForAllValues:StringLike": {
+          "dynamodb:LeadingKeys": leadingKeys,
+        },
+      },
+    });
+  }
+
+  // EventBridge Scheduler: only the per-user schedule group, explicit actions.
+  if (scheduleCrudArn && scheduleListArn) {
+    statements.push({
+      Effect: "Allow",
+      Action: [
+        "scheduler:GetSchedule",
+        "scheduler:CreateSchedule",
+        "scheduler:UpdateSchedule",
+        "scheduler:DeleteSchedule",
+        "scheduler:ListSchedules",
+      ],
+      Resource: [scheduleCrudArn, scheduleListArn],
+    });
+  }
+
+  // iam:PassRole: only the EventBridge scheduler role, and only when passed
+  // to scheduler.amazonaws.com.
+  if (eventbridgeRoleArn) {
+    statements.push({
+      Effect: "Allow",
+      Action: "iam:PassRole",
+      Resource: eventbridgeRoleArn,
+      Condition: {
+        StringEquals: { "iam:PassedToService": "scheduler.amazonaws.com" },
+      },
+    });
+  }
+
+  // KMS: scoped to the project CMK (used to decrypt S3/DynamoDB/Secrets).
+  if (cmkArn) {
+    statements.push({
+      Effect: "Allow",
+      Action: ["kms:Decrypt", "kms:GenerateDataKey"],
+      Resource: cmkArn,
+    });
+  }
+
+  const policy = { Version: "2012-10-17", Statement: statements };
   return JSON.stringify(policy);
 }
 
