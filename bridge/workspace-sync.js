@@ -866,18 +866,17 @@ async function runRestore(namespace, overwrite, attempt) {
       }
 
       // Validate object size before downloading (uses ListObjectsV2 Size field).
-      // obj.Size is the STORED (compressed) size, so this check only bounds
-      // non-gzip objects' impact on disk. The streaming path in
-      // writeRestoredObject enforces the real per-object cap (from the
-      // uploader-written uncompressed-size metadata) and the aggregate budget.
-      // The per-object cap is NOT selected from the attacker-chosen key suffix
-      // any more: the stored (compressed) size has to fit the non-SQLite cap
-      // for every object. A legitimate large SQLite snapshot is gzip-compressed
-      // and comes in well under this threshold even when its uncompressed form
-      // is hundreds of MB.
-      if (obj.Size > _limits.maxFileSize) {
+      // obj.Size is the STORED (compressed) size. A large SQLite database is
+      // uploaded as a gzip snapshot that can itself be well above the
+      // non-SQLite cap, so `.sqlite` keys are listed against the SQLite cap.
+      // The key suffix only widens this pre-download filter: the bytes
+      // written to disk are bounded in writeRestoredObject by the object's
+      // metadata (declared uncompressed size for gzip, the non-SQLite cap
+      // otherwise), the decompression-ratio guard and the aggregate budget.
+      const listedCap = relativePath.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
+      if (obj.Size > listedCap) {
         console.warn(
-          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} stored bytes > ${_limits.maxFileSize})`,
+          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} stored bytes > ${listedCap})`,
         );
         failed++;
         continue;
@@ -1077,8 +1076,8 @@ async function writeRestoredObject(getResp, localFile, attempt, budget) {
     );
   }
   // Per-object cap: declared uncompressed size (gzip) OR the non-SQLite cap
-  // (non-gzip bodies cannot be amplified on write beyond their stored size,
-  // which the listing-pass check already bounds at _limits.maxFileSize).
+  // (a non-gzip body is written byte for byte, so the streaming check below
+  // holds it to _limits.maxFileSize whatever its key suffix).
   // Selection is driven by object metadata, not by the key name.
   const perObjectCap = declaredSize !== null
     ? Math.min(declaredSize, _limits.maxSqliteFileSize)

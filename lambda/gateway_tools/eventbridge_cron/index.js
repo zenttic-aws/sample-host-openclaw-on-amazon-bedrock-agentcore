@@ -35,7 +35,7 @@ const MIN_INTERVAL_MINUTES = 5;
  * past an exact-string denylist.
  *
  * Supported shapes:
- *   - `*` or `*/1`           -> 1 minute
+ *   - `*` or `*\/1`          -> 1 minute
  *   - `*\/N` (step on "*")    -> N minutes
  *   - a single integer 0..59 -> 60 minutes (once per hour)
  *   - an explicit comma list of integers 0..59 (circular min gap)
@@ -282,6 +282,7 @@ function createHandler(deps = {}) {
             Input: JSON.stringify({
               userId,
               actorId: identity.actorId,
+              channelActorId: identity.actorId,
               channel,
               channelTarget,
               message: args.message,
@@ -310,6 +311,9 @@ function createHandler(deps = {}) {
               channel,
               channelTarget,
               actorId: identity.actorId,
+              // The Cron Lambda delivers to the record's channelActorId. A
+              // gateway schedule delivers on the caller's own channel.
+              channelActorId: identity.actorId,
               enabled: true,
               createdAt: now,
               updatedAt: now,
