@@ -4,7 +4,7 @@
 
 OpenClaw deploys AWS Bedrock Guardrails via the `OpenClawGuardrails` CDK stack to provide content-level defense on every Bedrock Converse/ConverseStream API call. The proxy (`agentcore-proxy.js`) injects `guardrailConfig` into every request — Bedrock evaluates the guardrail server-side.
 
-**Input scope.** The proxy wraps every text block in the latest user turn in `guardContent` (`bridge/guardrail-scope.js`). Input filters assess that turn instead of reassessing blocked text from earlier turns. Text is never exempted because it begins with an internal-looking marker such as `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`. When the trailing turn contains only tool results, all text in the most recent earlier user turn is tagged instead; tool results remain unchanged. If no user text exists, the request retains the default assessment scope. Model output is always assessed in full. The headless provider configuration keeps OpenClaw's generated Runtime metadata in system messages; see [AgentCore Runtime V2 compatibility](runtime-v2.md#lifecycle-and-compatibility).
+**Input scope.** The proxy wraps every text block in the latest user turn in `guardContent` (`bridge/guardrail-scope.js`). Image blocks of the same user turn are also wrapped (`{ guardContent: { image: ... } }`) so customer-uploaded images are assessed by the content filters that support the IMAGE modality (HATE, INSULTS, SEXUAL, VIOLENCE — see the content-filter table below). MISCONDUCT and PROMPT_ATTACK are text-only in Bedrock; text-in-image jailbreak content is therefore outside guardrail scope. Input filters assess that turn instead of reassessing blocked text from earlier turns. Text is never exempted because it begins with an internal-looking marker such as `<<<BEGIN_OPENCLAW_INTERNAL_CONTEXT>>>`. When the trailing turn contains only tool results, all text in the most recent earlier user turn is tagged instead; tool results remain unchanged (Bedrock does not permit `guardContent` on `toolResult` blocks). If no user text or image exists, the request retains the default assessment scope. Model output is always assessed in full. The headless provider configuration keeps OpenClaw's generated Runtime metadata in system messages; see [AgentCore Runtime V2 compatibility](runtime-v2.md#lifecycle-and-compatibility).
 
 **Stack**: `OpenClawGuardrails` (`stacks/guardrails_stack.py`)
 **Default**: Enabled (`enable_guardrails = true`)
@@ -15,14 +15,14 @@ OpenClaw deploys AWS Bedrock Guardrails via the `OpenClawGuardrails` CDK stack t
 
 ### Content Filters
 
-| Category | Input Strength | Output Strength |
-|----------|---------------|-----------------|
-| HATE | HIGH | HIGH |
-| INSULTS | MEDIUM | HIGH |
-| SEXUAL | HIGH | HIGH |
-| VIOLENCE | HIGH | HIGH |
-| MISCONDUCT | HIGH | HIGH |
-| PROMPT_ATTACK | HIGH | NONE (input only) |
+| Category | Input Strength | Output Strength | Input Modalities |
+|----------|---------------|-----------------|------------------|
+| HATE | HIGH | HIGH | TEXT, IMAGE |
+| INSULTS | MEDIUM | HIGH | TEXT, IMAGE |
+| SEXUAL | HIGH | HIGH | TEXT, IMAGE |
+| VIOLENCE | HIGH | HIGH | TEXT, IMAGE |
+| MISCONDUCT | HIGH | HIGH | TEXT (image modality not supported by Bedrock) |
+| PROMPT_ATTACK | HIGH | NONE (input only) | TEXT (image modality not supported by Bedrock) |
 
 ### Topic Denial (6 denied topics)
 
