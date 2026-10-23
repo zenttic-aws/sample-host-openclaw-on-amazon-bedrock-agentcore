@@ -48,6 +48,7 @@ const { renderConfig, renderAgents } = require("./gateway-config");
 const { createLiveSeedBridge, readGatewayToken } = require("./live-seed-bridge");
 const { createProxySdkSnapshotOwner } = require("./proxy-sdk-snapshot");
 const { createProxyAuthParent } = require("./proxy-auth-prepare");
+const { createChannelOwnershipVerifier } = require("./channel-authz");
 
 const PORT = 8080;
 const PROXY_PORT = 18790;
@@ -171,6 +172,38 @@ const v2Lifecycle = createRuntimeLifecycle({
   cleanup: cleanupV2Resources,
   activationTimeoutMs: ACTIVATION_TIMEOUT_MS,
 });
+
+// Per-turn delivery identity (channel/channelActorId/channelTarget) carried in
+// the request body is NOT part of the activation binding, so it must be
+// authorized separately against the activated user before updateIdentityFile()
+// or createTelegramStreamer() acts on it. See bridge/channel-authz.js for the
+// contract. In production (IDENTITY_TABLE_NAME set) a cross-channel turn's
+// channelActorId must have a CHANNEL#<actorId> PROFILE record whose userId
+// equals binding.userId. When the identity table is unset (local dev harness,
+// unit tests) the verifier logs a one-time warning and allows the turn so
+// developer loops keep working; production deployments always set the env.
+let channelOwnershipVerifier = createChannelOwnershipVerifier({
+  identityTable: process.env.IDENTITY_TABLE_NAME || null,
+  region: process.env.AWS_REGION || "us-west-2",
+  allowWithoutTable: !process.env.IDENTITY_TABLE_NAME,
+});
+let warnedChannelAuthzUnavailable = false;
+async function assertChannelOwnership(binding, context) {
+  const result = await channelOwnershipVerifier.verify(binding, context);
+  if (result.decision === "deny") {
+    const error = new Error(`Channel delivery identity rejected: ${result.reason}`);
+    error.channelAuthzReason = result.reason;
+    throw error;
+  }
+  if (result.reason === "identity_table_unavailable" && !warnedChannelAuthzUnavailable) {
+    warnedChannelAuthzUnavailable = true;
+    console.warn(
+      "[contract] IDENTITY_TABLE_NAME is unset; cross-channel delivery authorization is advisory. " +
+      "Set the identity table on the AgentCore runtime container to enforce it.",
+    );
+  }
+  return result;
+}
 
 // Derive EVENTBRIDGE_ROLE_ARN from EXECUTION_ROLE_ARN + AWS_REGION if not already set.
 // The agentcore toolkit doesn't support injecting arbitrary env vars into the container,
@@ -2277,6 +2310,22 @@ async function handleV2Invocation(payload, req, res, callerGone, arrival,
       if (action === "warmup" && dispatchAllowed) return { status: "ready" };
       stream?.signal.throwIfAborted();
       stream?.ready(v2Lifecycle.snapshot());
+      // Authorize the per-turn delivery identity against the activated user
+      // before it reaches updateIdentityFile() or createTelegramStreamer().
+      // Shape checks above do not prove ownership; the request body is
+      // controlled by whichever process in the microVM is calling the
+      // unauthenticated contract server. channel-authz looks up the DynamoDB
+      // CHANNEL# record (same contract runtime_enrollment.py writes) and
+      // compares its userId against the activation binding.
+      const activeBinding = v2Lifecycle.snapshot().binding;
+      try {
+        await assertChannelOwnership(activeBinding, {
+          channel: turn.channel, channelActorId: turn.channelActorId, channelTarget: turn.channelTarget,
+        });
+      } catch (error) {
+        console.warn(`[contract] Rejected per-turn delivery identity: ${error.channelAuthzReason || error.message}`);
+        throw error;
+      }
       updateIdentityFile(turn.actorId, turn.channel, turn.channelActorId, turn.channelTarget,
         turn.modelOverride, { trigger: action, sessionId: turn.runtimeSessionId });
       lateTurn = lateAnnounces?.beginTurn({
@@ -2510,6 +2559,26 @@ const server = http.createServer(async (req, res) => {
           // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = proxyReady ? await checkProxyHealth() : null;
 
+          // The /invocations endpoint has no caller authentication (any process
+          // inside the microVM can POST here), so the status response MUST NOT
+          // echo back the binding fields a forged turn needs to pass
+          // assertBinding — the per-turn delivery identity is now authorized
+          // separately, but we still redact runtimeSessionId and
+          // routingGeneration so a replay attempt cannot cheaply impersonate
+          // the activated session. userId/actorId remain to let AgentCore's
+          // own health polling identify the active binding.
+          const lifecycleSnapshot = v2Lifecycle.snapshot();
+          const redactedBinding = lifecycleSnapshot.binding ? {
+            userId: lifecycleSnapshot.binding.userId,
+            actorId: lifecycleSnapshot.binding.actorId,
+          } : null;
+          const safeLifecycle = {
+            state: lifecycleSnapshot.state,
+            binding: redactedBinding,
+            generation: lifecycleSnapshot.generation,
+            resources: lifecycleSnapshot.resources,
+          };
+
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
@@ -2525,7 +2594,7 @@ const server = http.createServer(async (req, res) => {
             activeTaskCount,
             pingStatus: v2Lifecycle.health(activeTaskCount).body.status,
             runtimePlatform: RUNTIME_PLATFORM,
-            lifecycle: v2Lifecycle.snapshot(),
+            lifecycle: safeLifecycle,
           };
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ response: JSON.stringify(diag) }));
