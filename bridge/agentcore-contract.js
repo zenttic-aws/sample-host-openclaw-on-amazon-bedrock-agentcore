@@ -81,9 +81,10 @@ let GATEWAY_TOKEN = null;
 // Used for typing indicator during processing + single final message delivery.
 let TELEGRAM_BOT_TOKEN = null;
 
-// Cognito password secret — fetched during user activation.
-// Stored in-process only, never written to process.env.
-let COGNITO_PASSWORD_SECRET = null;
+// Cognito passwords are per user: generated with crypto.randomBytes and stored
+// in Secrets Manager at openclaw/cognito-user/<poolId>/<namespace> (see
+// cognito-token.js). No password-derivation key is held by the contract server
+// or passed into the proxy child.
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
@@ -600,16 +601,8 @@ async function prefetchSecrets() {
     }
   }
 
-  const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
-  if (cognitoSecretId) {
-    const resp = await smClient.send(
-      new GetSecretValueCommand({ SecretId: cognitoSecretId }),
-    );
-    if (resp.SecretString) {
-      COGNITO_PASSWORD_SECRET = resp.SecretString;
-      console.log("[contract] Cognito password secret pre-fetched");
-    }
-  }
+  // No Cognito password key is fetched: per-user passwords are generated and
+  // stored in Secrets Manager on first use (cognito-token.js).
 
   const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
   if (telegramSecretId) {
@@ -1499,7 +1492,6 @@ async function setupGatewayBearer(actorId) {
   const provider = createCognitoTokenProvider({
     userPoolId: process.env.COGNITO_USER_POOL_ID || "",
     clientId: process.env.COGNITO_CLIENT_ID || "",
-    passwordSecret: COGNITO_PASSWORD_SECRET || "",
     region: process.env.AWS_REGION || "us-west-2",
     log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[contract] Cognito")),
   });
@@ -1632,7 +1624,9 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         BEDROCK_FALLBACK_MODEL_ID: process.env.BEDROCK_FALLBACK_MODEL_ID || "",
         COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
         COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-        COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
+        // No Cognito password key is forwarded: the proxy reads the bound
+        // user's own per-user password secret (cognito-token.js) with the
+        // execution role.
         S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
         SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
         SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
@@ -1663,7 +1657,6 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
             currentUserId !== userId || currentNamespace !== namespace ||
             process.env.USER_ID !== actorId || process.env.INTERNAL_USER_ID !== userId ||
             !secretsReady || !GATEWAY_TOKEN || credentialManager !== credentials ||
-            (COGNITO_PASSWORD_SECRET || "") !== proxyEnv.COGNITO_PASSWORD_SECRET ||
             !current.resources.includes("restore") || !current.resources.includes("credentials") ||
             (AGENTCORE_GATEWAY_URL && !gatewayBearer?.token) ||
             ["BEDROCK_MODEL_ID", "BEDROCK_FALLBACK_MODEL_ID", "COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID",

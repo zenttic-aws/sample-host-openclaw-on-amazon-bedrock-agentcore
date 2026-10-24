@@ -92,10 +92,11 @@ if (temperatureOverride.invalid !== undefined) {
   console.log("[proxy] BEDROCK_TEMPERATURE=%s applied to all models", String(temperatureOverride.value));
 }
 
-// Cognito identity configuration
+// Cognito identity configuration. Per-user Cognito passwords are stored in
+// Secrets Manager (one secret per user, see cognito-token.js) and read with
+// the execution role; no password key is placed in this process' environment.
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
-const COGNITO_PASSWORD_SECRET = process.env.COGNITO_PASSWORD_SECRET || "";
 
 // Diagnostic state — exposed via /health for observability (container stdout not in CloudWatch)
 let lastIdentityDiag = null;
@@ -260,9 +261,9 @@ function extractSessionMetadata(parsed, headers) {
   return { sessionId, actorId, channel, idSource, modelOverride, trigger };
 }
 
-// Per-user Cognito ID tokens (user provisioning, HMAC-derived password,
-// cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
-// both processes derive the same password for the same actorId.
+// Per-user Cognito ID tokens (user provisioning, per-user random password in
+// Secrets Manager, token cache). Shared with agentcore-contract.js via
+// bridge/cognito-token.js.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
 // Per-session sticky redaction of previously-blocked user turns. Without this,
 // scopeGuardrailToLatestUserTurn would re-send blocked text untagged on the
@@ -274,7 +275,6 @@ const { readBody } = require("./read-body");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   userPoolId: COGNITO_USER_POOL_ID,
   clientId: COGNITO_CLIENT_ID,
-  passwordSecret: COGNITO_PASSWORD_SECRET,
   region: AWS_REGION,
   log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[proxy] Cognito")),
 });

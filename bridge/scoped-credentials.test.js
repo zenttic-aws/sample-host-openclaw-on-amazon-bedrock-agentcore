@@ -788,6 +788,26 @@ describe("buildSessionPolicy Secrets Manager", () => {
       "Secrets Manager CRUD resource must be the per-namespace secret path",
     );
   });
+
+  it("never grants the per-user Cognito password secrets (openclaw/cognito-user/*)", () => {
+    const { defaultSecretId } = require("./cognito-token");
+    const name = defaultSecretId("telegram:12345", "us-west-2_POOL");
+    const policy = JSON.parse(buildSessionPolicy({
+      bucket: "openclaw-user-files-123-us-west-2",
+      namespace: "telegram_12345",
+      region: "us-west-2",
+      account: "123456789012",
+    }));
+    const arn = `arn:aws:secretsmanager:us-west-2:123456789012:secret:${name}-AbCdEf`;
+    const matches = (pattern) => new RegExp("^" + pattern.split("*").map(
+      (part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(arn);
+    for (const stmt of policy.Statement) {
+      const actions = Array.isArray(stmt.Action) ? stmt.Action : [stmt.Action];
+      if (!actions.some((a) => a.startsWith("secretsmanager:") && a !== "secretsmanager:ListSecrets")) continue;
+      const resources = Array.isArray(stmt.Resource) ? stmt.Resource : [stmt.Resource];
+      assert.ok(!resources.some(matches), "session policy must not reach " + name);
+    }
+  });
 });
 
 describe("expiry-aware scoped credentials", () => {

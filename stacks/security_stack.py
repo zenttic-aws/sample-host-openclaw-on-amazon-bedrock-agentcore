@@ -206,7 +206,11 @@ class SecurityStack(Stack):
             ),
         )
 
-        # --- HMAC secret for deriving Cognito user passwords -----------------
+        # --- Cognito password secret (previous derivation scheme) -----------
+        # The runtime no longer reads this secret: each Cognito user now has a
+        # random password in its own secret (bridge/cognito-token.js), and
+        # existing users move to one on their next authentication. The secret
+        # is kept unchanged so an older runtime image still deploys.
         self.cognito_password_secret = secretsmanager.Secret(
             self,
             "CognitoPasswordSecret",
