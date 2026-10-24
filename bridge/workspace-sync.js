@@ -103,6 +103,34 @@ const DEFAULT_MAX_SQLITE_FILE_SIZE = 1024 * 1024 * 1024; // 1 GiB
 // One multipart part per this many gzip'd bytes (S3 minimum is 5 MiB); at most
 // ~2 parts are ever held in memory, whatever the database size.
 const DEFAULT_UPLOAD_PART_SIZE = 8 * 1024 * 1024;
+// Aggregate restore caps. The per-object checks only bound ONE object; without
+// these caps a tenant with s3:PutObject on <namespace>/* can plant many small
+// gzip objects named `*.sqlite` that each inflate to 1 GiB on disk, exhausting
+// the microVM's local disk on every cold start and permanently failing restore
+// (see state-storage.js:DEFAULT_MIRROR_BUDGET_BYTES / makeRoom for the matching
+// aggregate quota on the session-storage mirror). Caps are deliberately well
+// above a realistic user's .openclaw/ snapshot (one ~299 MB imported history
+// plus some config/workspace files) while making the amplification attack fit
+// in a bounded blast radius: an aggregate 4 GiB write budget and 20_000 files.
+const DEFAULT_MAX_RESTORE_BYTES = 4 * 1024 * 1024 * 1024; // 4 GiB written to disk
+const DEFAULT_MAX_RESTORE_FILES = 20000;
+// Minimum fraction of disk space that must stay free after a restore. If the
+// aggregate budget would push us past this reserve, the restore fails before
+// writing — a full disk ends up with ENOSPC which marks the restore `failed`
+// and keeps uploads disabled, with no recovery short of operator action.
+const DEFAULT_RESTORE_FREE_DISK_RESERVE_BYTES = 256 * 1024 * 1024; // 256 MiB
+// Gzip decompression-ratio ceiling. The uploader's own gzip of a SQLite
+// snapshot comes in well under 20:1; a ratio over this threshold is a signal
+// of a zip-bomb-style object planted under the tenant's own prefix.
+const DEFAULT_MAX_DECOMPRESSION_RATIO = 50;
+
+function parsePositiveInt(raw, fallback) {
+  if (raw === undefined || raw === "") return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0 || !Number.isInteger(n)) return fallback;
+  return n;
+}
+
 const _limits = {
   maxFileSize: MAX_FILE_SIZE,
   maxSqliteFileSize: parseInt(
@@ -110,6 +138,31 @@ const _limits = {
     10,
   ),
   uploadPartSize: DEFAULT_UPLOAD_PART_SIZE,
+  // Aggregate restore budget: total bytes written to disk across all objects
+  // in a single runRestore(). Enforced in the streaming path so a gzip zip
+  // bomb (or many small-but-huge-when-decompressed objects) stops the restore
+  // instead of filling the microVM's disk.
+  maxRestoreBytes: parsePositiveInt(process.env.WORKSPACE_RESTORE_MAX_BYTES, DEFAULT_MAX_RESTORE_BYTES),
+  // Aggregate restore file-count cap, enforced during the listing pass. The
+  // listing itself is otherwise unbounded (ListObjectsV2 paginates until
+  // IsTruncated is false), so a tenant can plant tens of thousands of tiny
+  // keys at O(1) cost per object.
+  maxRestoreFiles: parsePositiveInt(process.env.WORKSPACE_RESTORE_MAX_FILES, DEFAULT_MAX_RESTORE_FILES),
+  // Minimum free-disk reserve the restore must leave on the local filesystem
+  // (checked once per download in the streaming path). A write that would
+  // consume more than this is rejected with a clear reason, mirroring
+  // state-storage.js's MOUNT_BUDGET accounting rather than relying on ENOSPC.
+  restoreFreeDiskReserveBytes: parsePositiveInt(
+    process.env.WORKSPACE_RESTORE_FREE_DISK_RESERVE_BYTES,
+    DEFAULT_RESTORE_FREE_DISK_RESERVE_BYTES,
+  ),
+  // Maximum gzip decompression ratio allowed per object. A ratio above this
+  // threshold aborts the stream before the full uncompressed body is written,
+  // defending against zip-bomb-style objects planted under the tenant prefix.
+  maxDecompressionRatio: parsePositiveInt(
+    process.env.WORKSPACE_RESTORE_MAX_DECOMPRESSION_RATIO,
+    DEFAULT_MAX_DECOMPRESSION_RATIO,
+  ),
 };
 
 // Files with this extension are SQLite databases and are uploaded via
@@ -309,9 +362,15 @@ async function snapshotSqliteToFile(dbPath) {
   if (!sqlite || typeof sqlite.backup !== "function") {
     throw new Error("node:sqlite backup API unavailable on this Node runtime");
   }
+  // Unique-per-call staging name. The PID+ms discriminators are not sufficient
+  // alone: periodic save, change-flush and cleanup/SIGTERM saves share one event
+  // loop, and two of them can enter this line within the same millisecond on
+  // the same database path. A random suffix (see also state-storage.js:228)
+  // keeps each snapshot in its own file so one path's cleanup cannot delete or
+  // overwrite the file another path is still hashing/streaming.
   const stagePath = path.join(
     path.dirname(dbPath),
-    `.${path.basename(dbPath)}.${process.pid}-${Date.now()}.sqlite-snapshot`,
+    `.${path.basename(dbPath)}.${process.pid}-${Date.now()}-${crypto.randomUUID()}.sqlite-snapshot`,
   );
   const source = new sqlite.DatabaseSync(dbPath, { readOnly: true });
   try {
@@ -703,7 +762,7 @@ function restoreAborted(attempt) {
 }
 
 /** GET one object into place, retrying transient failures. */
-async function downloadRestoreObject(s3, item, attempt, stats) {
+async function downloadRestoreObject(s3, item, attempt, stats, budget) {
   for (let retry = 0; ; retry++) {
     assertRestoreActive(attempt);
     try {
@@ -713,7 +772,7 @@ async function downloadRestoreObject(s3, item, attempt, stats) {
         { abortSignal: attempt.controller.signal },
       );
       assertRestoreActive(attempt);
-      return await writeRestoredObject(getResp, item.localFile, attempt);
+      return await writeRestoredObject(getResp, item.localFile, attempt, budget);
     } catch (err) {
       if (restoreAborted(attempt) || retry >= _restoreTuning.retries || !isRetryableRestoreError(err)) throw err;
       stats.retries++;
@@ -754,6 +813,8 @@ async function runRestore(namespace, overwrite, attempt) {
   const s3 = getS3Client();
   const startedAt = Date.now();
   const concurrency = _restoreTuning.concurrency;
+  const maxFiles = _limits.maxRestoreFiles;
+  const maxBytes = _limits.maxRestoreBytes;
 
   console.log(
     `[workspace-sync] Restoring workspace from s3://${BUCKET}/${prefix}` +
@@ -763,6 +824,7 @@ async function runRestore(namespace, overwrite, attempt) {
   let failed = 0;
   let hadState = false;
   let continuationToken;
+  let listedCount = 0; // candidate objects seen so far (post-skip, post-validate)
   const keptFiles = []; // { key, relativePath } — compared against S3 after the listing
   const downloads = []; // { key, relativePath, localFile } — fetched after the listing
 
@@ -791,14 +853,30 @@ async function runRestore(namespace, overwrite, attempt) {
         throw new Error("Invalid S3 restore path");
       }
       hadState = true;
+      listedCount++;
+      // Aggregate file-count cap: a tenant with PutObject on <namespace>/*
+      // (scoped-credentials.js:buildSessionPolicy) can list tens of thousands
+      // of tiny keys at O(1) per-object cost. Fail the restore here with a
+      // clear reason instead of letting the download pool loop unbounded.
+      if (listedCount > maxFiles) {
+        throw new Error(
+          `Workspace restore aborted: more than ${maxFiles} objects under ${prefix} ` +
+          `(set WORKSPACE_RESTORE_MAX_FILES to raise)`,
+        );
+      }
 
       // Validate object size before downloading (uses ListObjectsV2 Size field).
-      // A SQLite object may be a gzip snapshot, so its listed size is at most
-      // the uncompressed one — the SQLite cap applies to it.
-      const sizeCap = relativePath.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
-      if (obj.Size > sizeCap) {
+      // obj.Size is the STORED (compressed) size. A large SQLite database is
+      // uploaded as a gzip snapshot that can itself be well above the
+      // non-SQLite cap, so `.sqlite` keys are listed against the SQLite cap.
+      // The key suffix only widens this pre-download filter: the bytes
+      // written to disk are bounded in writeRestoredObject by the object's
+      // metadata (declared uncompressed size for gzip, the non-SQLite cap
+      // otherwise), the decompression-ratio guard and the aggregate budget.
+      const listedCap = relativePath.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
+      if (obj.Size > listedCap) {
         console.warn(
-          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} bytes > ${sizeCap})`,
+          `[workspace-sync] Skipping oversized file: ${obj.Key} (${obj.Size} stored bytes > ${listedCap})`,
         );
         failed++;
         continue;
@@ -860,10 +938,30 @@ async function runRestore(namespace, overwrite, attempt) {
   let totalFiles = 0;
   let totalBytes = 0;
   const stats = { retries: 0 };
+  // Shared aggregate budget: writeRestoredObject consults it before each
+  // written chunk and the pool stops as soon as the running total would
+  // exceed the configured maxRestoreBytes. The free-disk reserve is enforced
+  // in the same place so we fail with a clear reason instead of ENOSPC.
+  const budget = {
+    maxBytes,
+    writtenBytes: 0,
+    freeDiskReserveBytes: _limits.restoreFreeDiskReserveBytes,
+    exceeded: null,
+    reserve(nBytes, relativePath) {
+      if (this.writtenBytes + nBytes > this.maxBytes) {
+        this.exceeded ||= new Error(
+          `Workspace restore aborted: aggregate size budget of ${this.maxBytes} bytes exceeded` +
+          (relativePath ? ` at ${relativePath}` : ""),
+        );
+        throw this.exceeded;
+      }
+      this.writtenBytes += nBytes;
+    },
+  };
   await runBounded(downloads, concurrency, async (item) => {
     assertRestoreActive(attempt);
     try {
-      const { digest, size } = await downloadRestoreObject(s3, item, attempt, stats);
+      const { digest, size } = await downloadRestoreObject(s3, item, attempt, stats, budget);
       // What is on disk now IS what S3 holds, so the first save after a
       // restore must not re-upload it. Without this seed every restored file
       // was PUT again by the first full save (SIGTERM / periodic) of the
@@ -875,6 +973,11 @@ async function runRestore(namespace, overwrite, attempt) {
       // An abort stops the pool (and the restore); any other error fails
       // just this file, which still fails the restore as a whole.
       if (restoreAborted(attempt)) throw attempt.error || _fatalRestoreError || err;
+      // The aggregate budget / free-disk reserve are restore-wide failures,
+      // not single-file failures: once one write has been rejected the next
+      // worker would see the same cap, so stop the whole pool with a clear
+      // reason instead of letting every remaining item retry and warn.
+      if (budget.exceeded && err === budget.exceeded) throw err;
       failed++;
       console.warn("[workspace-sync] Failed to restore %s: %s", item.relativePath, err.message);
     }
@@ -900,6 +1003,38 @@ async function runRestore(namespace, overwrite, attempt) {
 let _restoreTmpSeq = 0;
 
 /**
+ * Reject the restore before a write when the local filesystem does not have
+ * `needed` bytes plus `budget.freeDiskReserveBytes` available. A full disk
+ * ends up with ENOSPC which marks the restore `failed` and permanently keeps
+ * uploads disabled; failing here, with a clear reason, lets an operator see
+ * what happened and fix the underlying input (poisoned objects) instead of
+ * silently bricking the agent.
+ *
+ * `fs.statfsSync` is available on Node >= 18; absent on some test runners,
+ * in which case we skip the headroom check (the aggregate budget still caps
+ * total bytes written, and the pool is bounded by the configured concurrency).
+ */
+function assertRestoreDiskHeadroom(dir, needed, budget) {
+  if (!budget || typeof fs.statfsSync !== "function") return;
+  let stat;
+  try {
+    stat = fs.statfsSync(dir);
+  } catch {
+    return; // directory not created yet or statfs unsupported
+  }
+  const avail = Number(stat.bavail) * Number(stat.bsize);
+  if (!Number.isFinite(avail) || avail <= 0) return;
+  const reserve = Math.max(0, budget.freeDiskReserveBytes || 0);
+  if (avail < needed + reserve) {
+    budget.exceeded ||= new Error(
+      `Workspace restore aborted: not enough free disk space ` +
+      `(need ${needed} B + ${reserve} B reserve, ${avail} B available in ${dir})`,
+    );
+    throw budget.exceeded;
+  }
+}
+
+/**
  * Stream one GetObject response to `localFile` and return the sha256 and size
  * of the bytes written. A gzip snapshot (UPLOAD_ENCODING_METADATA_KEY / the
  * ContentEncoding header — see uploadCompressedFile) is decompressed on the
@@ -913,22 +1048,93 @@ let _restoreTmpSeq = 0;
  *
  * @returns {Promise<{ digest: string, size: number }>}
  */
-async function writeRestoredObject(getResp, localFile, attempt) {
+async function writeRestoredObject(getResp, localFile, attempt, budget) {
   const meta = getResp.Metadata || {};
   const gzipped =
     getResp.ContentEncoding === GZIP_ENCODING || meta[UPLOAD_ENCODING_METADATA_KEY] === GZIP_ENCODING;
   const expected = meta[UPLOAD_HASH_METADATA_KEY];
+  // Declared uncompressed size: the uploader writes it on every gzip object
+  // (uploadCompressedFile sets UPLOAD_SIZE_METADATA_KEY from the staged
+  // snapshot's actual byte count). For a gzip object we REQUIRE it and use
+  // it as the per-object cap: deriving the cap from the attacker-chosen key
+  // suffix (as the earlier code did) let one `*.sqlite` object balloon to
+  // 1 GiB on disk under a tenant-writable prefix.
+  const declaredRaw = meta[UPLOAD_SIZE_METADATA_KEY];
+  let declaredSize = null;
+  if (declaredRaw !== undefined) {
+    const parsed = Number(declaredRaw);
+    if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+      throw new Error(
+        `Invalid uncompressed-size metadata on restore object: ${String(declaredRaw).slice(0, 32)}`,
+      );
+    }
+    declaredSize = parsed;
+  }
+  if (gzipped && declaredSize === null) {
+    throw new Error(
+      "Refusing to restore gzip object without uncompressed-size metadata (zip-bomb guard)",
+    );
+  }
+  // Per-object cap: declared uncompressed size (gzip) OR the non-SQLite cap
+  // (a non-gzip body is written byte for byte, so the streaming check below
+  // holds it to _limits.maxFileSize whatever its key suffix).
+  // Selection is driven by object metadata, not by the key name.
+  const perObjectCap = declaredSize !== null
+    ? Math.min(declaredSize, _limits.maxSqliteFileSize)
+    : _limits.maxFileSize;
+  // Free-disk reserve: fail with a clear reason if writing this object
+  // (bounded by its declared/stored size) would consume more than the reserve.
+  if (budget) assertRestoreDiskHeadroom(path.dirname(localFile), perObjectCap, budget);
   const tmpFile = `${localFile}.tmp-${process.pid}-${++_restoreTmpSeq}`;
+  const relForBudget = path.relative(LOCAL_PATH, localFile);
   const hash = crypto.createHash("sha256");
   let size = 0;
+  let compressedBytes = 0;
   const stages = [getResp.Body];
-  if (gzipped) stages.push(zlib.createGunzip());
+  if (gzipped) {
+    // Decompression-ratio guard: measure the compressed bytes as they arrive
+    // from S3 BEFORE they hit zlib, so a zip-bomb-shaped body stops before
+    // it has been fully inflated into memory and disk.
+    stages.push(async function* (source) {
+      for await (const chunk of source) {
+        assertRestoreActive(attempt);
+        compressedBytes += Buffer.byteLength(chunk);
+        yield chunk;
+      }
+    });
+    stages.push(zlib.createGunzip());
+  }
   stages.push(async function* (source) {
     for await (const chunk of source) {
       assertRestoreActive(attempt);
-      size += Buffer.byteLength(chunk);
-      const cap = localFile.endsWith(SQLITE_EXT) ? _limits.maxSqliteFileSize : _limits.maxFileSize;
-      if (size > cap) throw new Error("Restored object exceeds size limit");
+      const chunkLen = Buffer.byteLength(chunk);
+      size += chunkLen;
+      // Per-object cap: strictly bounded by the declared uncompressed size
+      // (gzip, authoritative) or the non-SQLite cap (non-gzip). The cap is
+      // no longer derived from the attacker-controlled key suffix.
+      if (size > perObjectCap) {
+        throw new Error(
+          `Restored object exceeds declared size (${size} > ${perObjectCap} bytes)`,
+        );
+      }
+      // Decompression-ratio cap: a few hundred KB of gzip inflating to a GiB
+      // is a signal of a zip bomb, not a legitimate SQLite snapshot.
+      if (
+        gzipped &&
+        compressedBytes > 0 &&
+        size > _limits.maxDecompressionRatio * compressedBytes
+      ) {
+        throw new Error(
+          `Restored object decompression ratio exceeds ${_limits.maxDecompressionRatio}:1 ` +
+          `(${size} uncompressed / ${compressedBytes} compressed bytes)`,
+        );
+      }
+      // Aggregate budget: if this chunk would push the whole restore past
+      // the configured maxRestoreBytes, fail the restore (not just this
+      // file) so the pool stops instead of looping over the rest of the
+      // listing. budget.reserve() throws the shared `exceeded` error, which
+      // the pool recognises and rethrows out of runBounded.
+      if (budget) budget.reserve(chunkLen, relForBudget);
       hash.update(chunk);
       yield chunk;
     }
@@ -940,6 +1146,15 @@ async function writeRestoredObject(getResp, localFile, attempt) {
     const digest = hash.digest("hex");
     if (expected && expected !== digest) {
       throw new Error(`sha256 mismatch after download (S3 says ${expected.slice(0, 12)}…, got ${digest.slice(0, 12)}…)`);
+    }
+    // If the uploader declared an uncompressed size, the actual written
+    // bytes must match it exactly. The sha256 check already catches a short
+    // body against modern objects, but legacy gzip objects with declared
+    // size and no sha256 need this stronger invariant.
+    if (declaredSize !== null && size !== declaredSize) {
+      throw new Error(
+        `Restored object size mismatch (declared ${declaredSize}, got ${size} bytes)`,
+      );
     }
     if (localFile.endsWith(SQLITE_EXT)) stateStorage.assertSqliteFile(tmpFile);
     stateStorage.assertSafePath(LOCAL_PATH, localFile);
@@ -1149,7 +1364,41 @@ function contentHash(content) {
  *
  * @returns {Promise<"uploaded"|"unchanged"|"skipped"|"missing">}
  */
+// Per-relative-path serialization. All upload entry points (saveWorkspace,
+// runChangeFlush/uploadBatch, saveFile, cleanup) funnel through uploadStateFile;
+// holding one promise per relative path there means the periodic save, the
+// change-driven flush and the SIGTERM/cleanup save never run two concurrent
+// snapshots of the same database, which is what let two SQLite backups write
+// into the same staging file and let the hash-then-stream window on the large
+// (gzip) path produce an object whose body disagreed with its sha256 metadata.
+const _uploadInFlight = new Map();
+
 async function uploadStateFile(namespace, relativePath, { force = false } = {}) {
+  // Serialise overlapping saves of the same relative path (periodic save vs
+  // change flush vs cleanup). The second caller awaits the first and returns
+  // its outcome; we do not run a second snapshot in parallel. A forcing caller
+  // never coalesces onto a non-forcing in-flight run (which could legitimately
+  // short-circuit on an "unchanged" hash and skip the actual upload); it
+  // waits until the in-flight run (and any forced run that queued behind it)
+  // finishes, then runs its own forced pass.
+  if (!force) {
+    const inFlight = _uploadInFlight.get(relativePath);
+    if (inFlight) return inFlight;
+  } else {
+    while (_uploadInFlight.has(relativePath)) {
+      try { await _uploadInFlight.get(relativePath); } catch { /* this caller will retry */ }
+    }
+  }
+  const run = (async () => uploadStateFileLocked(namespace, relativePath, { force }))();
+  _uploadInFlight.set(relativePath, run);
+  try {
+    return await run;
+  } finally {
+    if (_uploadInFlight.get(relativePath) === run) _uploadInFlight.delete(relativePath);
+  }
+}
+
+async function uploadStateFileLocked(namespace, relativePath, { force = false } = {}) {
   assertNamespaceBound(namespace);
   if (!uploadsAllowed()) { warnGated("File upload"); return "skipped"; }
   if (normalizeRelativePath(relativePath) !== relativePath) throw new Error("Invalid state file path");
@@ -1258,11 +1507,22 @@ async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
       return "uploaded";
     }
     // Large database: never in memory whole.
+    const statAtHash = fs.statSync(stagePath);
     const hash = await hashFile(stagePath);
     if (!force && _uploadedHashes.get(relativePath) === hash) return "unchanged";
     scanForCredentials(relativePath, readFileHead(stagePath, 64 * 1024));
     const started = Date.now();
-    const { bytes, parts } = await uploadCompressedFile(key, stagePath, { hash, size });
+    // Pass the size/mtime captured at hash time so uploadCompressedFile can
+    // confirm the staged file still matches right before CompleteMultipartUpload.
+    // That guarantees the body uploaded to S3 is the exact bytes we hashed,
+    // closing the hash-then-reread window (if some other code path mutates or
+    // unlinks this staging file the upload is aborted rather than publishing
+    // an object whose body disagrees with its sha256 metadata).
+    const { bytes, parts } = await uploadCompressedFile(key, stagePath, {
+      hash,
+      size,
+      verify: { size: statAtHash.size, mtimeMs: statAtHash.mtimeMs },
+    });
     _uploadedHashes.set(relativePath, hash);
     _lastLargeUploadAt.set(relativePath, Date.now());
     console.log(
@@ -1285,10 +1545,32 @@ async function uploadSqliteFile(key, localFile, relativePath, stat, force) {
  *
  * @returns {Promise<{ bytes: number, parts: number }>} compressed bytes sent
  */
-async function uploadCompressedFile(key, filePath, { hash, size }) {
+async function uploadCompressedFile(key, filePath, { hash, size, verify } = {}) {
   assertRestoreReady();
   const s3 = getS3Client();
   const sdk = getS3Sdk();
+  // Confirm the staged bytes we hashed are still on disk unchanged. If another
+  // concurrent save path mutated or unlinked the staging file between hashFile()
+  // and here, abort rather than publishing an S3 object whose body contradicts
+  // the sha256 we store in its metadata (which would make the next restore
+  // reject the object with "sha256 mismatch after download").
+  const assertStageUnchanged = () => {
+    if (!verify) return;
+    let cur;
+    try {
+      cur = fs.statSync(filePath);
+    } catch (err) {
+      throw new Error(
+        `Staged snapshot ${path.basename(filePath)} disappeared before upload completed: ${err.message}`,
+      );
+    }
+    if (cur.size !== verify.size || cur.mtimeMs !== verify.mtimeMs) {
+      throw new Error(
+        `Staged snapshot ${path.basename(filePath)} changed under us before upload completed ` +
+          `(size ${verify.size}->${cur.size}, mtimeMs ${verify.mtimeMs}->${cur.mtimeMs}); aborting`,
+      );
+    }
+  };
   const base = {
     Bucket: BUCKET,
     Key: key,
@@ -1340,6 +1622,8 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
       }
     }
     const tail = Buffer.concat(pending);
+    // The staged bytes we hashed must still be the exact bytes we just streamed.
+    assertStageUnchanged();
     assertRestoreReady();
     getS3Client();
     if (!uploadId) {
@@ -1347,6 +1631,7 @@ async function uploadCompressedFile(key, filePath, { hash, size }) {
       return { bytes: total, parts: 1 };
     }
     if (tail.length > 0) await sendPart(tail);
+    assertStageUnchanged();
     assertRestoreReady();
     getS3Client();
     await s3.send(new sdk.CompleteMultipartUploadCommand({

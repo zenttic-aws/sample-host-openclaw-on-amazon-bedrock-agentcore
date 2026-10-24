@@ -289,8 +289,8 @@ Authorized links retain the canonical V2 actor and route. A second channel must 
   User on Telegram: "link"
          |
          v
-  Router Lambda generates 8-char bind code
-  Stores in DynamoDB: BIND#A1B2C3D4 -> userId (10 min TTL)
+  Router Lambda generates a CSPRNG bind code (20-char base32, ~100 bits)
+  Stores in DynamoDB: BIND#<code> -> userId (10 min TTL)
          |
          v
   Bot replies: "Your link code is A1B2C3D4 (valid 10 min)"

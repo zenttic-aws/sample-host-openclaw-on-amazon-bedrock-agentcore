@@ -5,14 +5,21 @@
  *
  * The skill is downloaded into /skills (where OpenClaw scans for skills and
  * where it can resolve /app/node_modules) and recorded, with its pinned
- * version, in the per-user manifest ~/.openclaw/runtime-skills.json. That
- * manifest is part of the state that survives a microVM cold start, and the
+ * version and a sha256 digest of the installed files, in the per-user
+ * manifest ~/.openclaw/runtime-skills.json. That manifest is part of the state that survives a microVM cold start, and the
  * bridge reinstalls every skill in it in the background shortly after a new
- * session starts — /skills itself is not persisted.
+ * session starts — /skills itself is not persisted. The reinstall refuses
+ * files that do not match the recorded digest.
  *
  * No `--force`: clawhub uses that flag to bypass its "flagged for security
  * review" check in non-interactive mode. A flagged skill therefore fails here
  * with a clear message instead of being installed silently.
+ *
+ * When the deployment operator has set `RUNTIME_SKILLS_ALLOWLIST`, this
+ * script refuses to install any slug that is not in that allowlist. The
+ * allowlist lives in the container env, which the agent context cannot
+ * modify in a way the next cold-start sees, so an operator-pinned
+ * allowlist bounds the persistence effect of a prompt-injected install.
  */
 const { execFileSync } = require("child_process");
 const { validateSkillName, runtimeSkills } = require("./common");
@@ -26,6 +33,20 @@ try {
   process.exit(2);
 }
 const manifestFile = runtimeSkills.manifestPath();
+
+// Operator allowlist: if configured, fail fast so a refused slug never
+// touches /skills or the manifest, and the same decision applies at cold
+// start (reinstallFromManifest enforces it there too).
+const allowlist = runtimeSkills.parseAllowlist(process.env, {
+  log: { log() {}, warn() {}, error() {} },
+});
+if (allowlist && !runtimeSkills.isAllowed(skillName, allowlist)) {
+  console.error(
+    `Refused to install skill "${skillName}": not in this deployment's ${runtimeSkills.ALLOWLIST_ENV} ` +
+      `(operator-controlled allowlist). Ask the deployment operator to add it if you need it.`,
+  );
+  process.exit(1);
+}
 
 if (runtimeSkills.isSkillPresent(skillName)) {
   const manifest = runtimeSkills.readManifest(manifestFile);
@@ -70,31 +91,26 @@ try {
 
 // Record the install so it comes back after a cold start. A manifest write
 // failure must not be reported as an install failure — the skill IS on disk —
-// but the user needs to know it will not persist. The reinstall path
-// (reinstallFromManifest) refuses entries without a pinned version AND a
-// recorded integrity digest, so when we can't resolve either we omit the
-// entry rather than silently setting up an unverified auto-update.
-if (!installedVersion || !installedIntegrity) {
-  const missing = [
-    !installedVersion ? "a pinned version (clawhub recorded no semver in .clawhub/origin.json)" : null,
-    !installedIntegrity ? "an integrity digest of the installed files" : null,
-  ].filter(Boolean).join(" and ");
-  console.error(
-    `Warning: installed "${skillName}" but did not record it for automatic reinstall \u2014 ` +
-      `could not determine ${missing}. The skill is usable in this session; it will be gone after ` +
-      "the next cold start unless you install it again.",
-  );
-  process.exit(0);
-}
-
+// but the user needs to know it will not persist.
 try {
   runtimeSkills.recordInstall(manifestFile, skillName, installedVersion, { integrity: installedIntegrity });
   runtimeSkills.mirrorManifest(manifestFile);
   console.log(
     "\nOpenClaw loads the skill when it next refreshes its skill list (on file change, or at the latest " +
-      "at the next session start). It is reinstalled automatically a few seconds after each new session starts, " +
-      "and the bridge verifies the reinstalled files against the integrity digest recorded now before loading them.",
+      "at the next session start). It is reinstalled automatically a few seconds after each new session starts.",
   );
+  if (!installedVersion) {
+    console.log(
+      "Note: ClawHub reported no release version for this skill, so new sessions reinstall its current " +
+        "release. If that release's files differ from the ones installed now, the skill is not loaded and " +
+        "list_skills shows it as quarantined; install it again to accept the new files.",
+    );
+  }
+  if (!installedIntegrity) {
+    console.log(
+      "Note: could not compute a digest of the installed files; it is recorded at the next reinstall instead.",
+    );
+  }
 } catch (err) {
   console.error(
     `Warning: installed, but could not record "${skillName}" for reinstall on new sessions (${err.message}). ` +
