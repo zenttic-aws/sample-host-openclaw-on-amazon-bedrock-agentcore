@@ -47,6 +47,19 @@ const { createPreparedGateway } = require("./openclaw-worker-owner");
 const { renderConfig, renderAgents } = require("./gateway-config");
 const { createLiveSeedBridge, readGatewayToken } = require("./live-seed-bridge");
 const { createProxySdkSnapshotOwner } = require("./proxy-sdk-snapshot");
+const workspaceFilesS3 = require("./workspace-files-s3");
+
+// Execution-role S3 client for operator-owned keys outside the user's
+// namespace prefix (the AGENTS.md upload). The scoped-credential client in
+// workspace-sync.js has no access there.
+let _executionRoleS3Client = null;
+function executionRoleS3Client() {
+  if (!_executionRoleS3Client) {
+    const { S3Client } = require("@aws-sdk/client-s3");
+    _executionRoleS3Client = new S3Client({ region: process.env.AWS_REGION });
+  }
+  return _executionRoleS3Client;
+}
 const { createProxyAuthParent } = require("./proxy-auth-prepare");
 const { createChannelOwnershipVerifier } = require("./channel-authz");
 
@@ -1038,6 +1051,10 @@ function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
     // Also upload to S3 so the proxy's system prompt injection picks it up.
     // The proxy reads AGENTS.md from S3 (not local filesystem), so without
     // this sync the proxy would inject the stale 156-byte default template.
+    // Publish to "_system/<namespace>/AGENTS.md" at the bucket root
+    // (bridge/workspace-files-s3.js). That key is outside the user's
+    // namespace prefix, so the scoped-credential client cannot write it;
+    // this upload uses the contract server's execution-role client.
     const namespace = currentNamespace;
     const bucket = process.env.S3_USER_FILES_BUCKET;
     if (bucket && namespace) {
@@ -1045,14 +1062,14 @@ function writeOpenClawConfig({ preserveSeedFiles = false } = {}) {
       const publish = (async () => {
         try {
           const { PutObjectCommand } = require("@aws-sdk/client-s3");
-          // Use the bound persistence client for the proxy's system prompt.
-          const s3 = workspaceSync.getS3Client();
-          await s3.send(new PutObjectCommand({
-            Bucket: bucket,
-            Key: `${namespace}/AGENTS.md`,
-            Body: agentsContent,
-            ContentType: "text/markdown",
-          }), { abortSignal: activationScope.signal });
+          await workspaceFilesS3.publishAgentsMd({
+            s3: executionRoleS3Client(),
+            commands: { PutObjectCommand },
+            bucket,
+            namespace,
+            content: agentsContent,
+            abortSignal: activationScope.signal,
+          });
           console.log(`[contract] AGENTS.md synced to S3 (${agentsContent.length} bytes)`);
         } catch (err) {
           console.warn(`[contract] Failed to sync AGENTS.md to S3: ${err.message}`);

@@ -94,7 +94,8 @@ test("linked-channel delivery changes retain the canonical actor and namespace",
   assert.equal((await app.request({ "x-openclaw-actor-id": "discord:foreign" })).status, 200);
   assert.deepEqual(app.cognito, ["slack:owner"]);
   assert.ok(app.s3.length > 0);
-  assert.ok(app.s3.every((request) => request.Key.startsWith("slack_owner/")));
+  assert.ok(app.s3.every((request) => request.Key.startsWith("slack_owner/") ||
+    request.Key.startsWith("_system/slack_owner/")));
   assert.equal(app.model.length, 1);
 });
 

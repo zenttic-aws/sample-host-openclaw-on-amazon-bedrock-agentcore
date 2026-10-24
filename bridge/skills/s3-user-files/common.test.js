@@ -65,8 +65,8 @@ describe("sanitize", () => {
 describe("buildKey", () => {
   it("builds key with userId and filename", () => {
     assert.equal(
-      buildKey("telegram_12345", "IDENTITY.md"),
-      "telegram_12345/IDENTITY.md",
+      buildKey("telegram_12345", "notes.md"),
+      "telegram_12345/notes.md",
     );
   });
 
@@ -85,6 +85,34 @@ describe("buildKey", () => {
     assert.equal(
       buildKey("../admin", "../../etc/passwd"),
       "_admin/__etc_passwd",
+    );
+  });
+
+  it("rejects reserved system-prompt filenames", () => {
+    for (const name of [
+      "AGENTS.md",
+      "SOUL.md",
+      "USER.md",
+      "IDENTITY.md",
+      "TOOLS.md",
+      "MEMORY.md",
+    ]) {
+      assert.throws(
+        () => buildKey("telegram_12345", name),
+        /reserved system-prompt source/,
+        `expected ${name} to be rejected`,
+      );
+    }
+  });
+
+  it("rejects filenames inside the reserved _system/ sub-prefix", () => {
+    assert.throws(
+      () => buildKey("telegram_12345", "_system/SOUL.md"),
+      /_system\/.*reserved/,
+    );
+    assert.throws(
+      () => buildKey("telegram_12345", "_system"),
+      /_system\/.*reserved/,
     );
   });
 });
