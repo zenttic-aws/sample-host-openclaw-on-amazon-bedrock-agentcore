@@ -164,7 +164,8 @@ Seven system secrets are stored in AWS Secrets Manager, all encrypted with the p
 |---|---|
 | `openclaw/gateway-token` | Auto-generated 64-char token for WebSocket auth |
 | `openclaw/webhook-secret` | 64-char token for Telegram/Slack webhook validation |
-| `openclaw/cognito-password-secret` | HMAC key for deriving Cognito user passwords |
+| `openclaw/cognito-password-secret` | Previous Cognito password derivation key; no longer read by the runtime |
+| `openclaw/cognito-user/<poolId>/<namespace>` | Per-user random Cognito password (execution role only) |
 | `openclaw/channels/telegram` | Telegram Bot API token |
 | `openclaw/channels/slack` | Slack bot token + signing secret (JSON) |
 | `openclaw/channels/discord` | Discord bot token (placeholder) |
