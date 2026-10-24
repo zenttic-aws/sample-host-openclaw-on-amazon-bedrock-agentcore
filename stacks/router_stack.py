@@ -20,6 +20,7 @@ from aws_cdk import (
     aws_kms as kms,
     aws_lambda as _lambda,
     aws_logs as logs,
+    aws_sqs as sqs,
 )
 import cdk_nag
 import json
@@ -60,6 +61,26 @@ class RouterStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
+        def ctx_int(key, default):
+            # `or default` would turn an explicit 0 into the default, so test
+            # for absence instead.
+            value = self.node.try_get_context(key)
+            return int(default if value is None or value == "" else value)
+
+        # Optional reserved concurrency for the Router Lambda. Off by default
+        # (0): a reservation fails to deploy when the account's concurrency
+        # quota cannot keep 100 unreserved executions, which is the case for
+        # new or low-quota accounts. Set `router_reserved_concurrency` to a
+        # positive value to bound the Router's share of the pool.
+        router_reserved_concurrency = ctx_int("router_reserved_concurrency", 0)
+        # Default stage throttle (POST event routes). Overridable via context.
+        stage_rate_limit = ctx_int("router_stage_rate_limit", 100)
+        stage_burst_limit = ctx_int("router_stage_burst_limit", 50)
+        # Lower per-route limit for the GET routes that need no signature
+        # (/health, /webhook/whatsapp subscription verification) so they cannot
+        # use up the stage budget the signed POST webhooks need.
+        get_route_rate_limit = ctx_int("router_unauth_get_rate_limit", 10)
+        get_route_burst_limit = ctx_int("router_unauth_get_burst_limit", 20)
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
         # Per-user `/model` switching: validated at synth so a bad map never deploys.
         user_selectable_models = parse_user_selectable_models(
@@ -99,6 +120,23 @@ class RouterStack(Stack):
             removal_policy=RemovalPolicy.DESTROY,
         )
 
+        # --- Dead letter queue for async self-invocations ---
+        # The Router Lambda invokes itself asynchronously (InvocationType=Event)
+        # to answer webhooks within the API Gateway 30s window. If the async
+        # invocation raises, Lambda would retry up to 2 more times by default
+        # and re-run the paid AgentCore agent turn each time. We set
+        # retry_attempts=0 below and route failed events to this DLQ for
+        # operator inspection instead of silent duplicate agent spend.
+        router_async_dlq = sqs.Queue(
+            self,
+            "RouterAsyncDLQ",
+            queue_name=namer.name("openclaw-router-async-dlq"),
+            retention_period=Duration.days(14),
+            encryption=sqs.QueueEncryption.SQS_MANAGED,
+            enforce_ssl=True,
+        )
+        self.router_async_dlq = router_async_dlq
+
         # --- Lambda Function ---
         self.router_fn = _lambda.Function(
             self,
@@ -115,6 +153,19 @@ class RouterStack(Stack):
             )],
             timeout=Duration.seconds(lambda_timeout),
             memory_size=lambda_memory,
+            # The Router self-invokes asynchronously (InvocationType=Event) to
+            # answer webhooks within the API Gateway 30s window. Lambda's
+            # default two async retries would re-run a failed invocation and
+            # re-execute the paid AgentCore agent turn each time (e.g. when a
+            # formatting bug raises after the agent reply arrived). Mirror the
+            # Cron Lambda (stacks/cron_stack.py) and disable retries, routing
+            # failed events to a DLQ for operator inspection instead.
+            retry_attempts=0,
+            dead_letter_queue_enabled=True,
+            dead_letter_queue=router_async_dlq,
+            reserved_concurrent_executions=(
+                router_reserved_concurrency if router_reserved_concurrency > 0 else None
+            ),
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
@@ -151,7 +202,9 @@ class RouterStack(Stack):
             description="OpenClaw webhook ingestion API (explicit routes only)",
         )
 
-        # Explicit routes — only these paths are reachable
+        # Explicit routes — only these paths are reachable. The route keys of
+        # unauthenticated GETs are collected so the stage can give them a
+        # tighter per-route throttle than the signed POST event routes.
         self.http_api.add_routes(
             path="/webhook/telegram",
             methods=[apigwv2.HttpMethod.POST],
@@ -169,7 +222,7 @@ class RouterStack(Stack):
         )
         # WhatsApp: GET is Meta's subscription verification, POST carries events.
         # Both return 404 from the Lambda until the channel secret is configured.
-        self.http_api.add_routes(
+        whatsapp_routes = self.http_api.add_routes(
             path="/webhook/whatsapp",
             methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
             integration=lambda_integration,
@@ -186,11 +239,20 @@ class RouterStack(Stack):
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
-        self.http_api.add_routes(
+        health_routes = self.http_api.add_routes(
             path="/health",
             methods=[apigwv2.HttpMethod.GET],
             integration=lambda_integration,
         )
+
+        # Route keys reachable without a signing key: /health is answered
+        # before validation and GET /webhook/whatsapp is Meta's subscription
+        # verification. They get a lower per-route limit than the signed POST
+        # routes.
+        unauth_get_route_keys = [
+            "GET /health",
+            "GET /webhook/whatsapp",
+        ]
 
         # --- Access Logging ---
         access_log_group = logs.LogGroup(
@@ -206,10 +268,26 @@ class RouterStack(Stack):
         if default_stage:
             cfn_stage = default_stage.node.default_child
             cfn_stage.default_route_settings = apigwv2.CfnStage.RouteSettingsProperty(
-                throttling_burst_limit=50,
-                throttling_rate_limit=100,
+                throttling_burst_limit=stage_burst_limit,
+                throttling_rate_limit=stage_rate_limit,
                 detailed_metrics_enabled=True,
             )
+            # Per-route overrides for the unsigned GET routes, keyed by route
+            # key ("METHOD /path"). RouteSettings is a plain JSON property, so
+            # the values are written with CloudFormation's PascalCase names
+            # (a RouteSettingsProperty struct would serialize as camelCase).
+            cfn_stage.route_settings = {
+                route_key: {
+                    "ThrottlingBurstLimit": get_route_burst_limit,
+                    "ThrottlingRateLimit": get_route_rate_limit,
+                    "DetailedMetricsEnabled": True,
+                }
+                for route_key in unauth_get_route_keys
+            }
+            # RouteSettings keys must name existing routes, so create the
+            # routes before the stage applies them.
+            for route in [*health_routes, *whatsapp_routes]:
+                cfn_stage.node.add_dependency(route)
             cfn_stage.access_log_settings = apigwv2.CfnStage.AccessLogSettingsProperty(
                 destination_arn=access_log_group.log_group_arn,
                 format='{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","latency":"$context.responseLatency","time":"$context.requestTime"}',
@@ -241,18 +319,37 @@ class RouterStack(Stack):
             )
         )
 
-        # Secrets Manager (channel tokens)
-        self.router_fn.add_to_role_policy(
-            iam.PolicyStatement(
-                actions=[
-                    "secretsmanager:GetSecretValue",
-                    "secretsmanager:DescribeSecret",
-                ],
-                resources=[
-                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
-                ],
+        # Secrets Manager — scoped to the exact channel-token and webhook
+        # validation secrets the Router Lambda actually reads. The names come
+        # in as constructor arguments and are already present as fixed env
+        # vars on the function, so an enumerated resource list is feasible.
+        # Must NOT include openclaw/cognito-password-secret, openclaw/gateway-token
+        # or openclaw/user/* — this function is internet-facing and those
+        # secrets would widen the blast radius of any webhook-parsing defect.
+        router_secret_names = [
+            telegram_token_secret_name,
+            slack_token_secret_name,
+            feishu_token_secret_name,
+            whatsapp_token_secret_name,
+            discord_token_secret_name,
+            line_token_secret_name,
+            webhook_secret_name,
+        ]
+        router_secret_resources = [
+            f"arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+            for name in router_secret_names
+            if name
+        ]
+        if router_secret_resources:
+            self.router_fn.add_to_role_policy(
+                iam.PolicyStatement(
+                    actions=[
+                        "secretsmanager:GetSecretValue",
+                        "secretsmanager:DescribeSecret",
+                    ],
+                    resources=router_secret_resources,
+                )
             )
-        )
 
         # KMS decrypt for secrets
         self.router_fn.add_to_role_policy(
@@ -306,13 +403,19 @@ class RouterStack(Stack):
                     id="AwsSolutions-IAM5",
                     reason="AgentCore InvokeAgentRuntime IAM resource must include "
                     "runtime-endpoint sub-resource path (runtime/{id}/*). "
-                    "Secrets Manager scoped to openclaw/* prefix. DynamoDB "
-                    "grant_read_write_data adds index wildcards and KMS wildcards "
-                    "for CMK-encrypted table. S3 PutObject scoped to */_uploads/* "
-                    "prefix for image uploads.",
+                    "Secrets Manager resources are each a single secret with the "
+                    "mandatory '-*' Secrets Manager random suffix; the enumerated "
+                    "list covers only the channel/webhook secrets this Lambda reads. "
+                    "DynamoDB grant_read_write_data adds index wildcards and KMS "
+                    "wildcards for CMK-encrypted table. S3 PutObject scoped to "
+                    "*/_uploads/* prefix for image uploads.",
                     applies_to=[
                         *([f"Resource::{runtime_arn}/*"] if runtime_arn else []),
-                        f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:openclaw/*",
+                        *[
+                            f"Resource::arn:aws:secretsmanager:{region}:{account}:secret:{name}-*"
+                            for name in router_secret_names
+                            if name
+                        ],
                         f"Resource::{self.identity_table.table_arn}/index/*",
                         "Resource::<UserFilesBucketCFDFD8C0.Arn>/*/_uploads/*",
                         "Action::kms:GenerateDataKey*",
@@ -337,8 +440,11 @@ class RouterStack(Stack):
                     "X-Slack-Signature HMAC, Feishu X-Lark-Signature and WhatsApp "
                     "X-Hub-Signature-256 HMAC (plus a constant-time verify-token check on "
                     "its GET subscription route), Discord X-Signature-Ed25519 and LINE "
-                    "X-Line-Signature HMAC. API Gateway throttling provides rate "
-                    "limiting. Only explicit routes are exposed.",
+                    "X-Line-Signature HMAC. API Gateway stage throttling, with "
+                    "lower per-route limits on the GET routes that need no "
+                    "signature (/health, /webhook/whatsapp subscription "
+                    "verification), provides rate limiting. Only explicit "
+                    "routes are exposed.",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-APIG1",

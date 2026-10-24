@@ -404,20 +404,76 @@ describe("runtime-skills.reinstallFromManifest", () => {
     rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
     rs.recordInstall(manifestFile, "flagged", "1.0.0", { log: quietLog });
     rs.recordInstall(manifestFile, "gamma", "3.0.0", { log: quietLog });
-    const before = fs.readFileSync(manifestFile, "utf8");
     const { run, calls } = fakeRunner({ failing: ["flagged"] });
     const log = collectingLog();
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log });
     assert.equal(r.total, 3);
     assert.equal(r.reinstalled, 2);
     assert.equal(r.failed, 1);
+    assert.equal(r.quarantined, 0);
     assert.deepEqual(calls.map((a) => a[1]), ["alpha", "flagged", "gamma"]);
     const failed = r.results.find((x) => x.status === "failed");
     assert.equal(failed.slug, "flagged");
     assert.match(failed.error, /security review|suspicious/);
     assert.equal(log.lines.filter((l) => /warn:.*Reinstall of flagged@1\.0\.0 failed/.test(l)).length, 1);
     assert.equal(rs.isSkillPresent("flagged", skillsDir), false);
-    assert.equal(fs.readFileSync(manifestFile, "utf8"), before, "manifest untouched by reinstall");
+    // The failing entry stays in the manifest (not pruned on a single failure),
+    // only its `failures` counter is bumped so repeated failures can be
+    // quarantined — see the next test.
+    const after = rs.readManifest(manifestFile, { log: quietLog });
+    assert.deepEqual(Object.keys(after.skills).sort(), ["alpha", "flagged", "gamma"]);
+    assert.equal(after.skills.flagged.disabled, undefined);
+    assert.equal(after.skills.flagged.failures, 1);
+    assert.equal(after.skills.alpha.failures, undefined);
+  });
+
+  it("quarantines an entry after MAX_CONSECUTIVE_FAILURES consecutive failures and skips it afterwards", async () => {
+    rs.recordInstall(manifestFile, "zz-no-such-skill", "1.0.0", { log: quietLog });
+    const { run, calls } = fakeRunner({ failing: ["zz-no-such-skill"] });
+    const log = collectingLog();
+    // Threshold = 2 to keep the test short; production default is
+    // MAX_CONSECUTIVE_FAILURES (3).
+    const first = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log, maxConsecutiveFailures: 2 });
+    assert.equal(first.failed, 1);
+    assert.equal(first.quarantined, 0);
+    const second = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log, maxConsecutiveFailures: 2 });
+    assert.equal(second.failed, 0);
+    assert.equal(second.quarantined, 1);
+    const third = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log, maxConsecutiveFailures: 2 });
+    assert.equal(third.failed, 0);
+    assert.equal(third.quarantined, 0);
+    assert.equal(third.skipped, 1);
+    // After quarantine the slug is never passed to clawhub again.
+    assert.deepEqual(calls.map((a) => a[1]), ["zz-no-such-skill", "zz-no-such-skill"]);
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.skills["zz-no-such-skill"].disabled, true);
+  });
+
+  it("a successful reinstall clears the failure streak and the quarantine flag", async () => {
+    rs.recordInstall(manifestFile, "flaky", "1.0.0", { log: quietLog });
+    // Pre-seed a near-quarantine state (failures=1, not disabled yet).
+    const seeded = rs.readManifest(manifestFile, { log: quietLog });
+    seeded.skills.flaky.failures = 1;
+    rs.writeManifest(manifestFile, { skills: seeded.skills });
+    const { run } = fakeRunner();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.equal(r.reinstalled, 1);
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.skills.flaky.failures, undefined);
+    assert.equal(m.skills.flaky.disabled, undefined);
+  });
+
+  it("recordInstall clears the quarantine so re-installing a disabled slug makes it live again", () => {
+    rs.recordInstall(manifestFile, "flaky", "1.0.0", { log: quietLog });
+    const seeded = rs.readManifest(manifestFile, { log: quietLog });
+    seeded.skills.flaky.failures = 5;
+    seeded.skills.flaky.disabled = true;
+    rs.writeManifest(manifestFile, { skills: seeded.skills });
+    rs.recordInstall(manifestFile, "flaky", "1.1.0", { log: quietLog });
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.skills.flaky.version, "1.1.0");
+    assert.equal(m.skills.flaky.failures, undefined);
+    assert.equal(m.skills.flaky.disabled, undefined);
   });
 
   it("counts a zero exit that left no SKILL.md behind as a failure", async () => {
@@ -428,13 +484,18 @@ describe("runtime-skills.reinstallFromManifest", () => {
     assert.match(r.results[0].error, /SKILL\.md is missing/);
   });
 
-  it("a corrupt manifest reinstalls nothing, calls nothing, reports corrupt and does not throw", async () => {
+  it("a corrupt manifest reinstalls nothing, is rewritten clean, and does not throw", async () => {
     fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
     fs.writeFileSync(manifestFile, "{{{ definitely not json");
     const { run, calls } = fakeRunner();
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
     assert.deepEqual({ total: r.total, reinstalled: r.reinstalled, failed: r.failed, corrupt: r.corrupt }, { total: 0, reinstalled: 0, failed: 0, corrupt: true });
     assert.deepEqual(calls, []);
+    // Self-heal: the next read sees a clean manifest so the lockout cannot
+    // repeat on every cold start.
+    const after = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(after.corrupt, false);
+    assert.deepEqual(after.skills, {});
   });
 
   it("a missing manifest is simply nothing to do", async () => {
@@ -445,7 +506,7 @@ describe("runtime-skills.reinstallFromManifest", () => {
     assert.deepEqual(calls, []);
   });
 
-  it("invalid manifest entries never reach the runner and are counted", async () => {
+  it("invalid manifest entries never reach the runner, are counted and dropped from the persisted manifest", async () => {
     fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
     fs.writeFileSync(
       manifestFile,
@@ -456,6 +517,11 @@ describe("runtime-skills.reinstallFromManifest", () => {
     assert.deepEqual(calls.map((a) => a[1]), ["good"]);
     assert.equal(r.invalid, 2);
     assert.equal(r.total, 1);
+    // Self-heal: the invalid entries are pruned so the invalid counter does
+    // not re-fire on every subsequent cold start.
+    const after = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(after.invalid, 0);
+    assert.deepEqual(Object.keys(after.skills), ["good"]);
   });
 
   it("a runner that throws synchronously-shaped errors without stderr still yields a summary", async () => {
@@ -545,12 +611,15 @@ describe("runtime-skills.watchManifest", () => {
 describe("agentcore-contract.js wiring", () => {
   const source = fs.readFileSync(path.join(__dirname, "agentcore-contract.js"), "utf-8");
 
-  it("awaits required skill restoration before activating the prepared gateway", () => {
+  it("logs runtime skill restoration gaps and continues activation instead of throwing", () => {
     const reinstall = source.indexOf("await runtimeSkills.reinstallFromManifest(");
     const activate = source.indexOf("await preparedGateway.activate(");
     assert.ok(reinstall > 0 && activate > reinstall);
     assert.match(source, /runtimeSkills\.manifestPath\(OPENCLAW_DIR\)/);
-    assert.match(source, /if \(skills\.failed \|\| skills\.corrupt \|\| skills\.invalid\) throw new Error/);
+    // The old fail-closed gate is gone: a failed/corrupt/invalid summary must
+    // not block USER_READY (persistent-lockout fix).
+    assert.equal(/if \(skills\.failed \|\| skills\.corrupt \|\| skills\.invalid\) throw new Error/.test(source), false);
+    assert.match(source, /Runtime skill restoration incomplete — continuing activation/);
   });
 
   it("backs the manifest up to S3 on change via watchManifest + workspaceSync.saveFile, started with the periodic save", () => {
