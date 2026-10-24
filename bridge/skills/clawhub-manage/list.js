@@ -43,10 +43,20 @@ try {
     console.log(`Installed ClawHub skills (${onDisk.length}):\n`);
     for (const skill of onDisk) {
       const entry = persisted[skill];
-      const tag = entry
-        ? ` (installed by you${entry.version ? `, v${entry.version}` : ""}; reinstalled automatically in new sessions)`
+      if (!entry) {
+        console.log(`  - ${skill}`);
+        continue;
+      }
+      const parts = [];
+      if (entry.version) parts.push(`v${entry.version}`);
+      if (entry.installedAt) parts.push(`at ${entry.installedAt}`);
+      if (entry.installedBy) parts.push(`by user ${entry.installedBy}`);
+      if (entry.installedSession) parts.push(`in session ${entry.installedSession}`);
+      const provenance = parts.length ? ` (installed ${parts.join(", ")}` : " (installed by this environment";
+      const warning = !entry.installedBy && !entry.installedSession
+        ? "; WARNING: no install provenance recorded — this entry may have been added directly to the manifest without going through `node /skills/clawhub-manage/install.js`"
         : "";
-      console.log(`  - ${skill}${tag}`);
+      console.log(`  - ${skill}${provenance}; reinstalled automatically in new sessions${warning})`);
     }
   }
   if (pending.length > 0) {
@@ -54,8 +64,17 @@ try {
       `\nRecorded for automatic reinstall but not on disk yet (${pending.length}) — the reinstall runs a few seconds after a session starts; if a skill stays here, its last reinstall failed:\n`,
     );
     for (const skill of pending) {
-      const v = persisted[skill].version;
-      console.log(`  - ${skill}${v ? ` (v${v})` : ""}`);
+      const entry = persisted[skill];
+      const parts = [];
+      if (entry.version) parts.push(`v${entry.version}`);
+      if (entry.installedAt) parts.push(`recorded ${entry.installedAt}`);
+      if (entry.installedBy) parts.push(`by user ${entry.installedBy}`);
+      if (entry.installedSession) parts.push(`in session ${entry.installedSession}`);
+      const suffix = parts.length ? ` (${parts.join(", ")})` : "";
+      const warning = !entry.installedBy && !entry.installedSession
+        ? "  [WARNING: no install provenance recorded]"
+        : "";
+      console.log(`  - ${skill}${suffix}${warning}`);
     }
   }
   if (disabled.length > 0) {

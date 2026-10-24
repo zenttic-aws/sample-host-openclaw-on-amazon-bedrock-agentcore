@@ -1769,6 +1769,16 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       manifestFile: runtimeSkills.manifestPath(OPENCLAW_DIR), log: console, run: runRuntimeSkillInstall,
     });
     checkpoint();
+    if (skills.refused) {
+      // An operator-pinned allowlist refused one or more manifest entries:
+      // the slug is in the manifest but the deployment operator has not
+      // permitted it. Surface it in the cold-start logs.
+      for (const r of skills.results) {
+        if (r.status === "refused") {
+          console.warn("[contract] Runtime skill %s refused by operator allowlist and NOT reinstalled", r.slug);
+        }
+      }
+    }
     // Previously any failed/corrupt/invalid summary threw and blocked
     // USER_READY, which turned a single unresolvable manifest entry (prompt-
     // injected bad slug, upstream unpublish, clawhub.ai outage) into a

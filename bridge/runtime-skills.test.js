@@ -102,6 +102,45 @@ describe("runtime-skills manifest read/write", () => {
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
+  it("recordInstall captures install provenance from the environment", () => {
+    rs.recordInstall(file, "baidu-search", "1.0.0", {
+      log: quietLog,
+      env: { INTERNAL_USER_ID: "user-123", AGENTCORE_RUNTIME_SESSION_ID: "session-abc" },
+    });
+    const m = rs.readManifest(file, { log: quietLog });
+    assert.equal(m.skills["baidu-search"].installedBy, "user-123");
+    assert.equal(m.skills["baidu-search"].installedSession, "session-abc");
+    assert.match(m.skills["baidu-search"].installedAt, /^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("recordInstall tolerates missing provenance env vars and does not store empty fields", () => {
+    rs.recordInstall(file, "baidu-search", "1.0.0", { log: quietLog, env: {} });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(Object.prototype.hasOwnProperty.call(raw.skills["baidu-search"], "installedBy"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(raw.skills["baidu-search"], "installedSession"), false);
+  });
+
+  it("readManifest preserves provenance fields on round-trip and ignores oversized / malformed ones", () => {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        skills: {
+          good: { version: "1.0.0", installedBy: "u1", installedSession: "s1", installedAt: "2026-01-01T00:00:00Z" },
+          nostr: { version: null, installedBy: 42, installedSession: {} },
+          toobig: { version: null, installedBy: "x".repeat(300) },
+        },
+      }),
+    );
+    const m = rs.readManifest(file, { log: quietLog });
+    assert.equal(m.skills.good.installedBy, "u1");
+    assert.equal(m.skills.good.installedSession, "s1");
+    assert.equal(m.skills.good.installedAt, "2026-01-01T00:00:00Z");
+    assert.equal(m.skills.nostr.installedBy, undefined);
+    assert.equal(m.skills.nostr.installedSession, undefined);
+    assert.equal(m.skills.toobig.installedBy, undefined);
+  });
+
   it("reads a missing manifest as empty (not corrupt)", () => {
     const m = rs.readManifest(file, { log: quietLog });
     assert.deepEqual(m.skills, {});
@@ -311,6 +350,35 @@ describe("runtime-skills clawhub argv", () => {
       CLAWHUB_REGISTRY: "https://registry.example",
       CLAWDHUB_SITE: "https://site.example",
     });
+  });
+});
+
+describe("runtime-skills.parseAllowlist / isAllowed", () => {
+  it("returns null when the env var is unset or empty (back-compat: no allowlist)", () => {
+    assert.equal(rs.parseAllowlist({}, { log: quietLog }), null);
+    assert.equal(rs.parseAllowlist({ RUNTIME_SKILLS_ALLOWLIST: "" }, { log: quietLog }), null);
+    assert.equal(rs.parseAllowlist({ RUNTIME_SKILLS_ALLOWLIST: "   \t  " }, { log: quietLog }), null);
+  });
+
+  it("parses comma / whitespace separated slugs, lowercases, drops invalid tokens with a warning", () => {
+    const log = collectingLog();
+    const list = rs.parseAllowlist(
+      { RUNTIME_SKILLS_ALLOWLIST: "alpha, Beta ,gamma\n@owner/slug, ../bad\tdelta" },
+      { log },
+    );
+    assert.ok(list instanceof Set);
+    assert.deepEqual([...list].sort(), ["alpha", "beta", "delta", "gamma"]);
+    assert.equal(log.lines.filter((l) => l.startsWith("warn:")).length, 2);
+  });
+
+  it("isAllowed returns true when there is no allowlist, enforces membership otherwise", () => {
+    assert.equal(rs.isAllowed("anything", null), true);
+    const list = rs.parseAllowlist({ RUNTIME_SKILLS_ALLOWLIST: "alpha,beta" }, { log: quietLog });
+    assert.equal(rs.isAllowed("alpha", list), true);
+    assert.equal(rs.isAllowed("ALPHA", list), true);
+    assert.equal(rs.isAllowed("gamma", list), false);
+    assert.equal(rs.isAllowed("", list), false);
+    assert.equal(rs.isAllowed(undefined, list), false);
   });
 });
 
@@ -532,6 +600,67 @@ describe("runtime-skills.reinstallFromManifest", () => {
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
     assert.equal(r.failed, 1);
     assert.match(r.results[0].error, /ENOENT/);
+  });
+
+  it("operator allowlist (RUNTIME_SKILLS_ALLOWLIST) refuses manifest entries that are not permitted", async () => {
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
+    rs.recordInstall(manifestFile, "attacker-slug", null, { log: quietLog });
+    rs.recordInstall(manifestFile, "gamma", "3.0.0", { log: quietLog });
+    const { run, calls } = fakeRunner();
+    const log = collectingLog();
+    const r = await rs.reinstallFromManifest({
+      manifestFile,
+      skillsDir,
+      run,
+      log,
+      env: { RUNTIME_SKILLS_ALLOWLIST: "alpha, gamma" },
+    });
+    assert.equal(r.total, 3);
+    assert.equal(r.refused, 1);
+    assert.equal(r.reinstalled, 2);
+    assert.deepEqual(calls.map((a) => a[1]).sort(), ["alpha", "gamma"]);
+    const refused = r.results.find((x) => x.status === "refused");
+    assert.equal(refused.slug, "attacker-slug");
+    assert.match(refused.error, /not in operator allowlist/);
+    assert.ok(
+      log.lines.some((l) => /warn:.*Refusing to reinstall attacker-slug.*RUNTIME_SKILLS_ALLOWLIST/.test(l)),
+      log.lines.join("\n"),
+    );
+  });
+
+  it("an unset or empty allowlist is back-compat: every valid entry is reinstalled", async () => {
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
+    rs.recordInstall(manifestFile, "beta", null, { log: quietLog });
+    const { run, calls } = fakeRunner();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog, env: {} });
+    assert.equal(r.refused, 0);
+    assert.equal(r.reinstalled, 2);
+    assert.deepEqual(calls.map((a) => a[1]), ["alpha", "beta"]);
+    const r2 = await rs.reinstallFromManifest({
+      manifestFile,
+      skillsDir: path.join(dir, "skills2"),
+      run: fakeRunner().run,
+      log: quietLog,
+      env: { RUNTIME_SKILLS_ALLOWLIST: "   " },
+    });
+    assert.equal(r2.refused, 0);
+  });
+
+  it("the allowlist log notes a slug's recorded installedBy if present", async () => {
+    rs.recordInstall(manifestFile, "attacker-slug", null, { log: quietLog, env: { INTERNAL_USER_ID: "victim-user-id" } });
+    const { run } = fakeRunner();
+    const log = collectingLog();
+    await rs.reinstallFromManifest({
+      manifestFile,
+      skillsDir,
+      run,
+      log,
+      env: { RUNTIME_SKILLS_ALLOWLIST: "only-permitted-slug" },
+    });
+    assert.ok(
+      log.lines.some((l) => /Refusing to reinstall attacker-slug.*installedBy=victim-user-id/.test(l)),
+      log.lines.join("\n"),
+    );
   });
 });
 
