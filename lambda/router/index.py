@@ -14,17 +14,20 @@ Path routing:
   POST /webhook/line      — LINE Messaging API webhook (disabled until configured)
 """
 
+import base64
 import hashlib
 import hmac
+import html as _html
 import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
 from urllib import request as urllib_request
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import boto3
 from botocore.config import Config
@@ -66,6 +69,13 @@ REGISTRATION_OPEN = os.environ.get("REGISTRATION_OPEN", "false").lower() == "tru
 LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "600"))
 RUNTIME_TARGET = json.loads(os.environ.get("RUNTIME_TARGET", "null"))
 DEFAULT_MODEL_ID = os.environ.get("DEFAULT_MODEL_ID", "")
+
+# Maximum accepted webhook body size (bytes). Matches the 1 MB cap enforced by
+# the WhatsApp/LINE/Discord verifiers (lambda/shared/python/*.py). Oversized
+# bodies are rejected with 413 before any parsing, base64 decoding or HMAC work
+# runs, so an unauthenticated client cannot force the 256 MB router Lambda to
+# materialise a multi-megabyte JSON document pre-signature.
+MAX_BODY_BYTES = 1_000_000
 
 
 def _load_user_selectable_models(raw):
@@ -231,6 +241,124 @@ def _get_feishu_tenant_token():
 # Webhook validation helpers
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Async self-invocation authenticator
+# ---------------------------------------------------------------------------
+#
+# The handler re-enters itself via lambda:Invoke to finish processing after
+# ACK'ing the platform (see `_self_invoke_async`). Historically the re-entry
+# branch trusted a self-asserted `_async_dispatch` flag on the event, which
+# meant any principal that could invoke this function could skip the per-
+# channel signature verifiers. We now attach an HMAC produced from a secret
+# only the router holds, keyed to the exact channel + body + filtered headers,
+# and refuse to dispatch unless the MAC verifies and the timestamp is fresh.
+
+_ASYNC_DISPATCH_LABEL = b"openclaw-async-dispatch-v1"
+_ASYNC_DISPATCH_MAX_AGE_SECONDS = 300  # 5 minutes
+
+
+def _async_dispatch_key():
+    """Derive a dedicated subkey for signing async-dispatch envelopes.
+
+    We never sign with the raw webhook secret directly: the webhook secret is
+    also handed to Telegram as the X-Telegram-Bot-Api-Secret-Token value, so
+    reusing it verbatim would let a Telegram-controlled party forge async
+    envelopes. HKDF-style derivation isolates the key material.
+
+    Returns an empty bytes string when no webhook secret is configured; the
+    verifier treats that as fail-closed.
+    """
+    secret = _get_webhook_secret()
+    if not secret:
+        return b""
+    secret_bytes = secret.encode("utf-8") if isinstance(secret, str) else secret
+    return hmac.new(secret_bytes, _ASYNC_DISPATCH_LABEL, hashlib.sha256).digest()
+
+
+def _canonical_async_dispatch_message(timestamp, nonce, channel, body, headers):
+    """Build the canonical byte string the MAC is computed over.
+
+    The body and headers can be arbitrarily large or structured; we hash each
+    before concatenating so field boundaries are unambiguous.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        body_bytes = bytes(body)
+    elif isinstance(body, str):
+        body_bytes = body.encode("utf-8")
+    else:
+        body_bytes = json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    headers_bytes = json.dumps(
+        headers or {}, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+    body_digest = hashlib.sha256(body_bytes).hexdigest()
+    headers_digest = hashlib.sha256(headers_bytes).hexdigest()
+
+    return "|".join([
+        "v1",
+        str(timestamp),
+        str(nonce),
+        str(channel or ""),
+        body_digest,
+        headers_digest,
+    ]).encode("utf-8")
+
+
+def _sign_async_dispatch(channel, body, headers):
+    """Return the auth envelope that `_self_invoke_async` attaches to the event.
+
+    Returns None if no signing key is available; callers must then refuse to
+    dispatch rather than send an unsigned payload.
+    """
+    key = _async_dispatch_key()
+    if not key:
+        return None
+    timestamp = int(time.time())
+    nonce = uuid.uuid4().hex
+    message = _canonical_async_dispatch_message(timestamp, nonce, channel, body, headers)
+    mac = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return {"v": 1, "ts": timestamp, "nonce": nonce, "mac": mac}
+
+
+def _verify_async_dispatch(event):
+    """Verify the HMAC envelope on an incoming async-dispatch event.
+
+    Returns True only when the MAC matches a message built from the exact
+    channel/body/headers on the event and the timestamp is within the
+    allowed window. Any missing field, stale timestamp, or MAC mismatch is
+    rejected (fail-closed).
+    """
+    auth = event.get("_auth")
+    if not isinstance(auth, dict):
+        return False
+    if auth.get("v") != 1:
+        return False
+    ts = auth.get("ts")
+    nonce = auth.get("nonce")
+    provided_mac = auth.get("mac")
+    if not isinstance(ts, int) or not isinstance(nonce, str) or not isinstance(provided_mac, str):
+        return False
+    now = int(time.time())
+    if abs(now - ts) > _ASYNC_DISPATCH_MAX_AGE_SECONDS:
+        return False
+
+    key = _async_dispatch_key()
+    if not key:
+        logger.error("Async dispatch verification failed \u2014 no webhook secret configured")
+        return False
+
+    message = _canonical_async_dispatch_message(
+        ts,
+        nonce,
+        event.get("_channel"),
+        event.get("_body"),
+        event.get("_headers", {}),
+    )
+    expected_mac = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected_mac, provided_mac)
+
+
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
 
@@ -316,6 +444,15 @@ def validate_feishu_webhook(headers, body_bytes):
         logger.warning("Feishu webhook missing signature headers")
         return False
 
+    # Reject requests older than 5 minutes to prevent replay attacks
+    try:
+        if abs(time.time() - int(timestamp)) > 300:
+            logger.warning("Feishu webhook timestamp too old (replay attack prevention)")
+            return False
+    except (ValueError, TypeError):
+        logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
+        return False
+
     body_b = body_bytes if isinstance(body_bytes, bytes) else body_bytes.encode("utf-8")
     content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
     expected = hashlib.sha256(content).hexdigest()
@@ -340,6 +477,7 @@ def _decrypt_feishu_event(encrypted_body):
     Returns the decrypted JSON string, or None on failure.
     """
     import base64
+    import binascii
 
     _, _, _, encrypt_key = _get_feishu_credentials()
     if not encrypt_key:
@@ -349,8 +487,21 @@ def _decrypt_feishu_event(encrypted_body):
     try:
         data = json.loads(encrypted_body) if isinstance(encrypted_body, str) else encrypted_body
         cipher_text = base64.b64decode(data["encrypt"])
-    except (json.JSONDecodeError, KeyError, TypeError) as e:
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, binascii.Error) as e:
         logger.error("Feishu decrypt: bad input — %s", e)
+        return None
+
+    # Validate the decoded blob before handing any pointer to libcrypto:
+    # AES-CBC requires at least one 16-byte IV plus one 16-byte ciphertext
+    # block, and the ciphertext body must be an exact multiple of the block
+    # size. Anything shorter would make us slice a <16-byte IV, which when
+    # passed as a bare c_char_p pointer lets libcrypto memcpy past the end of
+    # the Python bytes buffer (CWE-130 heap over-read).
+    if len(cipher_text) < 32 or (len(cipher_text) - 16) % 16 != 0:
+        logger.error(
+            "Feishu decrypt: invalid ciphertext length %d (must be >=32 and 16-byte aligned)",
+            len(cipher_text),
+        )
         return None
 
     key = hashlib.sha256(encrypt_key.encode("utf-8")).digest()
@@ -363,7 +514,11 @@ def _decrypt_feishu_event(encrypted_body):
         logger.error("Feishu decrypt failed: %s", e)
         return None
 
-    return decrypted.decode("utf-8")
+    try:
+        return decrypted.decode("utf-8")
+    except UnicodeDecodeError as e:
+        logger.error("Feishu decrypt: plaintext not valid UTF-8 — %s", e)
+        return None
 
 
 def _aes_cbc_decrypt(key, iv, data):
@@ -417,13 +572,23 @@ def _aes_cbc_decrypt(key, iv, data):
     libcrypto.EVP_aes_256_cbc.restype = ctypes.c_void_p
     libcrypto.EVP_aes_256_cbc.argtypes = []
 
+    # Enforce fixed-size key and IV buffers so a short input can never cause
+    # libcrypto to dereference past the end of a Python bytes buffer. AES-256
+    # requires a 32-byte key; AES-CBC requires a 16-byte IV.
+    if not isinstance(key, (bytes, bytearray)) or len(key) != 32:
+        raise RuntimeError("AES-256 key must be exactly 32 bytes")
+    if not isinstance(iv, (bytes, bytearray)) or len(iv) != 16:
+        raise RuntimeError("AES-CBC IV must be exactly 16 bytes")
+    key_buf = ctypes.create_string_buffer(bytes(key), 32)
+    iv_buf = ctypes.create_string_buffer(bytes(iv), 16)
+
     ctx = libcrypto.EVP_CIPHER_CTX_new()
     if not ctx:
         raise RuntimeError("EVP_CIPHER_CTX_new failed")
 
     try:
         cipher_type = libcrypto.EVP_aes_256_cbc()
-        rc = libcrypto.EVP_DecryptInit_ex(ctx, cipher_type, None, key, iv)
+        rc = libcrypto.EVP_DecryptInit_ex(ctx, cipher_type, None, key_buf, iv_buf)
         if rc != 1:
             raise RuntimeError("EVP_DecryptInit_ex failed")
 
@@ -450,32 +615,90 @@ def _aes_cbc_decrypt(key, iv, data):
 # DynamoDB identity helpers
 # ---------------------------------------------------------------------------
 
+def _allow_record_exists(channel_key):
+    """Return True iff ALLOW#<channel_key> currently exists (consistent read).
+
+    Uses a consistent read so that an operator revocation via
+    scripts/manage-allowlist.sh is observed on the very next turn.
+    """
+    try:
+        resp = identity_table.get_item(
+            Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"}, ConsistentRead=True,
+        )
+    except ClientError as e:
+        # Fail closed on allowlist read errors so revocation is never silently
+        # bypassed by a transient DynamoDB fault.
+        logger.error("Allowlist check failed for %s: %s", channel_key, e)
+        return False
+    return "Item" in resp
+
+
 def is_user_allowed(channel, channel_user_id):
-    """Check if a new user is permitted to register.
+    """Check if the given channel identity is currently permitted.
 
     Returns True if:
-    - REGISTRATION_OPEN is true (anyone can register), OR
-    - An ALLOW#{channel}:{channel_user_id} record exists in DynamoDB
+    - REGISTRATION_OPEN is true (anyone may use the bot), OR
+    - An ALLOW#{channel}:{channel_user_id} record exists in DynamoDB.
 
-    This is only called for NEW users (no existing CHANNEL# record).
-    Existing users and bind-code redemptions bypass this check.
+    This is now consulted on *every* turn by ``resolve_user`` (not only on
+    first enrollment) so that removing a user from the allowlist actually
+    revokes their access.
+    """
+    if REGISTRATION_OPEN:
+        return True
+    return _allow_record_exists(f"{channel}:{channel_user_id}")
+
+
+def _is_currently_authorized(channel, channel_user_id, user_id):
+    """Re-evaluate per-turn authorization for an already-enrolled identity.
+
+    An enrolled identity remains authorized only while REGISTRATION_OPEN is
+    on, an ALLOW# record exists for its own channel key, OR — for linked
+    secondary channels — an ALLOW# record exists for the owning user's
+    original enrollment actor. Fails closed on missing / unreadable records
+    so operator revocation via scripts/manage-allowlist.sh takes effect on
+    the next webhook turn.
     """
     if REGISTRATION_OPEN:
         return True
     channel_key = f"{channel}:{channel_user_id}"
+    if _allow_record_exists(channel_key):
+        return True
+    # Linked secondary channel: honour the primary enrollment actor's ALLOW#.
     try:
-        resp = identity_table.get_item(Key={"PK": f"ALLOW#{channel_key}", "SK": "ALLOW"})
-        if "Item" in resp:
-            return True
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
     except ClientError as e:
-        logger.error("Allowlist check failed: %s", e)
+        logger.error("Authorization profile read failed for %s: %s", user_id, e)
+        return False
+    enrollment_actor = profile.get("enrollmentActorId")
+    if isinstance(enrollment_actor, str) and enrollment_actor and enrollment_actor != channel_key:
+        if _allow_record_exists(enrollment_actor):
+            return True
     return False
+
+
+def _is_user_disabled(user_id):
+    """Operator kill switch: USER#<id>/PROFILE.status == "DISABLED" blocks routing."""
+    try:
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
+    except ClientError as e:
+        # Fail closed: an unreadable profile must not grant service.
+        logger.error("User status read failed for %s: %s", user_id, e)
+        return True
+    return profile.get("status") == "DISABLED"
 
 
 def resolve_user(channel, channel_user_id, display_name=""):
     """Look up or create a user for the given channel identity.
 
-    Returns (user_id, is_new). Returns (None, False) if user is not allowed.
+    Returns (user_id, is_new). Returns (None, False) if the identity is not
+    currently authorized — either because it was never enrolled and is not on
+    the allowlist, or because its ALLOW# record has since been removed, or
+    because the owning user has been administratively disabled.
     """
     channel_key = f"{channel}:{channel_user_id}"
     pk = f"CHANNEL#{channel_key}"
@@ -484,10 +707,27 @@ def resolve_user(channel, channel_user_id, display_name=""):
     try:
         resp = identity_table.get_item(Key={"PK": pk, "SK": "PROFILE"}, ConsistentRead=True)
         if "Item" in resp:
+            existing_user_id = resp["Item"]["userId"]
             owner = read_actor_owner(identity_table, channel_key)
-            if owner and owner["userId"] != resp["Item"]["userId"]:
+            if owner and owner["userId"] != existing_user_id:
                 raise RouteUnavailable("Channel mapping conflicts with durable actor ownership")
-            return resp["Item"]["userId"], False
+            # Re-evaluate authorization on every turn so that an operator
+            # removing the ALLOW# record (the documented revocation step)
+            # actually revokes service, instead of only blocking first-time
+            # enrollment. See docs/security.md "Revoking access".
+            if not _is_currently_authorized(channel, channel_user_id, existing_user_id):
+                logger.warning(
+                    "Enrolled identity %s is no longer on the allowlist — denying turn",
+                    channel_key,
+                )
+                return None, False
+            if _is_user_disabled(existing_user_id):
+                logger.warning(
+                    "User %s is administratively DISABLED — denying turn for %s",
+                    existing_user_id, channel_key,
+                )
+                return None, False
+            return existing_user_id, False
     except ClientError as e:
         logger.error("DynamoDB get_item failed: %s", e)
         raise
@@ -506,7 +746,15 @@ def resolve_user(channel, channel_user_id, display_name=""):
 
 
 def get_or_create_session(user_id):
-    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation.
+
+    Also honours the operator kill switch: a USER#<id>/PROFILE record with
+    ``status == "DISABLED"`` short-circuits routing before any AgentCore
+    invocation, so operators can halt a compromised user without waiting for
+    allowlist propagation.
+    """
+    if _is_user_disabled(user_id):
+        raise RouteUnavailable("User is administratively disabled")
     return resolve_route(identity_table, user_id)
 
 
@@ -514,13 +762,65 @@ def get_or_create_session(user_id):
 # Cross-channel binding
 # ---------------------------------------------------------------------------
 
+def _generate_bind_code():
+    """CSPRNG bind code: 20 uppercase base32 chars (~100 bits of entropy).
+
+    Produces an alnum code that remains compatible with ``_is_bind_command``
+    parsing. 100 bits of entropy is safe without an application-layer attempt
+    limiter against the 10-minute TTL and real chat-platform throughput.
+    """
+    # 13 random bytes -> 21 base32 chars; take 20 for a tidy length.
+    raw = secrets.token_bytes(13)
+    return base64.b32encode(raw).decode("ascii").rstrip("=")[:20]
+
+
+def _invalidate_previous_bind_code(user_id):
+    """Best-effort: delete any outstanding BIND code previously issued to user.
+
+    Caps outstanding bind codes per user to one by resolving a per-user pointer
+    item (``USER#<id> / BIND_POINTER``) that records the most recently issued
+    code and deleting the matching ``BIND#<code>`` item. Any failure here is
+    non-fatal: the new code will be written regardless and the stale code will
+    expire via its own TTL.
+    """
+    pointer_key = {"PK": f"USER#{user_id}", "SK": "BIND_POINTER"}
+    try:
+        resp = identity_table.get_item(Key=pointer_key, ConsistentRead=True)
+    except ClientError as e:
+        logger.warning("create_bind_code: pointer lookup failed for %s: %s", user_id, e)
+        return
+    prev = (resp.get("Item") or {}).get("code")
+    if not prev:
+        return
+    try:
+        identity_table.delete_item(
+            Key={"PK": f"BIND#{prev}", "SK": "BIND"},
+            ConditionExpression="userId = :user",
+            ExpressionAttributeValues={":user": user_id},
+        )
+    except ClientError as e:
+        # ConditionalCheckFailed just means the code was already redeemed or
+        # expired/evicted; nothing to clean up.
+        if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+            logger.warning("create_bind_code: stale code delete failed for %s: %s", user_id, e)
+
+
 def create_bind_code(user_id):
-    """Generate an 8-char bind code and store it in DynamoDB with TTL."""
+    """Generate a high-entropy bind code and store it in DynamoDB with TTL.
+
+    The code is a 20-character uppercase base32 string generated from a CSPRNG
+    (~100 bits of entropy), replacing the former 8-hex-char code whose 32-bit
+    keyspace was only safe behind an application-layer attempt limiter. Any
+    previous outstanding bind code issued to the same user is invalidated so
+    at most one code is live per user at a time.
+    """
     try:
         route = _binding_route(user_id)
     except RouteUnavailable:
         return None
-    code = uuid.uuid4().hex[:8].upper()  # 16^8 = 4.3B keyspace
+    # Cap outstanding codes per user to one: delete any prior live code first.
+    _invalidate_previous_bind_code(user_id)
+    code = _generate_bind_code()
     ttl = int(time.time()) + BIND_CODE_TTL_SECONDS
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
@@ -537,6 +837,19 @@ def create_bind_code(user_id):
         },
         ConditionExpression="attribute_not_exists(PK)",
     )
+    try:
+        identity_table.put_item(
+            Item={
+                "PK": f"USER#{user_id}",
+                "SK": "BIND_POINTER",
+                "userId": user_id,
+                "code": code,
+                "createdAt": now_iso,
+                "ttl": ttl,
+            },
+        )
+    except ClientError as e:
+        logger.warning("create_bind_code: pointer write failed for %s: %s", user_id, e)
     return code
 
 
@@ -581,6 +894,19 @@ def redeem_bind_code(code, channel, channel_user_id, display_name=""):
                 or item.get("sessionId") != route.session_id):
             return None, False
         link_actor(IDENTITY_TABLE_NAME, identity_client, channel_key, user_id, current, owner, code, display_name, route)
+
+        # Clear the per-user BIND_POINTER so the user is immediately eligible
+        # to request a fresh code. The underlying BIND# item is deleted inside
+        # link_actor's transact_write_items; the pointer is best-effort state.
+        try:
+            identity_table.delete_item(
+                Key={"PK": f"USER#{user_id}", "SK": "BIND_POINTER"},
+                ConditionExpression="code = :code",
+                ExpressionAttributeValues={":code": code},
+            )
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                logger.warning("redeem_bind_code: pointer cleanup failed for %s: %s", user_id, e)
 
         logger.info("Bind code %s redeemed: %s -> %s", code, channel_key, user_id)
         return user_id, True
@@ -666,6 +992,12 @@ _BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
 _MALFORMED_TEXT_BLOCK_RE = re.compile(
     r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
 )
+# Maximum consecutive '[{' / '[' / '{' opener depth we will attempt to JSON
+# decode. CPython's json scanner recurses in C per nested container and raises
+# RecursionError well before 500 levels; attacker-controlled model output may
+# contain arbitrary depth, so we reject obviously too-deep candidates before
+# raw_decode() is called. Legitimate subagent nesting is <<< 100 levels.
+_MAX_CONTENT_BLOCK_NEST_DEPTH = 100
 
 
 def _extract_text_from_content_blocks(text):
@@ -694,24 +1026,43 @@ def _extract_text_from_content_blocks(text):
                 rebuilt.append(result[i:])
                 break
             rebuilt.append(result[i:pos])
-            # Try to parse a JSON array starting at pos
-            try:
-                blocks, end = decoder.raw_decode(result, pos)
-                if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
-                    # Check if this looks like a content block array (dicts with "type" keys)
-                    has_typed_blocks = any(b.get("type") for b in blocks)
-                    if has_typed_blocks:
-                        parts = [
-                            b.get("text", "")
-                            for b in blocks
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        ]
-                        # Always advance past the block — image-only blocks produce empty text
-                        rebuilt.append("".join(parts))
-                        i = end
-                        continue
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+            # Try to parse a JSON array starting at pos.
+            # Guard against attacker-controlled deeply nested JSON that would
+            # make json.JSONDecoder.raw_decode() raise RecursionError (not a
+            # subclass of ValueError/JSONDecodeError, so historically it would
+            # escape the handler, drop the user reply, and — because async
+            # self-invocations retry — trigger duplicate paid agent turns).
+            # Any candidate with more than _MAX_CONTENT_BLOCK_NEST_DEPTH
+            # consecutive openers at its start cannot be a legitimate content
+            # block array and is skipped as plain text.
+            opener_depth = 0
+            for ch in result[pos:pos + _MAX_CONTENT_BLOCK_NEST_DEPTH + 2]:
+                if ch in "[{":
+                    opener_depth += 1
+                else:
+                    break
+            if opener_depth <= _MAX_CONTENT_BLOCK_NEST_DEPTH:
+                try:
+                    blocks, end = decoder.raw_decode(result, pos)
+                    if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+                        # Check if this looks like a content block array (dicts with "type" keys)
+                        has_typed_blocks = any(b.get("type") for b in blocks)
+                        if has_typed_blocks:
+                            parts = [
+                                b.get("text", "")
+                                for b in blocks
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            ]
+                            # Always advance past the block — image-only blocks produce empty text
+                            rebuilt.append("".join(parts))
+                            i = end
+                            continue
+                except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+                    # RecursionError can escape raw_decode() for deeply nested
+                    # attacker-controlled JSON on top of the depth guard above
+                    # (platform/interpreter dependent); treat the fragment as
+                    # plain text rather than crashing the handler.
+                    pass
             # Not a valid content block array. If it looks like content-block
             # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
             # runs to the end of the string is dropped (a partial stream tail).
@@ -857,12 +1208,25 @@ def _markdown_to_telegram_html(text):
     # Strikethrough: ~~text~~
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
-    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection.
+    # Reject any URL containing characters that could break out of the href attribute
+    # (quotes, angle brackets, whitespace, control/NUL — incl. placeholder markers), then
+    # validate the full scheme (not just a prefix) and HTML-escape for attribute context.
+    _LINK_URL_FORBIDDEN = re.compile(r'[\x00-\x20"\'<>]')
+    _LINK_ALLOWED_SCHEMES = {"http", "https", "tg", "mailto"}
+
     def _safe_link(m):
         link_text, link_url = m.group(1), m.group(2)
-        if re.match(r'^(https?://|tg://|mailto:)', link_url):
-            return f'<a href="{link_url}">{link_text}</a>'
-        return m.group(0)  # leave non-http links as plain text
+        if _LINK_URL_FORBIDDEN.search(link_url):
+            return m.group(0)  # unsafe characters — leave as plain text
+        try:
+            scheme = urlparse(link_url).scheme.lower()
+        except ValueError:
+            return m.group(0)
+        if scheme not in _LINK_ALLOWED_SCHEMES:
+            return m.group(0)  # leave non-allowlisted links as plain text
+        safe_url = _html.escape(link_url, quote=True)
+        return f'<a href="{safe_url}">{link_text}</a>'
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
 
@@ -1046,6 +1410,20 @@ def _periodic_typing(chat_id, token, stop_event, interval=4, notify_after_s=30):
             notified = True
 
 
+def _escape_slack_text(text):
+    """Neutralize Slack control characters per Slack's documented escaping rules.
+
+    Replaces ``&`` with ``&amp;``, ``<`` with ``&lt;``, and ``>`` with ``&gt;`` so
+    that attacker-influenced content (e.g. model output) cannot inject mrkdwn link
+    syntax (``<url|label>``) or broadcast/user mention tokens (``<!channel>``,
+    ``<!here>``, ``<@U...>``, ``<!subteam^ID>``) into chat.postMessage ``text``.
+    See https://api.slack.com/reference/surfaces/formatting#escaping.
+    """
+    if not isinstance(text, str):
+        return text
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def send_slack_message(channel_id, text, bot_token):
     """Send a message via Slack Web API."""
     if not bot_token:
@@ -1054,7 +1432,7 @@ def send_slack_message(channel_id, text, bot_token):
     url = "https://slack.com/api/chat.postMessage"
     data = json.dumps({
         "channel": channel_id,
-        "text": text,
+        "text": _escape_slack_text(text),
     }).encode()
     req = urllib_request.Request(
         url,
@@ -1405,17 +1783,26 @@ def _download_telegram_image(message, token):
             logger.warning("Telegram getFile returned no file_path for file_id=%s", file_id)
             return None, None, None
 
-        # Check file size before downloading (Telegram includes it)
-        file_size = data.get("result", {}).get("file_size", 0)
+        # Check file size before downloading (Telegram includes it).
+        # Treat a missing file_size as a rejection rather than defaulting to 0,
+        # so we never trust "size absent" as "size zero".
+        file_size = data.get("result", {}).get("file_size")
+        if not isinstance(file_size, int) or file_size <= 0:
+            logger.warning("Telegram file missing or invalid file_size; rejecting")
+            return None, None, None
         if file_size > MAX_IMAGE_BYTES:
             logger.warning("Telegram file too large: %d bytes", file_size)
             return None, None, None
 
-        # Download the file
+        # Download the file. Bound the transfer itself in addition to the
+        # declared size, matching the sibling helpers (document/WhatsApp/LINE/Feishu).
         download_url = f"https://api.telegram.org/file/bot{token}/{file_path}"
         req = urllib_request.Request(download_url)
         resp = urllib_request.urlopen(req, timeout=15)
-        image_bytes = resp.read()
+        image_bytes = resp.read(MAX_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            logger.warning("Telegram image exceeded %d bytes during download", MAX_IMAGE_BYTES)
+            return None, None, None
 
         filename = file_path.split("/")[-1] if "/" in file_path else file_path
         return image_bytes, content_type, filename
@@ -1433,7 +1820,12 @@ def _download_slack_file(file_info, bot_token):
     if mimetype not in ALLOWED_IMAGE_TYPES:
         return None, None, None
 
-    file_size = file_info.get("size", 0)
+    # Treat a missing size as a rejection rather than defaulting to 0; Slack
+    # omits `size` on some file objects and we must not trust that as "empty".
+    file_size = file_info.get("size")
+    if not isinstance(file_size, int) or file_size <= 0:
+        logger.warning("Slack file missing or invalid size; rejecting")
+        return None, None, None
     if file_size > MAX_IMAGE_BYTES:
         logger.warning("Slack file too large: %d bytes", file_size)
         return None, None, None
@@ -1449,7 +1841,12 @@ def _download_slack_file(file_info, bot_token):
             headers={"Authorization": f"Bearer {bot_token}"},
         )
         resp = urllib_request.urlopen(req, timeout=15)
-        image_bytes = resp.read()
+        # Bound the transfer itself so an understated or absent declared size
+        # cannot cause an unbounded read into Lambda memory.
+        image_bytes = resp.read(MAX_IMAGE_BYTES + 1)
+        if len(image_bytes) > MAX_IMAGE_BYTES:
+            logger.warning("Slack image exceeded %d bytes during download", MAX_IMAGE_BYTES)
+            return None, None, None
         filename = file_info.get("name", "image")
         return image_bytes, mimetype, filename
     except Exception as e:
@@ -1544,13 +1941,18 @@ def _upload_document_to_s3(data, namespace, kind):
 # ---------------------------------------------------------------------------
 
 def _is_bind_command(text):
-    """Check if the message is a bind-code command (e.g. 'link ABCD1234')."""
+    """Check if the message is a bind-code command (e.g. 'link ABCD1234...').
+
+    Accepts alphanumeric bind codes between 8 and 32 characters: the current
+    issuer emits a 20-char base32 code (~100 bits of entropy); the 8-char
+    lower bound retains compatibility with any still-outstanding legacy codes.
+    """
     if not text:
         return False, ""
     parts = text.strip().split()
     if len(parts) == 2 and parts[0].lower() in ("link", "bind"):
         code = parts[1].strip().upper()
-        if len(code) == 8 and code.isalnum():
+        if 8 <= len(code) <= 32 and code.isalnum():
             return True, code
     return False, ""
 
@@ -1714,8 +2116,25 @@ def handle_telegram(body):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "telegram")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # The bind code is a bearer credential whose redemption bypasses the
+    # allowlist, so it must only be emitted into a verified 1:1 chat with the
+    # requesting identity. Anywhere else (group/supergroup/channel) we refuse
+    # and tell the user to DM the bot instead — the code is NEVER generated
+    # or disclosed in that reply.
     if _is_link_command(text):
+        chat_type = str(message.get("chat", {}).get("type", ""))
+        if chat_type != "private" or str(chat_id) != str(user_id_tg):
+            logger.warning(
+                "Telegram: refusing link command in non-private chat (type=%s)", chat_type,
+            )
+            send_telegram_message(
+                chat_id,
+                "For your security, account linking is only available in a direct "
+                "message. Please DM me the word `link` from a 1:1 chat.",
+                token,
+            )
+            return
         code = create_bind_code(resolved_user_id)
         if not code:
             send_telegram_message(chat_id, "Account linking requires identity reconciliation.", token)
@@ -1819,7 +2238,7 @@ def handle_telegram(body):
     response_text = result.get("response", "Sorry, I couldn't process your message.")
     # Extract plain text from content blocks if the contract server returned them raw
     response_text = _extract_text_from_content_blocks(response_text)
-    logger.info("Response to send (len=%d): %s", len(response_text), response_text[:2000])
+    logger.info("Telegram response ready (len=%d, streamed=%s)", len(response_text), bool(result.get("streamed")))
 
     # If contract already streamed progressively to Telegram, skip duplicate send
     if result.get("streamed"):
@@ -1911,8 +2330,28 @@ def handle_slack(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "slack")
 
-    # Handle link-accounts command (generate bind code for existing users)
+    # Handle link-accounts command (generate bind code for existing users).
+    # Slack delivers `app_mention` events from public/private channels and
+    # strips the `<@BOT>` prefix, so a group `@bot link` would otherwise reach
+    # this branch. The bind code is a bearer credential that bypasses the
+    # allowlist on redemption, so we only emit it into a direct-message channel
+    # (`channel_id` starts with "D", i.e. an `im` conversation) and never on an
+    # `app_mention`. In any other context we refuse and ask the user to DM the
+    # bot — the code is NEVER generated or disclosed in that reply.
     if _is_link_command(text):
+        is_dm = event_type == "message" and isinstance(channel_id, str) and channel_id.startswith("D")
+        if not is_dm:
+            logger.warning(
+                "Slack: refusing link command in non-DM context (event_type=%s channel=%s)",
+                event_type, (channel_id[:1] if isinstance(channel_id, str) else "?"),
+            )
+            send_slack_message(
+                channel_id,
+                "For your security, account linking is only available in a direct "
+                "message. Please open a DM with me and send `link` there.",
+                bot_token,
+            )
+            return {"statusCode": 200, "body": "ok"}
         code = create_bind_code(resolved_user_id)
         if not code:
             send_slack_message(channel_id, "Account linking requires identity reconciliation.", bot_token)
@@ -1977,6 +2416,25 @@ def handle_slack(body, headers=None):
     return {"statusCode": 200, "body": "ok"}
 
 
+FEISHU_DEDUP_TTL_SECONDS = 86400
+
+
+def _claim_feishu_event(event_id):
+    """Record a Feishu header.event_id so a replayed/retried delivery runs once. False = duplicate."""
+    try:
+        identity_table.put_item(
+            Item={"PK": f"DEDUP#feishu:{event_id}", "SK": "DEDUP",
+                  "ttl": int(time.time()) + FEISHU_DEDUP_TTL_SECONDS},
+            ConditionExpression="attribute_not_exists(PK)",
+        )
+        return True
+    except ClientError as e:
+        if e.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return False
+        logger.warning("Feishu dedupe write failed: %s", type(e).__name__)
+        return True
+
+
 def handle_feishu(body, headers=None):
     """Process a Feishu Events API webhook.
 
@@ -1990,7 +2448,11 @@ def handle_feishu(body, headers=None):
         if not decrypted:
             logger.error("Feishu: failed to decrypt event")
             return {"statusCode": 200, "body": "ok"}
-        event_data = json.loads(decrypted)
+        try:
+            event_data = json.loads(decrypted)
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.error("Feishu: decrypted payload is not valid JSON — %s", e)
+            return {"statusCode": 200, "body": "ok"}
         logger.info("Feishu: decrypted event successfully")
 
     # Feishu URL verification challenge (like Slack's url_verification)
@@ -2008,6 +2470,13 @@ def handle_feishu(body, headers=None):
     header = event_data.get("header", {})
     event = event_data.get("event", {})
     event_type = header.get("event_type", "")
+
+    # Idempotency: claim header.event_id so replays/retries run at most once
+    event_id = header.get("event_id", "")
+    if event_id:
+        if not _claim_feishu_event(event_id):
+            logger.info("Feishu: duplicate event ignored")
+            return {"statusCode": 200, "body": "ok"}
 
     if event_type != "im.message.receive_v1":
         logger.info("Feishu: ignoring event type: %s", event_type)
@@ -2080,8 +2549,23 @@ def handle_feishu(body, headers=None):
     session_id = get_or_create_session(resolved_user_id)
     authorize_channel_actor(identity_table, session_id, resolved_user_id, actor_id, "feishu")
 
-    # Handle link-accounts command
+    # Handle link-accounts command.
+    # Feishu reports `chat_type` on the inbound message (p2p vs. group). The
+    # bind code is a bearer credential that bypasses the allowlist on
+    # redemption, so we only emit it in a 1:1 (p2p) chat. In a group we refuse
+    # and ask the user to DM the bot — the code is NEVER generated or
+    # disclosed in that reply.
     if _is_link_command(text):
+        if chat_type != "p2p":
+            logger.warning(
+                "Feishu: refusing link command in non-p2p chat (chat_type=%s)", chat_type,
+            )
+            send_feishu_message(
+                chat_id,
+                "For your security, account linking is only available in a direct "
+                "(1:1) chat. Please message me directly and send `link` there.",
+            )
+            return {"statusCode": 200, "body": "ok"}
         bind_code = create_bind_code(resolved_user_id)
         if not bind_code:
             send_feishu_message(chat_id, "Account linking requires identity reconciliation.")
@@ -2541,22 +3025,41 @@ def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
+        # The handler re-enters itself via lambda:Invoke after the per-channel
+        # verifier passes. We refuse to dispatch unless the envelope carries a
+        # valid HMAC produced by `_self_invoke_async` with the router's own
+        # webhook secret; without this, any principal with lambda:InvokeFunction
+        # on this ARN could skip signature verification and impersonate users.
+        if not _verify_async_dispatch(event):
+            logger.warning("Async dispatch rejected \u2014 missing or invalid authenticator")
+            return {"statusCode": 401, "body": "Unauthorized"}
+
         channel = event.get("_channel")
         body = event.get("_body")
         headers = event.get("_headers", {})
 
-        if channel == "telegram":
-            handle_telegram(body)
-        elif channel == "slack":
-            handle_slack(body, headers)
-        elif channel == "feishu":
-            handle_feishu(body, headers)
-        elif channel == "whatsapp":
-            handle_whatsapp(body)
-        elif channel == "discord":
-            handle_discord(body)
-        elif channel == "line":
-            handle_line(body)
+        # Wrap the per-channel dispatch so that an unexpected formatting or
+        # delivery failure does not fail the asynchronous invocation. If the
+        # Lambda handler raises, Lambda's async retry policy would re-invoke
+        # the event (default 2 retries) and re-run the paid AgentCore turn,
+        # so we log and return 200 instead. retry_attempts=0 and a DLQ are
+        # also configured on the Router Lambda in stacks/router_stack.py as
+        # defense in depth.
+        try:
+            if channel == "telegram":
+                handle_telegram(body)
+            elif channel == "slack":
+                handle_slack(body, headers)
+            elif channel == "feishu":
+                handle_feishu(body, headers)
+            elif channel == "whatsapp":
+                handle_whatsapp(body)
+            elif channel == "discord":
+                handle_discord(body)
+            elif channel == "line":
+                handle_line(body)
+        except Exception:
+            logger.exception("Async dispatch failed for channel=%s", channel)
         return {"statusCode": 200, "body": "ok"}
 
     # --- Function URL entry point ---
@@ -2578,12 +3081,32 @@ def handler(event, context):
     if method != "POST":
         return {"statusCode": 405, "body": "Method not allowed"}
 
+    headers = event.get("headers", {})
+
+    # Reject oversized payloads before any parsing, base64 decoding or HMAC
+    # work. Check Content-Length first so a declared-huge base64 body is
+    # refused without allocating the decoded copy; then re-check the resolved
+    # body length because Content-Length is attacker-controlled.
+    content_length_header = (
+        headers.get("content-length")
+        or headers.get("Content-Length")
+        or ""
+    )
+    if content_length_header:
+        try:
+            if int(content_length_header) > MAX_BODY_BYTES:
+                return {"statusCode": 413, "body": "Payload too large"}
+        except (TypeError, ValueError):
+            pass
+
     body = event.get("body", "")
+    if isinstance(body, str) and len(body) > MAX_BODY_BYTES:
+        return {"statusCode": 413, "body": "Payload too large"}
     if event.get("isBase64Encoded"):
         import base64
         body = base64.b64decode(body).decode("utf-8")
-
-    headers = event.get("headers", {})
+    if isinstance(body, (bytes, str)) and len(body) > MAX_BODY_BYTES:
+        return {"statusCode": 413, "body": "Payload too large"}
 
     # Determine channel from path
     if path.endswith("/webhook/telegram"):
@@ -2597,14 +3120,19 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     elif path.endswith("/webhook/slack"):
-        # Slack url_verification — only allowed during initial setup
+        # Validate Slack request signature BEFORE dispatching on the body.
+        # Slack signs url_verification requests too, so verifying first does
+        # not break the Request URL setup handshake and prevents an
+        # unauthenticated caller from echoing an attacker-chosen challenge.
+        if not validate_slack_webhook(headers, body):
+            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
+        # Slack url_verification — respond synchronously after signature check
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
-                if os.environ.get("SLACK_VERIFIED") == "true":
-                    logger.warning("Slack url_verification rejected — already verified")
-                    return {"statusCode": 403, "body": "Already verified"}
-                # Validate challenge format before echoing (prevent injection)
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
+                # Validate challenge format before echoing (defense in depth)
                 challenge = str(event_data.get("challenge", ""))
                 if not re.match(r'^[a-zA-Z0-9_\-\.]{1,100}$', challenge):
                     return {"statusCode": 400, "body": "Invalid challenge format"}
@@ -2616,11 +3144,6 @@ def handler(event, context):
         except (json.JSONDecodeError, TypeError):
             pass
 
-        # Validate Slack request signature before processing
-        if not validate_slack_webhook(headers, body):
-            logger.warning("Slack webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
-
         # Ignore Slack retries
         if headers.get("x-slack-retry-num"):
             return {"statusCode": 200, "body": "ok"}
@@ -2630,10 +3153,23 @@ def handler(event, context):
         return {"statusCode": 200, "body": "ok"}
 
     elif path.endswith("/webhook/feishu"):
-        # Feishu URL verification challenge — must respond synchronously
+        # Validate Feishu signature BEFORE dispatching on the body. Once an
+        # Encrypt Key is configured, Feishu signs every event (including
+        # url_verification) and delivers url_verification encrypted inside an
+        # {"encrypt": "..."} envelope that is handled downstream in
+        # handle_feishu after decryption, so verifying first does not break
+        # a genuine setup flow.
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        if not validate_feishu_webhook(headers, body_bytes):
+            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 401, "body": "Unauthorized"}
+
+        # Plaintext url_verification (only reachable with a valid signature);
+        # respond synchronously. Encrypted url_verification bodies are
+        # handled inside handle_feishu after decryption.
         try:
             event_data = json.loads(body) if isinstance(body, str) else body
-            if event_data.get("type") == "url_verification":
+            if isinstance(event_data, dict) and event_data.get("type") == "url_verification":
                 challenge = str(event_data.get("challenge", ""))
                 if not re.match(r'^[a-zA-Z0-9_\-\.]{1,200}$', challenge):
                     return {"statusCode": 400, "body": "Invalid challenge format"}
@@ -2644,12 +3180,6 @@ def handler(event, context):
                 }
         except (json.JSONDecodeError, TypeError):
             pass
-
-        # Validate Feishu signature
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
-        if not validate_feishu_webhook(headers, body_bytes):
-            logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
-            return {"statusCode": 401, "body": "Unauthorized"}
 
         # Self-invoke async for actual processing
         _self_invoke_async("feishu", body, headers)
@@ -2689,6 +3219,14 @@ def handler(event, context):
 
 def _self_invoke_async(channel, body, headers):
     """Invoke this Lambda asynchronously to process the webhook in the background."""
+    filtered_headers = {k: v for k, v in (headers or {}).items()
+                        if k.startswith(("x-slack-", "x-lark-"))}
+    auth = _sign_async_dispatch(channel, body, filtered_headers)
+    if auth is None:
+        # Refuse to emit an unsigned envelope — the receiver would reject it
+        # anyway and this way the failure is logged at the producer.
+        logger.error("Self-invoke aborted \u2014 cannot sign async dispatch (no webhook secret)")
+        return
     try:
         lambda_client.invoke(
             FunctionName=LAMBDA_FUNCTION_NAME,
@@ -2697,8 +3235,8 @@ def _self_invoke_async(channel, body, headers):
                 "_async_dispatch": True,
                 "_channel": channel,
                 "_body": body,
-                "_headers": {k: v for k, v in (headers or {}).items()
-                             if k.startswith(("x-slack-", "x-lark-"))},
+                "_headers": filtered_headers,
+                "_auth": auth,
             }).encode(),
         )
     except Exception as e:

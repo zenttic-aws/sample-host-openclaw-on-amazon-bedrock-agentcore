@@ -73,11 +73,13 @@ def test_job_id_includes_the_verified_owner_and_the_scheduled_fire_time():
     fired = time.mktime((2026, 10, 19, 8, 47, 4, 0, 0, 0)) - time.timezone
     job = {**cron_event(), "userId": USER}
     assert module.async_job_id(job, now=fired) == "schedule123-410e6ba40e0a-20261019T084700Z"
-    # The payload scheduledTime is not trusted as the idempotency stamp: the
-    # invocation time (rounded to the minute) wins so an attacker cannot pick
-    # the slot they reserve by inserting a literal future scheduledTime.
-    attacker = {**job, "scheduledTime": "2099-01-01T00:00:00Z"}
-    assert module.async_job_id(attacker, now=fired) == "schedule123-410e6ba40e0a-20261019T084700Z"
+    # The schedule's fire time is the stamp, so a delivery of the same fire that
+    # arrives in a later minute still maps to the same name.
+    late = fired + 120
+    assert (module.async_job_id(job, "2026-10-19T08:47:00Z", now=late)
+            == "schedule123-410e6ba40e0a-20261019T084700Z")
+    # A malformed fire time falls back to the invocation time, to the minute.
+    assert module.async_job_id(job, "bogus", now=fired) == "schedule123-410e6ba40e0a-20261019T084700Z"
     # A different owner for the same scheduleId gets a different execution name.
     other = module.async_job_id({**job, "userId": "someone-else"}, now=fired)
     assert other.startswith("schedule123-") and other.endswith("-20261019T084700Z")
