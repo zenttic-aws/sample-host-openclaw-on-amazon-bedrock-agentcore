@@ -168,8 +168,27 @@ function extractSessionMetadata(parsed, headers) {
     if (BOUND_ACTOR_ID && identity.actorId !== BOUND_ACTOR_ID) {
       throw new Error("Proxy canonical actor changed");
     }
+    // The identity file is written by the trusted contract once per turn, but
+    // `/tmp` is world-writable inside the microVM. Treat the whole record as
+    // part of the binding: validate every sibling we forward to Bedrock
+    // `requestMetadata` against the proxy's own allowlists, and refuse any
+    // value that does not match — the same guarantee as the actorId pin.
+    const rawChannel = identity.channel == null ? "unknown" : identity.channel;
+    if (typeof rawChannel !== "string" || !VALID_CHANNELS.has(rawChannel)) {
+      throw new Error("Proxy canonical actor changed");
+    }
+    if (identity.sessionId !== undefined && identity.sessionId !== null &&
+        identity.sessionId !== "" &&
+        (typeof identity.sessionId !== "string" ||
+          !RUNTIME_SESSION_ID.test(identity.sessionId))) {
+      throw new Error("Proxy canonical actor changed");
+    }
+    if (identity.trigger !== undefined && identity.trigger !== null &&
+        identity.trigger !== "chat" && identity.trigger !== "cron") {
+      throw new Error("Proxy canonical actor changed");
+    }
     actorId = identity.actorId;
-    channel = identity.channel || "unknown";
+    channel = rawChannel;
     idSource = "identity-file";
   }
   const modelOverride = idSource === "identity-file" &&
@@ -359,9 +378,13 @@ function extractSessionMetadata(parsed, headers) {
   }
 
   // 5b. Validate actorId format to prevent prompt injection.
-  // Only allow channel:alphanumeric patterns or known fallback values.
+  // Only allow channel:alphanumeric patterns or known fallback values. The
+  // body is capped at 37 characters so the derived namespace
+  // (actorId.replace(':', '_')) stays within 46 characters — the maximum
+  // width that fits inside EventBridge schedule names without truncation
+  // (see bridge/skills/eventbridge-cron/common.js buildScheduleName).
   const VALID_ACTOR_ID =
-    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,64}$/;
+    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,37}$/;
   if (actorId !== "default-user" && !VALID_ACTOR_ID.test(actorId)) {
     console.warn(
       `[proxy] WARNING: actorId "${actorId.slice(0, 80)}" failed validation — falling back to default-user.`,
@@ -409,6 +432,11 @@ function extractSessionMetadata(parsed, headers) {
 // cache). Shared with agentcore-contract.js via bridge/cognito-token.js so
 // both processes derive the same password for the same actorId.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
+// Per-session sticky redaction of previously-blocked user turns. Without this,
+// scopeGuardrailToLatestUserTurn would re-send blocked text untagged on the
+// next turn (see guardrail-blocklist.js and docs/guardrails.md).
+const { createGuardrailBlocklist } = require("./guardrail-blocklist");
+const guardrailBlocklist = createGuardrailBlocklist();
 const { reconcileToolHistory } = require("./tool-history");
 const { readBody } = require("./read-body");
 const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
@@ -770,8 +798,15 @@ const VALID_CHANNELS = new Set([
   "discord",
   "whatsapp",
   "line",
+  "feishu",
   "unknown",
 ]);
+
+// Bedrock's requestMetadata charset: identifiers only, up to 128 characters.
+// The identity file is written by the trusted contract so legitimate values
+// stay inside this set; a mutated file that strays out of it is treated as
+// a canonical-actor change and refused.
+const RUNTIME_SESSION_ID = /^[A-Za-z0-9:_@$#=/+,.-]{1,128}$/;
 
 async function retrieveMemoryContext(_actorId, _lastUserText) {
   // Stub — memory retrieval not yet implemented.
@@ -1048,7 +1083,7 @@ function resolveModelId(requestedModel, modelOverride = null) {
  * Accepts optional systemTextOverride and toolConfig for tool use.
  */
 async function invokeBedrock(messages, systemTextOverride, toolConfig, requestedModel, modelOverride = null,
-  metadataFor = null) {
+  metadataFor = null, sessionId = "") {
   const {
     BedrockRuntimeClient,
     ConverseCommand,
@@ -1058,7 +1093,12 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
     region: AWS_REGION,
     requestHandler: bedrockClientOptions(modelId),
   });
-  const { bedrockMessages, systemText } = convertMessages(messages);
+  let { bedrockMessages, systemText } = convertMessages(messages);
+  // Strip any text block the input filter already blocked in this session,
+  // so it is not replayed untagged as part of history (see guardrail-blocklist.js).
+  if (guardrailConfig && sessionId) {
+    bedrockMessages = guardrailBlocklist.redactBlockedHistory(sessionId, bedrockMessages);
+  }
   const finalSystemText = systemTextOverride || systemText;
 
   const params = {
@@ -1094,9 +1134,13 @@ async function invokeBedrock(messages, systemTextOverride, toolConfig, requested
       if (response?.trace?.guardrail) {
         console.debug("[guardrail] trace:", JSON.stringify(response.trace.guardrail));
       }
-      // Handle guardrail intervention
+      // Handle guardrail intervention: remember the blocked turn so later
+      // requests in this session strip it from history before scoping.
       if (response?.stopReason === "guardrail_intervened") {
         console.warn("[guardrail] intervention on non-streaming response");
+        if (sessionId) {
+          guardrailBlocklist.recordBlockedUserTurn(sessionId, params.messages);
+        }
       }
 
       const outputMessage = response.output?.message;
@@ -1157,6 +1201,7 @@ async function invokeBedrockStreaming(
   systemPrefix,
   modelOverride = null,
   metadataFor = null,
+  sessionId = "",
 ) {
   if (modelOutcomeUnknown) {
     if (!res.destroyed && !res.writableEnded) {
@@ -1176,12 +1221,12 @@ async function invokeBedrockStreaming(
   });
   try {
     return await invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
-      metadataFor);
+      metadataFor, sessionId);
   } finally { route?.finish(); }
 }
 
 async function invokeBedrockStreamingRequest(messages, res, model, systemTextOverride, toolConfig, route, systemPrefix,
-  metadataFor = null) {
+  metadataFor = null, sessionId = "") {
   const {
     BedrockRuntimeClient,
     ConverseStreamCommand,
@@ -1192,7 +1237,12 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
     requestHandler: bedrockStreamClientOptions(modelId),
     ...(route && { maxAttempts: 1 }),
   });
-  const { bedrockMessages, systemText } = convertMessages(messages);
+  let { bedrockMessages, systemText } = convertMessages(messages);
+  // Strip any text block the input filter already blocked in this session,
+  // so it is not replayed untagged as part of history (see guardrail-blocklist.js).
+  if (guardrailConfig && sessionId) {
+    bedrockMessages = guardrailBlocklist.redactBlockedHistory(sessionId, bedrockMessages);
+  }
   const finalSystemText = systemTextOverride || systemText;
 
   const payload = {
@@ -1373,6 +1423,9 @@ async function invokeBedrockStreamingRequest(messages, res, model, systemTextOve
         }
         if (event.messageStop?.stopReason === "guardrail_intervened") {
           console.warn("[guardrail] intervention on streaming response");
+          if (sessionId) {
+            guardrailBlocklist.recordBlockedUserTurn(sessionId, params.messages);
+          }
         }
       }
 
@@ -1680,6 +1733,7 @@ const server = http.createServer(async (req, res) => {
             systemPrefix,
             modelOverride,
             metadataFor,
+            sessionId,
           );
         } else {
           const result = await invokeBedrock(
@@ -1689,6 +1743,7 @@ const server = http.createServer(async (req, res) => {
             parsed.model,
             modelOverride,
             metadataFor,
+            sessionId,
           );
           const response = formatChatResponse(result, parsed.model);
           console.log(

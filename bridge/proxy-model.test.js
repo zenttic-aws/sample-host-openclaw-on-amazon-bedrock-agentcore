@@ -77,6 +77,8 @@ test("the proxy reads the per-turn model override only from the bound identity f
       process: { env }, sessionMap: new Map(), console: { log() {} },
     };
     vm.createContext(box);
+    const allowStart = source.indexOf("const VALID_CHANNELS = new Set([");
+    vm.runInContext(source.slice(allowStart, source.indexOf("\nasync function retrieveMemoryContext(", allowStart)), box);
     vm.runInContext('const { osRandomUUID } = require("./runtime-lifecycle");' + source.slice(start, end), box);
     return box.extractSessionMetadata({}, {});
   };
