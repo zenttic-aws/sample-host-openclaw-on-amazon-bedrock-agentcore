@@ -61,6 +61,26 @@ class RouterStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("router_lambda_timeout_seconds") or "300")
         lambda_memory = int(self.node.try_get_context("router_lambda_memory_mb") or "256")
+        def ctx_int(key, default):
+            # `or default` would turn an explicit 0 into the default, so test
+            # for absence instead.
+            value = self.node.try_get_context(key)
+            return int(default if value is None or value == "" else value)
+
+        # Optional reserved concurrency for the Router Lambda. Off by default
+        # (0): a reservation fails to deploy when the account's concurrency
+        # quota cannot keep 100 unreserved executions, which is the case for
+        # new or low-quota accounts. Set `router_reserved_concurrency` to a
+        # positive value to bound the Router's share of the pool.
+        router_reserved_concurrency = ctx_int("router_reserved_concurrency", 0)
+        # Default stage throttle (POST event routes). Overridable via context.
+        stage_rate_limit = ctx_int("router_stage_rate_limit", 100)
+        stage_burst_limit = ctx_int("router_stage_burst_limit", 50)
+        # Lower per-route limit for the GET routes that need no signature
+        # (/health, /webhook/whatsapp subscription verification) so they cannot
+        # use up the stage budget the signed POST webhooks need.
+        get_route_rate_limit = ctx_int("router_unauth_get_rate_limit", 10)
+        get_route_burst_limit = ctx_int("router_unauth_get_burst_limit", 20)
         registration_open = str(self.node.try_get_context("registration_open") or "false").lower()
         # Per-user `/model` switching: validated at synth so a bad map never deploys.
         user_selectable_models = parse_user_selectable_models(
@@ -143,6 +163,9 @@ class RouterStack(Stack):
             retry_attempts=0,
             dead_letter_queue_enabled=True,
             dead_letter_queue=router_async_dlq,
+            reserved_concurrent_executions=(
+                router_reserved_concurrency if router_reserved_concurrency > 0 else None
+            ),
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
@@ -179,7 +202,9 @@ class RouterStack(Stack):
             description="OpenClaw webhook ingestion API (explicit routes only)",
         )
 
-        # Explicit routes — only these paths are reachable
+        # Explicit routes — only these paths are reachable. The route keys of
+        # unauthenticated GETs are collected so the stage can give them a
+        # tighter per-route throttle than the signed POST event routes.
         self.http_api.add_routes(
             path="/webhook/telegram",
             methods=[apigwv2.HttpMethod.POST],
@@ -197,7 +222,7 @@ class RouterStack(Stack):
         )
         # WhatsApp: GET is Meta's subscription verification, POST carries events.
         # Both return 404 from the Lambda until the channel secret is configured.
-        self.http_api.add_routes(
+        whatsapp_routes = self.http_api.add_routes(
             path="/webhook/whatsapp",
             methods=[apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
             integration=lambda_integration,
@@ -214,11 +239,20 @@ class RouterStack(Stack):
             methods=[apigwv2.HttpMethod.POST],
             integration=lambda_integration,
         )
-        self.http_api.add_routes(
+        health_routes = self.http_api.add_routes(
             path="/health",
             methods=[apigwv2.HttpMethod.GET],
             integration=lambda_integration,
         )
+
+        # Route keys reachable without a signing key: /health is answered
+        # before validation and GET /webhook/whatsapp is Meta's subscription
+        # verification. They get a lower per-route limit than the signed POST
+        # routes.
+        unauth_get_route_keys = [
+            "GET /health",
+            "GET /webhook/whatsapp",
+        ]
 
         # --- Access Logging ---
         access_log_group = logs.LogGroup(
@@ -234,10 +268,26 @@ class RouterStack(Stack):
         if default_stage:
             cfn_stage = default_stage.node.default_child
             cfn_stage.default_route_settings = apigwv2.CfnStage.RouteSettingsProperty(
-                throttling_burst_limit=50,
-                throttling_rate_limit=100,
+                throttling_burst_limit=stage_burst_limit,
+                throttling_rate_limit=stage_rate_limit,
                 detailed_metrics_enabled=True,
             )
+            # Per-route overrides for the unsigned GET routes, keyed by route
+            # key ("METHOD /path"). RouteSettings is a plain JSON property, so
+            # the values are written with CloudFormation's PascalCase names
+            # (a RouteSettingsProperty struct would serialize as camelCase).
+            cfn_stage.route_settings = {
+                route_key: {
+                    "ThrottlingBurstLimit": get_route_burst_limit,
+                    "ThrottlingRateLimit": get_route_rate_limit,
+                    "DetailedMetricsEnabled": True,
+                }
+                for route_key in unauth_get_route_keys
+            }
+            # RouteSettings keys must name existing routes, so create the
+            # routes before the stage applies them.
+            for route in [*health_routes, *whatsapp_routes]:
+                cfn_stage.node.add_dependency(route)
             cfn_stage.access_log_settings = apigwv2.CfnStage.AccessLogSettingsProperty(
                 destination_arn=access_log_group.log_group_arn,
                 format='{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","responseLength":"$context.responseLength","latency":"$context.responseLatency","time":"$context.requestTime"}',
@@ -390,8 +440,11 @@ class RouterStack(Stack):
                     "X-Slack-Signature HMAC, Feishu X-Lark-Signature and WhatsApp "
                     "X-Hub-Signature-256 HMAC (plus a constant-time verify-token check on "
                     "its GET subscription route), Discord X-Signature-Ed25519 and LINE "
-                    "X-Line-Signature HMAC. API Gateway throttling provides rate "
-                    "limiting. Only explicit routes are exposed.",
+                    "X-Line-Signature HMAC. API Gateway stage throttling, with "
+                    "lower per-route limits on the GET routes that need no "
+                    "signature (/health, /webhook/whatsapp subscription "
+                    "verification), provides rate limiting. Only explicit "
+                    "routes are exposed.",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-APIG1",
