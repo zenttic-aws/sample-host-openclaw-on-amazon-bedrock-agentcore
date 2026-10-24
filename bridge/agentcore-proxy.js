@@ -19,8 +19,33 @@ const systemPrefixCache = createSystemPrefixCache();
 const { buildRequestMetadata } = require("./request-metadata");
 
 const PORT = 18790;
-// The SDK snapshot owner loads this body only after installing the bound environment.
-const BOUND_ACTOR_ID = process.env.USER_ID || "";
+// Identity format allowlist — enforced as a post-condition on the bound actor.
+// Must include every channel the Router emits (telegram, slack, discord,
+// whatsapp, line, feishu). This is a shape check, not an identity source.
+const VALID_ACTOR_ID =
+  /^(telegram|slack|discord|whatsapp|line|feishu):[A-Za-z0-9_-]{1,64}$/;
+// The SDK snapshot owner loads this body only after installing the bound
+// environment. Fail closed if the loader did not bind an actor: the contract
+// server is the only legitimate source of identity for the proxy, so refuse
+// to serve requests whose tenant would otherwise be inferred from attacker-
+// controlled request data (headers, OpenAI `user`, message text).
+if (!process.env.USER_ID) {
+  console.error(
+    "[proxy] FATAL: USER_ID environment variable is not set. The proxy must " +
+      "be launched by the contract server with a bound actor; refusing to " +
+      "derive identity from request data.",
+  );
+  process.exit(1);
+}
+const BOUND_ACTOR_ID = process.env.USER_ID;
+if (!VALID_ACTOR_ID.test(BOUND_ACTOR_ID)) {
+  console.error(
+    `[proxy] FATAL: bound USER_ID "${BOUND_ACTOR_ID.slice(0, 80)}" does not ` +
+      "match the required <channel>:<id> format (channels: telegram, slack, " +
+      "discord, whatsapp, line, feishu).",
+  );
+  process.exit(1);
+}
 const AWS_REGION = process.env.AWS_REGION;
 if (!AWS_REGION) {
   console.error("[proxy] FATAL: AWS_REGION environment variable is not set.");
@@ -146,12 +171,18 @@ function sleep(ms) {
  * Returns { sessionId, actorId, channel }.
  */
 function extractSessionMetadata(parsed, headers) {
-  let actorId = "";
-  let channel = "unknown";
-  let sessionId = "";
-  let idSource = "none";
+  // Identity resolution fails closed: the proxy only serves the actor bound
+  // into its process environment by the contract server. The per-turn
+  // identity file carries delivery metadata (channel, runtime sessionId,
+  // modelOverride, trigger) but may not change the acting tenant. Request
+  // data (headers, `parsed.user`, message text) is never consulted — those
+  // channels were a known identity-spoofing vector when the proxy was
+  // launched unbound. The `parsed` and `headers` arguments are retained
+  // for signature compatibility only.
+  void parsed;
+  void headers;
 
-  if (BOUND_ACTOR_ID && process.env.USER_ID !== BOUND_ACTOR_ID) {
+  if (process.env.USER_ID !== BOUND_ACTOR_ID) {
     throw new Error("Proxy canonical actor changed");
   }
 
@@ -162,270 +193,71 @@ function extractSessionMetadata(parsed, headers) {
       fs.readFileSync("/tmp/current-identity.json", "utf-8"),
     );
   } catch (_) {
-    // File not yet written or unreadable — fall back to env vars
+    identity = null;
   }
-  if (identity?.actorId) {
-    if (BOUND_ACTOR_ID && identity.actorId !== BOUND_ACTOR_ID) {
-      throw new Error("Proxy canonical actor changed");
-    }
-    // The identity file is written by the trusted contract once per turn, but
-    // `/tmp` is world-writable inside the microVM. Treat the whole record as
-    // part of the binding: validate every sibling we forward to Bedrock
-    // `requestMetadata` against the proxy's own allowlists, and refuse any
-    // value that does not match — the same guarantee as the actorId pin.
-    const rawChannel = identity.channel == null ? "unknown" : identity.channel;
-    if (typeof rawChannel !== "string" || !VALID_CHANNELS.has(rawChannel)) {
-      throw new Error("Proxy canonical actor changed");
-    }
-    if (identity.sessionId !== undefined && identity.sessionId !== null &&
-        identity.sessionId !== "" &&
-        (typeof identity.sessionId !== "string" ||
-          !RUNTIME_SESSION_ID.test(identity.sessionId))) {
-      throw new Error("Proxy canonical actor changed");
-    }
-    if (identity.trigger !== undefined && identity.trigger !== null &&
-        identity.trigger !== "chat" && identity.trigger !== "cron") {
-      throw new Error("Proxy canonical actor changed");
-    }
-    actorId = identity.actorId;
-    channel = rawChannel;
-    idSource = "identity-file";
+  if (!identity || typeof identity !== "object" || !identity.actorId) {
+    throw new Error("Proxy identity file missing bound actor");
   }
-  const modelOverride = idSource === "identity-file" &&
-    typeof identity.modelOverride === "string" ? identity.modelOverride : null;
+  if (identity.actorId !== BOUND_ACTOR_ID) {
+    throw new Error("Proxy canonical actor changed");
+  }
+  // The identity file is written by the trusted contract once per turn, but
+  // `/tmp` is world-writable inside the microVM. Treat the whole record as
+  // part of the binding: validate every sibling we forward to Bedrock
+  // `requestMetadata` against the proxy's own allowlists, and refuse any
+  // value that does not match — the same guarantee as the actorId pin.
+  const rawChannel = identity.channel == null ? "unknown" : identity.channel;
+  if (typeof rawChannel !== "string" || !VALID_CHANNELS.has(rawChannel)) {
+    throw new Error("Proxy canonical actor changed");
+  }
+  if (identity.sessionId !== undefined && identity.sessionId !== null &&
+      identity.sessionId !== "" &&
+      (typeof identity.sessionId !== "string" ||
+        !RUNTIME_SESSION_ID.test(identity.sessionId))) {
+    throw new Error("Proxy canonical actor changed");
+  }
+  if (identity.trigger !== undefined && identity.trigger !== null &&
+      identity.trigger !== "chat" && identity.trigger !== "cron") {
+    throw new Error("Proxy canonical actor changed");
+  }
+
+  const actorId = identity.actorId;
+  // Post-condition: the bound actorId must still match the format allowlist.
+  // This is a shape check on the already-trusted bound value, not an identity
+  // source — a mismatch indicates loader/contract corruption, so refuse.
+  if (!VALID_ACTOR_ID.test(actorId)) {
+    throw new Error("Proxy bound actor failed format allowlist");
+  }
+  const channel = rawChannel;
+  const idSource = "identity-file";
+  const modelOverride = typeof identity.modelOverride === "string"
+    ? identity.modelOverride
+    : null;
   // Per-turn attribution from the contract: the turn kind and the AgentCore
   // runtime session. Only identifiers; request-metadata.js sanitises them.
-  const trigger = idSource === "identity-file" && identity.trigger === "cron" ? "cron" : "chat";
-  const runtimeSessionId = idSource === "identity-file" &&
-    typeof identity.sessionId === "string" ? identity.sessionId : "";
-  if (!actorId && process.env.USER_ID) {
-    actorId = process.env.USER_ID;
-    channel = process.env.CHANNEL || "unknown";
-    idSource = "environment";
-  }
-  if (actorId && (idSource === "identity-file" || idSource === "environment")) {
-    // Generate stable session ID for this user
-    const key = `${actorId}:${channel}`;
-    if (!sessionMap.has(key)) {
-      const ts = Date.now().toString(36);
-      const rand = osRandomUUID();
-      sessionMap.set(
-        key,
-        `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
-      );
-    }
-    sessionId = runtimeSessionId || sessionMap.get(key);
-    return { sessionId, actorId, channel, idSource, modelOverride, trigger };
-  }
+  const trigger = identity.trigger === "cron" ? "cron" : "chat";
+  const runtimeSessionId = typeof identity.sessionId === "string"
+    ? identity.sessionId
+    : "";
 
-  // 1. Check custom headers (future: OpenClaw might set these)
-  actorId = headers["x-openclaw-actor-id"] || "";
-  channel = headers["x-openclaw-channel"] || "unknown";
-  sessionId = headers["x-openclaw-session-id"] || "";
-  if (actorId) idSource = "header";
-
-  // 2. Check OpenAI 'user' field (OpenClaw may populate this)
-  if (!actorId && parsed.user) {
-    actorId = parsed.user;
-    idSource = "openai-user-field";
-  }
-
-  // Helper: extract text content from string or array (multimodal) format
-  function getTextContent(content) {
-    if (typeof content === "string") return content;
-    if (Array.isArray(content)) {
-      const textPart = content.find((p) => p.type === "text" && p.text);
-      return textPart ? textPart.text : "";
-    }
-    return "";
-  }
-
-  // 3. Extract from message envelope headers
-  // OpenClaw wraps user messages with channel-specific prefixes. Three known formats:
-  //
-  // Format C (metadata JSON — checked FIRST, highest priority):
-  //   Conversation info (untrusted metadata):
-  //   ```json
-  //   { "message_id": "542", "sender": "123456789" }
-  //   ```
-  //   NOT anchored — OpenClaw may PREPEND a Slack "System: [...]" line before
-  //   the metadata block. Used by ALL channels. Contains the platform user ID
-  //   (Telegram numeric, Slack U-prefixed, Discord snowflake) which is the
-  //   most stable identifier for namespacing.
-  //
-  // Format A (fallback — display-name-based):
-  //   System: [2026-02-22 11:16:42 UTC] Slack DM from Sen-Outlook: message
-  //   Pattern: System: [TIMESTAMP] CHANNEL TYPE from SENDER: message
-  //   Uses display names which can change — only used when Format C is absent.
-  //
-  // Format B (legacy, hypothetical):
-  //   [Telegram John Doe id:12345 timestamp] message
-  //
-  // IMPORTANT: Iterate in REVERSE (most recent message first) to prevent
-  // cross-channel identity leakage from older messages in the conversation.
-  // A single message can contain both a Slack "System:" prefix and Telegram
-  // metadata when OpenClaw merges cross-channel context — Format C's sender
-  // ID pattern detection resolves the actual channel correctly.
-  if (!actorId && parsed.messages) {
-    for (let i = parsed.messages.length - 1; i >= 0; i--) {
-      const msg = parsed.messages[i];
-      if (msg.role !== "user") continue;
-      const text = getTextContent(msg.content);
-      if (!text) continue;
-
-      // Format C: Metadata JSON block (all channels)
-      // Checked FIRST — contains platform user IDs (stable, unique).
-      // NOT anchored — OpenClaw may prepend "System: [...] Slack message edited..."
-      const formatC = text.match(
-        /Conversation info \(untrusted metadata\):\s*```json\s*(\{[\s\S]*?\})\s*```/,
-      );
-      if (formatC) {
-        try {
-          const meta = JSON.parse(formatC[1]);
-          if (meta.sender) {
-            const senderId = String(meta.sender)
-              .replace(/[^a-zA-Z0-9_-]/g, "")
-              .slice(0, 64);
-            // Determine channel from sender ID format:
-            //   meta.channel field (most authoritative if present)
-            //   /^[UW][A-Z0-9]{8,}/i → Slack user ID (e.g., U0XXXXXXXX1)
-            //   /^\d{15,}/ → Discord snowflake ID
-            //   /^\d{5,14}/ → Telegram numeric ID
-            let channelName = "";
-            if (meta.channel) {
-              channelName = String(meta.channel)
-                .toLowerCase()
-                .replace(/[^a-z]/g, "");
-            }
-            if (!channelName) {
-              if (/^[UW][A-Z0-9]{8,}$/i.test(senderId)) {
-                channelName = "slack";
-              } else if (/^\d{15,}$/.test(senderId)) {
-                channelName = "discord";
-              } else if (/^\d{5,14}$/.test(senderId)) {
-                channelName = "telegram";
-              }
-            }
-            if (!channelName) channelName = "telegram"; // safe fallback for numeric IDs
-            actorId = `${channelName}:${senderId}`;
-            channel = channelName;
-            idSource = "metadata-json";
-            break;
-          }
-        } catch {
-          // JSON parse failed, fall through to other formats
-        }
-      }
-
-      // Format A: "System: [TIMESTAMP] Channel TYPE from SenderName: message"
-      // Fallback — uses display names (can change). Only reached when Format C
-      // is absent from the message.
-      const formatA = text.match(
-        /System:\s*\[[^\]]+\]\s*(Slack|Telegram|Discord|WhatsApp)\s+\S+\s+from\s+([^:]+):/i,
-      );
-      if (formatA) {
-        const channelName = formatA[1].toLowerCase();
-        const senderName = formatA[2].trim();
-        if (senderName) {
-          const sanitizedName = senderName
-            .toLowerCase()
-            .replace(/[^a-z0-9_-]/g, "_")
-            .slice(0, 64);
-          actorId = `${channelName}:${sanitizedName}`;
-          channel = channelName;
-          idSource = "envelope-formatA";
-        }
-        break;
-      }
-
-      // Format B: "[Channel ... id:IDENTIFIER ...]"
-      const formatB = text.match(
-        /^\[(Slack|Telegram|Discord|WhatsApp)\s+[^\]]*?\bid:(\S+)/i,
-      );
-      if (formatB) {
-        const channelName = formatB[1].toLowerCase();
-        const rawId = formatB[2]
-          .replace(/\)$/, "")
-          .replace(/[^a-zA-Z0-9_-]/g, "")
-          .slice(0, 64);
-        if (rawId) {
-          actorId = `${channelName}:${rawId}`;
-          channel = channelName;
-          idSource = "envelope-formatB";
-        }
-        break;
-      }
-    }
-  }
-
-  // 4. Extract from message name fields (if OpenClaw sets them)
-  if (!actorId && parsed.messages) {
-    const userMsg = parsed.messages.find((m) => m.role === "user" && m.name);
-    if (userMsg && userMsg.name) {
-      actorId = userMsg.name;
-      idSource = "message-name";
-    }
-  }
-
-  // 5. Fallback to default (with warning)
-  if (!actorId) {
-    actorId = "default-user";
-    idSource = "fallback";
-    console.warn(
-      "[proxy] WARNING: No user identity found in request — using default-user fallback. " +
-        "All users share the same S3 namespace.",
+  // Generate (or reuse) a stable per-user session ID. AgentCore requires
+  // sessionId length >= 33 characters.
+  const key = `${actorId}:${channel}`;
+  if (!sessionMap.has(key)) {
+    const ts = Date.now().toString(36);
+    const rand = osRandomUUID();
+    sessionMap.set(
+      key,
+      `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
     );
   }
+  const sessionId = runtimeSessionId || sessionMap.get(key);
 
-  // 5b. Validate actorId format to prevent prompt injection.
-  // Only allow channel:alphanumeric patterns or known fallback values. The
-  // body is capped at 37 characters so the derived namespace
-  // (actorId.replace(':', '_')) stays within 46 characters — the maximum
-  // width that fits inside EventBridge schedule names without truncation
-  // (see bridge/skills/eventbridge-cron/common.js buildScheduleName).
-  const VALID_ACTOR_ID =
-    /^(telegram|slack|discord|whatsapp|line):[A-Za-z0-9_-]{1,37}$/;
-  if (actorId !== "default-user" && !VALID_ACTOR_ID.test(actorId)) {
-    console.warn(
-      `[proxy] WARNING: actorId "${actorId.slice(0, 80)}" failed validation — falling back to default-user.`,
-    );
-    actorId = "default-user";
-    idSource = "fallback-invalid";
-  }
-
-  // Diagnostic: log the first user message prefix to verify envelope format
-  if (parsed.messages) {
-    const firstUserMsg = parsed.messages.find(
-      (m) => m.role === "user" && typeof m.content === "string",
-    );
-    if (firstUserMsg) {
-      // Only log the envelope prefix (up to closing bracket), never full message content
-      const bracketEnd = firstUserMsg.content.indexOf("]");
-      const prefix =
-        bracketEnd > 0
-          ? firstUserMsg.content.slice(0, bracketEnd + 1)
-          : firstUserMsg.content.slice(0, 60);
-    }
-  }
   console.log(
     `[proxy][identity] actorId=${actorId}, channel=${channel}, source=${idSource}`,
   );
 
-  // 6. Generate stable session ID (AgentCore requires min 33 chars)
-  if (!sessionId) {
-    const key = `${actorId}:${channel}`;
-    if (!sessionMap.has(key)) {
-      const ts = Date.now().toString(36);
-      const rand = osRandomUUID();
-      sessionMap.set(
-        key,
-        `ses-${ts}-${rand}-${crypto.createHash("md5").update(key).digest("hex").slice(0, 8)}`,
-      );
-    }
-    sessionId = sessionMap.get(key);
-  }
-
-  return { sessionId, actorId, channel, idSource, trigger: "chat" };
+  return { sessionId, actorId, channel, idSource, modelOverride, trigger };
 }
 
 // Per-user Cognito ID tokens (user provisioning, HMAC-derived password,
@@ -446,9 +278,9 @@ const cognitoTokens = require("./cognito-token").createCognitoTokenProvider({
   region: AWS_REGION,
   log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[proxy] Cognito")),
 });
-const proxyAuthPrepare = BOUND_ACTOR_ID ? createProxyAuthChild({
+const proxyAuthPrepare = createProxyAuthChild({
   channel: process, tokenProvider: cognitoTokens, boundActor: BOUND_ACTOR_ID,
-}) : cognitoTokens;
+});
 
 // Lazily initialized S3 client
 let _s3Client = null;
