@@ -19,7 +19,14 @@ from stacks import DeploymentNamer, retention_days
 
 
 class SecurityStack(Stack):
-    def __init__(self, scope: Construct, construct_id: str, **kwargs) -> None:
+    def __init__(
+        self,
+        scope: Construct,
+        construct_id: str,
+        *,
+        user_files_bucket_arn: str = "",
+        **kwargs,
+    ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
         namer = DeploymentNamer.from_scope(self)
@@ -99,10 +106,12 @@ class SecurityStack(Stack):
 
         # --- CloudTrail (optional, off by default) -------------------------
         # Most AWS accounts already have an organization-level or account-level
-        # CloudTrail. Deploying a second trail adds cost (S3 storage + log
-        # delivery) with no additional security benefit. Enable via cdk.json
-        # context: "enable_cloudtrail": true
-        enable_cloudtrail = self.node.try_get_context("enable_cloudtrail") or False
+        # CloudTrail, and an account can hold only a few trails per region, so
+        # the dedicated trail stays opt-in: "enable_cloudtrail": true in
+        # cdk.json. When enabled it is multi-region and also records S3 data
+        # events on the user-files bucket, whose per-user namespace boundary is
+        # enforced in application code.
+        enable_cloudtrail = bool(self.node.try_get_context("enable_cloudtrail") or False)
         self.trail = None
         trail_bucket = None
 
@@ -122,7 +131,7 @@ class SecurityStack(Stack):
                 self,
                 "CloudTrailLogGroup",
                 retention=retention_days(log_retention),
-                removal_policy=RemovalPolicy.DESTROY,
+                removal_policy=RemovalPolicy.RETAIN,
             )
 
             self.trail = cloudtrail.Trail(
@@ -131,10 +140,34 @@ class SecurityStack(Stack):
                 bucket=trail_bucket,
                 send_to_cloud_watch_logs=True,
                 cloud_watch_log_group=trail_log_group,
-                is_multi_region_trail=False,
+                # Multi-region so sts:AssumeRole / Secrets Manager / KMS calls
+                # made from any region (e.g. global endpoints) are captured.
+                is_multi_region_trail=True,
                 include_global_service_events=True,
                 enable_file_validation=True,
             )
+
+            # S3 data events for the multi-tenant user-files bucket. Object-
+            # level reads/writes across namespaces are only visible through
+            # these selectors; without them the trail records only management
+            # events, which is what the user-files bucket's AwsSolutions-S1
+            # suppression already assumes exists.
+            if not user_files_bucket_arn:
+                # Same name the AgentCore stack gives the bucket. Built from
+                # this stack's account/region so it also resolves when the CDK
+                # environment is not set at synth time.
+                user_files_bucket_arn = "arn:aws:s3:::" + namer.name(
+                    f"openclaw-user-files-{self.account}-{self.region}"
+                )
+            if user_files_bucket_arn:
+                user_files_bucket = s3.Bucket.from_bucket_arn(
+                    self, "UserFilesBucketRefForTrail", user_files_bucket_arn,
+                )
+                self.trail.add_s3_event_selector(
+                    [cloudtrail.S3EventSelector(bucket=user_files_bucket)],
+                    read_write_type=cloudtrail.ReadWriteType.ALL,
+                    include_management_events=True,
+                )
 
         # --- Cognito User Pool (admin-provisioned identities) ---------------
         # NOTE on password_policy: this pool exposes only the IAM-gated
