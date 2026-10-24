@@ -79,11 +79,14 @@ try {
   }
   if (disabled.length > 0) {
     console.log(
-      `\nQuarantined after repeated reinstall failures (${disabled.length}) — these entries are skipped on cold start so one unresolvable slug cannot block activation. Reinstall the skill with 'install <slug>' to try again:\n`,
+      `\nQuarantined (${disabled.length}) — these entries are skipped on cold start so one unresolvable or changed skill cannot block activation. Reinstall the skill with 'install <slug>' to try again:\n`,
     );
     for (const skill of disabled) {
-      const v = persisted[skill].version;
-      console.log(`  - ${skill}${v ? ` (v${v})` : ""}`);
+      const { version: v, disabledReason } = persisted[skill];
+      const why = disabledReason === "integrity"
+        ? "reinstalled files did not match the ones originally installed"
+        : "repeated reinstall failures";
+      console.log(`  - ${skill}${v ? ` (v${v})` : ""}: ${why}`);
     }
   }
   if (manifest.corrupt) {

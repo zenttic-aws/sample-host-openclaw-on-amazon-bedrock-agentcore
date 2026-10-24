@@ -5,10 +5,11 @@
  *
  * The skill is downloaded into /skills (where OpenClaw scans for skills and
  * where it can resolve /app/node_modules) and recorded, with its pinned
- * version, in the per-user manifest ~/.openclaw/runtime-skills.json. That
- * manifest is part of the state that survives a microVM cold start, and the
+ * version and a sha256 digest of the installed files, in the per-user
+ * manifest ~/.openclaw/runtime-skills.json. That manifest is part of the state that survives a microVM cold start, and the
  * bridge reinstalls every skill in it in the background shortly after a new
- * session starts — /skills itself is not persisted.
+ * session starts — /skills itself is not persisted. The reinstall refuses
+ * files that do not match the recorded digest.
  *
  * No `--force`: clawhub uses that flag to bypass its "flagged for security
  * review" check in non-interactive mode. A flagged skill therefore fails here
@@ -58,6 +59,7 @@ if (runtimeSkills.isSkillPresent(skillName)) {
 }
 
 let installedVersion = null;
+let installedIntegrity = null;
 try {
   const output = execFileSync("clawhub", runtimeSkills.installArgs(skillName), {
     encoding: "utf-8",
@@ -69,6 +71,7 @@ try {
     throw new Error(`clawhub reported success but ${runtimeSkills.SKILLS_DIR}/${skillName}/SKILL.md is missing`);
   }
   installedVersion = runtimeSkills.readInstalledVersion(skillName);
+  installedIntegrity = runtimeSkills.computeSkillIntegrity(skillName);
   console.log(`Successfully installed skill: ${skillName}${installedVersion ? ` (v${installedVersion})` : ""}`);
   if (output.trim()) console.log(output.trim());
 } catch (err) {
@@ -90,12 +93,24 @@ try {
 // failure must not be reported as an install failure — the skill IS on disk —
 // but the user needs to know it will not persist.
 try {
-  runtimeSkills.recordInstall(manifestFile, skillName, installedVersion);
+  runtimeSkills.recordInstall(manifestFile, skillName, installedVersion, { integrity: installedIntegrity });
   runtimeSkills.mirrorManifest(manifestFile);
   console.log(
     "\nOpenClaw loads the skill when it next refreshes its skill list (on file change, or at the latest " +
       "at the next session start). It is reinstalled automatically a few seconds after each new session starts.",
   );
+  if (!installedVersion) {
+    console.log(
+      "Note: ClawHub reported no release version for this skill, so new sessions reinstall its current " +
+        "release. If that release's files differ from the ones installed now, the skill is not loaded and " +
+        "list_skills shows it as quarantined; install it again to accept the new files.",
+    );
+  }
+  if (!installedIntegrity) {
+    console.log(
+      "Note: could not compute a digest of the installed files; it is recorded at the next reinstall instead.",
+    );
+  }
 } catch (err) {
   console.error(
     `Warning: installed, but could not record "${skillName}" for reinstall on new sessions (${err.message}). ` +

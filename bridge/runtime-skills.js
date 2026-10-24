@@ -11,10 +11,11 @@
  * the next cold start.
  *
  * Fix: keep a small per-user manifest of runtime installs (slug + pinned
- * version) INSIDE the state that already survives a cold start
- * (~/.openclaw/runtime-skills.json, mirrored to /mnt/workspace/.openclaw by
- * state-storage.js and backed up to S3 by workspace-sync.js) and reinstall
- * from it in the background once the gateway is ready.
+ * version + sha256 digest of the installed files) INSIDE the state that
+ * already survives a cold start (~/.openclaw/runtime-skills.json, mirrored
+ * to /mnt/workspace/.openclaw by state-storage.js and backed up to S3 by
+ * workspace-sync.js) and reinstall from it in the background once the
+ * gateway is ready.
  *
  * Shared by the skill scripts (install/uninstall/list, which write the
  * manifest) and agentcore-contract.js (which reinstalls from it). No npm
@@ -24,6 +25,7 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const crypto = require("crypto");
 const { execFile } = require("child_process");
 
 /** Where ClawHub installs skills and where OpenClaw looks for them. */
@@ -48,6 +50,14 @@ const REINSTALL_TIMEOUT_MS = 90_000;
  * `clawhub install` through clawhub-manage.
  */
 const MAX_CONSECUTIVE_FAILURES = 3;
+
+/**
+ * Why an entry was disabled. `failures`: MAX_CONSECUTIVE_FAILURES reinstall
+ * failures in a row. `integrity`: the reinstalled files did not match the
+ * digest recorded at install time (retrying would fetch the same files, so
+ * the entry is disabled at once).
+ */
+const DISABLED_REASONS = new Set(["failures", "integrity"]);
 
 // ClawHub slugs: lowercase letters, digits and hyphens, must start with a
 // letter (clawhub's own sanitizeSlug lowercases and strips anything else).
@@ -132,6 +142,63 @@ function isValidVersion(version) {
   return typeof version === "string" && version.length <= 64 && VERSION_RE.test(version);
 }
 
+// Integrity digest recorded per manifest entry: sha256 of the installed skill
+// tree (see computeSkillIntegrity). Validated on read/write.
+const INTEGRITY_RE = /^sha256:[0-9a-f]{64}$/;
+
+function isValidIntegrity(value) {
+  return typeof value === "string" && INTEGRITY_RE.test(value);
+}
+
+// Top-level directories inside <skillsDir>/<slug> left out of the digest:
+// clawhub writes install metadata there (install timestamp, registry cache)
+// that differs between two installs of the same version.
+const INTEGRITY_EXCLUDE_DIRS = new Set([".clawhub", ".clawdhub"]);
+
+/**
+ * sha256 of the skill tree at `<skillsDir>/<slug>`, as `"sha256:<hex>"`, or
+ * null when the directory is missing or any part of it cannot be read.
+ * Covers each entry's relative POSIX path in sorted order, regular file
+ * sizes and contents, and symlink targets (links are not followed).
+ */
+function computeSkillIntegrity(slug, skillsDir = SKILLS_DIR) {
+  if (!isValidSlug(slug)) return null;
+  const root = path.join(skillsDir, slug);
+  try {
+    if (!fs.lstatSync(root).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const hash = crypto.createHash("sha256");
+  const walk = (rel) => {
+    const abs = rel ? path.join(root, rel) : root;
+    for (const name of fs.readdirSync(abs).sort()) {
+      if (!rel && INTEGRITY_EXCLUDE_DIRS.has(name)) continue;
+      const childRel = rel ? `${rel}/${name}` : name;
+      const st = fs.lstatSync(path.join(abs, name));
+      if (st.isDirectory()) {
+        hash.update(`D\0${childRel}\0`);
+        walk(childRel);
+      } else if (st.isSymbolicLink()) {
+        hash.update(`L\0${childRel}\0${fs.readlinkSync(path.join(abs, name))}\0`);
+      } else if (st.isFile()) {
+        const content = fs.readFileSync(path.join(abs, name));
+        hash.update(`F\0${childRel}\0${content.length}\0`);
+        hash.update(content);
+        hash.update("\0");
+      } else {
+        hash.update(`X\0${childRel}\0${st.mode}\0`);
+      }
+    }
+  };
+  try {
+    walk("");
+  } catch {
+    return null;
+  }
+  return `sha256:${hash.digest("hex")}`;
+}
+
 /** The OpenClaw state dir as the gateway (and its exec children) see it. */
 function resolveStateDir(env = process.env) {
   const explicit = (env.OPENCLAW_STATE_DIR || "").trim();
@@ -158,7 +225,10 @@ function emptyManifest() {
  * MAX_CONSECUTIVE_FAILURES / reinstallFromManifest below). The optional
  * provenance fields (`installedBy`, `installedSession`) are informational.
  *
- * @returns {{ version: number, skills: Record<string, {version: string|null, installedAt?: string, installedBy?: string, installedSession?: string, failures?: number, disabled?: boolean}>, corrupt: boolean, invalid: number }}
+ * `integrity` (sha256 of the installed files) is optional: entries written
+ * before it existed have none and are hashed on their next reinstall.
+ *
+ * @returns {{ version: number, skills: Record<string, {version: string|null, integrity?: string, installedAt?: string, installedBy?: string, installedSession?: string, failures?: number, disabled?: boolean, disabledReason?: string}>, corrupt: boolean, invalid: number }}
  */
 function readManifest(file = manifestPath(), { log = console } = {}) {
   const result = { ...emptyManifest(), corrupt: false, invalid: 0 };
@@ -197,15 +267,23 @@ function readManifest(file = manifestPath(), { log = console } = {}) {
       log.warn(`[runtime-skills] Dropping manifest entry ${slug}: invalid version ${JSON.stringify(version)}`);
       continue;
     }
+    const integrity = entry && typeof entry === "object" ? entry.integrity : undefined;
+    if (integrity !== null && integrity !== undefined && !isValidIntegrity(integrity)) {
+      result.invalid++;
+      log.warn(`[runtime-skills] Dropping manifest entry ${slug}: invalid integrity value`);
+      continue;
+    }
     const failures = entry && typeof entry === "object" && Number.isInteger(entry.failures) && entry.failures > 0
       ? entry.failures
       : 0;
     const disabled = !!(entry && typeof entry === "object" && entry.disabled === true);
     const normalized = {
       version: isValidVersion(version) ? version : null,
+      ...(isValidIntegrity(integrity) ? { integrity } : {}),
       ...(failures > 0 ? { failures } : {}),
       ...(disabled ? { disabled: true } : {}),
     };
+    if (disabled && DISABLED_REASONS.has(entry.disabledReason)) normalized.disabledReason = entry.disabledReason;
     if (entry && typeof entry.installedAt === "string") normalized.installedAt = entry.installedAt;
     if (entry && typeof entry.installedBy === "string" && entry.installedBy.length <= 256) {
       normalized.installedBy = entry.installedBy;
@@ -227,9 +305,13 @@ function writeManifest(file, manifest) {
     const failures = Number.isInteger(entry?.failures) && entry.failures > 0 ? entry.failures : 0;
     const persisted = {
       version: isValidVersion(entry?.version) ? entry.version : null,
+      ...(isValidIntegrity(entry?.integrity) ? { integrity: entry.integrity } : {}),
       ...(failures > 0 ? { failures } : {}),
       ...(entry?.disabled === true ? { disabled: true } : {}),
     };
+    if (entry?.disabled === true && DISABLED_REASONS.has(entry?.disabledReason)) {
+      persisted.disabledReason = entry.disabledReason;
+    }
     if (entry?.installedAt) persisted.installedAt = entry.installedAt;
     if (typeof entry?.installedBy === "string" && entry.installedBy.length <= 256) {
       persisted.installedBy = entry.installedBy;
@@ -269,8 +351,11 @@ function mirrorManifest(file, mountStateDir = DEFAULT_MOUNT_STATE_DIR, { log = c
 }
 
 /**
- * Record a runtime install. `version` may be null (unpinned: latest on
- * reinstall). Captures install provenance (`installedAt`, `installedBy`,
+ * Record a runtime install. `version` may be null when clawhub recorded no
+ * semver (e.g. a git-backed install); the reinstall then cannot pin a
+ * version, but `opts.integrity` (sha256 of the installed files, see
+ * computeSkillIntegrity) still makes it refuse files that differ from the
+ * ones installed now. Captures install provenance (`installedAt`, `installedBy`,
  * `installedSession`) so list.js can show who/when/which session added a
  * slug and a reviewer can tell a user-driven install apart from a
  * manifest poisoned by a prompt-injected turn. Provenance is informational
@@ -284,6 +369,7 @@ function recordInstall(file, slug, version, opts = {}) {
   const env = opts.env || process.env;
   const entry = {
     version: isValidVersion(version) ? version : null,
+    ...(isValidIntegrity(opts.integrity) ? { integrity: opts.integrity } : {}),
     installedAt: new Date().toISOString(),
     // A fresh install clears any previous quarantine / failure streak so the
     // cold-start reinstall will try this slug again on the next session.
@@ -482,6 +568,18 @@ function runClawhub(args, { timeoutMs = REINSTALL_TIMEOUT_MS, env = clawhubEnv()
  *     counters. `recordInstall` from the clawhub-manage skill also clears
  *     them, so the user can re-enable a quarantined skill by reinstalling.
  *
+ * Version pinning and integrity:
+ *   - An entry with a recorded `integrity` digest is re-hashed after the
+ *     reinstall. On a mismatch the reinstalled directory is removed (this
+ *     runs before the gateway starts, so OpenClaw never loads it) and the
+ *     entry is quarantined straight away with `disabledReason: "integrity"`.
+ *   - An entry without a digest (written before digests were recorded) is
+ *     reinstalled as before and its digest is recorded now, so later cold
+ *     starts verify it. An entry without a pinned version also gets the
+ *     version clawhub reports for the reinstalled files, so it stops
+ *     following the registry's latest release. Neither case blocks the
+ *     user's existing skills.
+ *
  * Returns a summary suitable for logging; `failed` / `corrupt` / `invalid`
  * remain informational only — callers must not treat them as fatal.
  *
@@ -491,7 +589,7 @@ function runClawhub(args, { timeoutMs = REINSTALL_TIMEOUT_MS, env = clawhubEnv()
  * @param {(args: string[]) => Promise<{stdout: string, stderr: string}>} [opts.run]  injected for tests
  * @param {object} [opts.log]
  * @param {number} [opts.maxConsecutiveFailures]
- * @returns {Promise<{ total: number, reinstalled: number, present: number, failed: number, quarantined: number, skipped: number, corrupt: boolean, invalid: number, results: Array<{slug: string, version: string|null, status: string, error?: string}> }>}
+ * @returns {Promise<{ total: number, reinstalled: number, present: number, failed: number, quarantined: number, skipped: number, corrupt: boolean, invalid: number, migrated: number, results: Array<{slug: string, version: string|null, status: string, error?: string}> }>}
  */
 async function reinstallFromManifest({
   manifestFile = manifestPath(),
@@ -503,7 +601,7 @@ async function reinstallFromManifest({
 } = {}) {
   const summary = {
     total: 0, reinstalled: 0, present: 0, failed: 0, quarantined: 0, skipped: 0,
-    corrupt: false, invalid: 0, refused: 0, results: [],
+    corrupt: false, invalid: 0, refused: 0, migrated: 0, results: [],
   };
   let manifest;
   try {
@@ -586,8 +684,45 @@ async function reinstallFromManifest({
       if (!isSkillPresent(slug, skillsDir)) {
         throw new Error(`clawhub exited 0 but ${path.join(skillsDir, slug, "SKILL.md")} is missing`);
       }
+      const actualIntegrity = computeSkillIntegrity(slug, skillsDir);
+      if (entry.integrity) {
+        if (actualIntegrity !== entry.integrity) {
+          try {
+            fs.rmSync(path.join(skillsDir, slug), { recursive: true, force: true });
+          } catch (rmErr) {
+            log.warn(`[runtime-skills] Could not remove ${slug} after an integrity mismatch: ${rmErr.message}`);
+          }
+          entry.failures = (entry.failures || 0) + 1;
+          entry.disabled = true;
+          entry.disabledReason = "integrity";
+          manifestDirty = true;
+          summary.quarantined++;
+          const msg = `reinstalled files do not match the digest recorded at install time (expected ${entry.integrity}, got ${actualIntegrity || "unreadable"})`;
+          summary.results.push({ slug, version, status: "quarantined", error: msg });
+          log.warn(`[runtime-skills] Quarantining ${slug}${version ? `@${version}` : ""}: ${msg}`);
+          continue;
+        }
+      } else {
+        // Entry written before digests were recorded: record one now, and pin
+        // the version clawhub resolved if none was recorded.
+        const recorded = [];
+        if (actualIntegrity) {
+          entry.integrity = actualIntegrity;
+          recorded.push("integrity digest");
+        }
+        const resolved = version ? null : readInstalledVersion(slug, skillsDir);
+        if (resolved) {
+          entry.version = resolved;
+          recorded.push(`version ${resolved}`);
+        }
+        if (recorded.length) {
+          manifestDirty = true;
+          summary.migrated++;
+          log.log(`[runtime-skills] Recorded ${recorded.join(" and ")} for ${slug}`);
+        }
+      }
       summary.reinstalled++;
-      summary.results.push({ slug, version, status: "reinstalled" });
+      summary.results.push({ slug, version: entry.version || null, status: "reinstalled" });
       const prov = entry.installedBy
         ? ` (installedBy=${entry.installedBy}${entry.installedAt ? ` at ${entry.installedAt}` : ""})`
         : " (no provenance recorded)";
@@ -602,6 +737,7 @@ async function reinstallFromManifest({
       if (nextFailures >= maxConsecutiveFailures) {
         entry.failures = nextFailures;
         entry.disabled = true;
+        entry.disabledReason = "failures";
         manifestDirty = true;
         summary.quarantined++;
         summary.results.push({ slug, version, status: "quarantined", error: detail });
@@ -632,6 +768,8 @@ module.exports = {
   REINSTALL_TIMEOUT_MS,
   MAX_CONSECUTIVE_FAILURES,
   ALLOWLIST_ENV,
+  isValidIntegrity,
+  computeSkillIntegrity,
   parseAllowlist,
   isAllowed,
   validateSkillName,
