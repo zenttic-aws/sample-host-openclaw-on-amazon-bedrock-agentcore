@@ -264,12 +264,13 @@ V2 uses the ports, proxy and OpenClaw `2026.9.5` shown below, with the readiness
   USER_ID env var set by contract server (e.g. "telegram:123456789")
          |
          v
-  derivePassword(actorId) = HMAC-SHA256(secret, actorId).slice(0, 32)
+  Cognito AdminGetUser (check if exists)
          |
-         +-- Cognito AdminGetUser (check if exists)
-         |      |
-         |      +-- Not found: AdminCreateUser + AdminSetUserPassword
-         |      +-- Found: continue
+         +-- Not found: claim a random password in Secrets Manager
+         |      (openclaw/cognito-user/<poolId>/<namespace>), then
+         |      AdminCreateUser + AdminSetUserPassword
+         +-- Found, secret stored: use the stored password
+         +-- Found, no secret (older user): claim one, AdminSetUserPassword
          |
          v
   AdminInitiateAuth (ADMIN_USER_PASSWORD_AUTH)
@@ -289,8 +290,8 @@ Authorized links retain the canonical V2 actor and route. A second channel must 
   User on Telegram: "link"
          |
          v
-  Router Lambda generates 8-char bind code
-  Stores in DynamoDB: BIND#A1B2C3D4 -> userId (10 min TTL)
+  Router Lambda generates a CSPRNG bind code (20-char base32, ~100 bits)
+  Stores in DynamoDB: BIND#<code> -> userId (10 min TTL)
          |
          v
   Bot replies: "Your link code is A1B2C3D4 (valid 10 min)"

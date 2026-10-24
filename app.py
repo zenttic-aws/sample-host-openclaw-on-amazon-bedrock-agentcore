@@ -42,21 +42,7 @@ env = cdk.Environment(
 # --- Foundation ---
 vpc_stack = VpcStack(app, namer.stack("OpenClawVpc"), env=env)
 
-# Deterministic ARN for the user-files bucket (owned by OpenClawAgentCore).
-# Computed here so the dedicated CloudTrail in OpenClawSecurity can select S3
-# data events on it without a cross-stack reference that would reverse the
-# existing Security -> AgentCore dependency.
-_cdk_account = app.node.try_get_context("account") or os.environ.get("CDK_DEFAULT_ACCOUNT", "")
-_cdk_region = app.node.try_get_context("region") or os.environ.get("CDK_DEFAULT_REGION", "")
-_user_files_bucket_name = namer.name(f"openclaw-user-files-{_cdk_account}-{_cdk_region}")
-_user_files_bucket_arn = f"arn:aws:s3:::{_user_files_bucket_name}"
-
-security_stack = SecurityStack(
-    app,
-    namer.stack("OpenClawSecurity"),
-    user_files_bucket_arn=_user_files_bucket_arn,
-    env=env,
-)
+security_stack = SecurityStack(app, namer.stack("OpenClawSecurity"), env=env)
 
 # --- Guardrails (Bedrock content filtering — opt-in via enable_guardrails) ---
 guardrails_stack = GuardrailsStack(

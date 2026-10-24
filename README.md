@@ -316,7 +316,7 @@ All tunable parameters are in `cdk.json`:
 | `cron_lambda_timeout_seconds` | `900` | Cron executor Lambda timeout (must exceed warmup time) |
 | `cron_async` | `true` | Run scheduled turns through the `openclaw-cron-runner` state machine, so a brief can run past the Lambda's 900 s limit (45 min job budget). `false` restores the synchronous path in one Cron stack deploy; schedules are unchanged either way. See [Async scheduled turns](docs/how-it-works.md#async-scheduled-turns) |
 | `cron_lambda_memory_mb` | `256` | Cron executor Lambda memory |
-| `enable_cloudtrail` | `true` | Deploy a dedicated multi-region CloudTrail trail with S3 data events on the user-files bucket. Set to `false` if your account is already covered by an organization or account trail that captures the same events (avoids the duplicate S3 bucket + trail cost) |
+| `enable_cloudtrail` | `false` | Deploy a dedicated multi-region CloudTrail trail that also records S3 data events on the user-files bucket. Off by default — most accounts already have one. Enabling creates an S3 bucket + trail (additional cost, including per-event data-event charges) |
 | `cron_lead_time_minutes` | `5` | Minutes before schedule time to start warmup |
 | `enable_guardrails` | `true` | Deploy Bedrock Guardrails for content filtering. See the [disable procedure](docs/guardrails.md#disable) before changing shared resources |
 | `guardrails_content_filter_level` | `HIGH` | Not read by the stack: filter strengths are set per category in `stacks/guardrails_stack.py` (`PROMPT_ATTACK` input `HIGH`, `INSULTS` input `MEDIUM`, the rest `HIGH`) |
@@ -533,7 +533,7 @@ This solution applies **defense-in-depth** across network, application, identity
 - **Per-user isolation**: Each user runs in their own AgentCore microVM with dedicated S3 namespace
 - **STS session-scoped credentials**: Container assumes its own role with a session policy restricting S3 and DynamoDB to the user's namespace/records — prevents cross-user data access even through shell tools
 - **Encryption**: All data encrypted at rest with customer-managed KMS key (S3, DynamoDB, SNS, Secrets Manager) and in transit (TLS)
-- **CloudTrail**: Dedicated multi-region trail with S3 data events on the user-files bucket (`enable_cloudtrail` in cdk.json, on by default). Set to `false` if your account already has an organization or account-level trail covering the same events.
+- **CloudTrail**: Optional dedicated multi-region trail with S3 data events on the user-files bucket (`enable_cloudtrail` in cdk.json). Off by default — most AWS accounts already have an organization or account-level trail; if yours does, add an S3 data-event selector for the user-files bucket there to get object-level history
 - **Least-privilege IAM**: Tightly scoped permissions per component
 - **Bedrock Guardrails**: Content filtering on every Bedrock API call — content filters (hate, violence, prompt attacks), topic denial (6 categories), PII redaction, word filters, and custom regex for credential patterns. Opt-out via `enable_guardrails: false` in `cdk.json`. Known limitations (ordinary scheduled-task prompts blocked as prompt attacks, version pinning): see [Guardrails known limitations](#guardrails-known-limitations)
 - **Tool hardening**: OpenClaw `read` tool denied to prevent credential access via `/proc` and local file reads; OpenClaw's channel-delivery tools (`message`, `conversations_send`, `conversations_turn`) denied because OpenClaw has no bot tokens and replies are delivered by the Router/Cron Lambda; `exec` allowed for skill management (scoped STS credentials limit blast radius); proxy bound to loopback only; security group egress restricted to HTTPS
@@ -580,7 +580,7 @@ The guardrail is applied only when the AgentCore Runtime role has `bedrock:Apply
 cdk destroy --all
 ```
 
-Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool and the DynamoDB identity and token-usage tables have `RETAIN` removal policies and will not be deleted automatically. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`; likewise `OpenClawBuild` only with `-c enable_codebuild=true`.
+Note: The SDK-managed AgentCore Runtime and its release endpoints are outside CDK teardown; retain manifests and reconcile active sessions before retiring them. KMS keys, the Cognito User Pool, the DynamoDB identity and token-usage tables and the CloudWatch log groups (`/openclaw/*`, `/aws/bedrock/invocation-logs` and the VPC flow log and CloudTrail groups) have `RETAIN` removal policies and will not be deleted automatically. Delete the named log groups before deploying again into the same account and region, or the deploy fails because they already exist. Remove them manually if needed; the DynamoDB tables also have deletion protection, which you must turn off before deleting them. `OpenClawGateway` is only part of the app (and of `--all`) while `enable_gateway` is `true` in `cdk.json`; likewise `OpenClawBuild` only with `-c enable_codebuild=true`.
 
 ## Contributing
 

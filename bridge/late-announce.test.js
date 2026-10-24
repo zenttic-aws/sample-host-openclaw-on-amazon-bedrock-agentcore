@@ -11,7 +11,7 @@
  */
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
-const { createLateAnnounceRelay, isAnnounceRunId, isSilentReply } = require("./late-announce");
+const { createLateAnnounceRelay, isAnnounceRunId, isSilentReply, parseAnnounceSubagentSessionKey, sameConversation } = require("./late-announce");
 
 const MAIN_KEY = "agent:main:main";
 const SUB_KEY = "agent:main:subagent:0000aaaa-1111-2222-3333-444455556666";
@@ -42,6 +42,15 @@ const finalEvent = (runId, extra = {}) => ({
   message: { role: "assistant", content: [{ type: "text", text: "buffer text" }] }, ...extra,
 });
 
+// Simulate the gateway broadcasting a sub-agent event while a turn is active.
+// This is how the relay captures the originating turn's route for a given
+// sub-agent sessionKey; the announce run that completes later is then
+// delivered to that route, not to a later turn's route.
+const spawnEvent = (sessionKey = SUB_KEY, runId = "sub-run") => ({
+  runId, sessionKey, seq: 1, state: "delta", spawnedBy: MAIN_KEY,
+  message: { role: "assistant", content: [{ type: "text", text: "spawning" }] },
+});
+
 describe("isAnnounceRunId", () => {
   it("matches openclaw's announce idempotency key prefix only", () => {
     assert.equal(isAnnounceRunId(ANNOUNCE_RUN), true);
@@ -49,6 +58,31 @@ describe("isAnnounceRunId", () => {
     assert.equal(isAnnounceRunId("0f6c1a52-run"), false);
     assert.equal(isAnnounceRunId("xannounce:v1"), false);
     assert.equal(isAnnounceRunId(undefined), false);
+  });
+});
+
+describe("parseAnnounceSubagentSessionKey", () => {
+  it("extracts the embedded sub-agent sessionKey", () => {
+    assert.equal(parseAnnounceSubagentSessionKey(ANNOUNCE_RUN), SUB_KEY);
+    assert.equal(
+      parseAnnounceSubagentSessionKey("announce:v1:agent:main:subagent:abc:child-run-2"),
+      "agent:main:subagent:abc",
+    );
+    assert.equal(parseAnnounceSubagentSessionKey("not-an-announce"), null);
+    assert.equal(parseAnnounceSubagentSessionKey("announce:v1:just-one-segment"), null);
+    assert.equal(parseAnnounceSubagentSessionKey("announce:v1:trailing:"), null);
+    assert.equal(parseAnnounceSubagentSessionKey(undefined), null);
+  });
+});
+
+describe("sameConversation", () => {
+  it("compares the full delivery triple only (not actorId)", () => {
+    const a = { actorId: "a1", channel: "telegram", channelActorId: "ca", channelTarget: "t" };
+    const b = { actorId: "DIFFERENT", channel: "telegram", channelActorId: "ca", channelTarget: "t" };
+    const c = { actorId: "a1", channel: "telegram", channelActorId: "ca", channelTarget: "OTHER" };
+    assert.equal(sameConversation(a, b), true);
+    assert.equal(sameConversation(a, c), false);
+    assert.equal(sameConversation(null, a), false);
   });
 });
 
@@ -66,6 +100,7 @@ describe("late announce relay", () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "SUB-AGENT SUMMARY" } });
     const turn = relay.beginTurn(ROUTE);
     turn.claim("main-run");
+    relay.onChatEvent(spawnEvent());
     turn.end();
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     await relay.idle();
@@ -77,6 +112,7 @@ describe("late announce relay", () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "SUB-AGENT SUMMARY" } });
     const turn = relay.beginTurn(ROUTE);
     turn.claim("main-run");
+    relay.onChatEvent(spawnEvent());
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     await tick(40);
     assert.equal(delivered.length, 0, "must not be sent ahead of the main reply");
@@ -90,6 +126,7 @@ describe("late announce relay", () => {
   it("waits the settle time after the turn ends so the main reply goes out first", async () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "S" }, settleMs: 80 });
     const turn = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     turn.end();
     await tick(30);
@@ -103,6 +140,7 @@ describe("late announce relay", () => {
     const { relay, delivered, fetched } = harness({ answers: { [ANNOUNCE_RUN]: "FINAL BRIEF" } });
     const turn = relay.beginTurn(ROUTE);
     turn.claim("main-run");
+    relay.onChatEvent(spawnEvent());
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     turn.claim(ANNOUNCE_RUN); // the turn adopted it after the watcher saw it
     turn.end();
@@ -116,6 +154,7 @@ describe("late announce relay", () => {
     const { relay, delivered } = harness();
     const turn = relay.beginTurn(ROUTE);
     turn.claim(ANNOUNCE_RUN);
+    relay.onChatEvent(spawnEvent());
     turn.end();
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     await relay.idle();
@@ -125,7 +164,9 @@ describe("late announce relay", () => {
 
   it("delivers each announce run at most once", async () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "ONCE" } });
-    relay.beginTurn(ROUTE).end();
+    const turn = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
+    turn.end();
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN, { seq: 4 }));
     await relay.idle();
@@ -137,7 +178,9 @@ describe("late announce relay", () => {
 
   it("ignores ordinary runs, sub-agent sessions, deltas, yields and errors", async () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "X" } });
-    relay.beginTurn(ROUTE).end();
+    const turn = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
+    turn.end();
     relay.onChatEvent(finalEvent("plain-run"));
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN, { sessionKey: SUB_KEY }));
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN, { spawnedBy: MAIN_KEY }));
@@ -155,7 +198,9 @@ describe("late announce relay", () => {
 
   it("skips a silent announce reply", async () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "NO_REPLY" } });
-    relay.beginTurn(ROUTE).end();
+    const turn = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
+    turn.end();
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     await relay.idle();
     assert.deepEqual(delivered, []);
@@ -170,14 +215,34 @@ describe("late announce relay", () => {
     relay.close();
   });
 
-  it("sends to the latest turn's route", async () => {
-    const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "X" } });
-    relay.beginTurn(ROUTE).end();
+  it("delivers to the originating turn's route, not a later turn's route (#148)", async () => {
+    // Scenario: a sub-agent spawned in a private chat finishes AFTER the
+    // user has sent another turn from a different conversation. Before this
+    // fix, drain used the latest `route` and leaked the private sub-agent
+    // answer into the second (group) chat.
+    const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "PRIVATE SUMMARY" } });
+    const privateTurn = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
+    privateTurn.end();
     const group = { ...ROUTE, channelTarget: "-100<telegram_id>" };
     relay.beginTurn(group).end();
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     await relay.idle();
-    assert.equal(delivered[0].route.channelTarget, "-100<telegram_id>");
+    assert.equal(delivered.length, 1,
+      "the announce must still be delivered (to the originating conversation)");
+    assert.equal(delivered[0].route.channelTarget, ROUTE.channelTarget,
+      "the announce must go to the originating chat, not the latest turn's chat");
+    relay.close();
+  });
+
+  it("drops an announce whose sub-agent was never observed", async () => {
+    const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "X" } });
+    relay.beginTurn(ROUTE).end();
+    // No sub-agent event was ever observed for SUB_KEY, so the relay has no
+    // originating route for the announce and must drop rather than deliver.
+    relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
+    await relay.idle();
+    assert.deepEqual(delivered, []);
     relay.close();
   });
 
@@ -192,18 +257,23 @@ describe("late announce relay", () => {
         delivered.push(text);
       },
     });
-    relay.beginTurn(ROUTE).end();
-    relay.onChatEvent(finalEvent(`${ANNOUNCE_RUN}-a`));
+    const RUN_A = `announce:v1:${SUB_KEY}:child-run-a`;
+    const RUN_B = `announce:v1:${SUB_KEY}:child-run-b`;
+    const turn = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
+    turn.end();
+    relay.onChatEvent(finalEvent(RUN_A));
     await relay.idle();
-    relay.onChatEvent(finalEvent(`${ANNOUNCE_RUN}-b`));
+    relay.onChatEvent(finalEvent(RUN_B));
     await relay.idle();
-    assert.deepEqual(delivered, [`${ANNOUNCE_RUN}-b`]);
+    assert.deepEqual(delivered, [RUN_B]);
     relay.close();
   });
 
   it("drops pending deliveries on close", async () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "X" } });
     const turn = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
     relay.onChatEvent(finalEvent(ANNOUNCE_RUN));
     relay.close();
     turn.end();
@@ -214,6 +284,7 @@ describe("late announce relay", () => {
   it("an extra end() call does not release a later turn early", async () => {
     const { relay, delivered } = harness({ answers: { [ANNOUNCE_RUN]: "X" } });
     const first = relay.beginTurn(ROUTE);
+    relay.onChatEvent(spawnEvent());
     first.end();
     const second = relay.beginTurn(ROUTE);
     first.end();

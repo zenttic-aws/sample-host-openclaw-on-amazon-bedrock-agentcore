@@ -42,7 +42,13 @@ class SecurityStack(Stack):
             removal_policy=RemovalPolicy.RETAIN,
         )
 
-        # Allow CloudWatch Alarms to publish to KMS-encrypted SNS topics
+        # Allow CloudWatch Alarms to publish to KMS-encrypted SNS topics.
+        # Scope the grant to this account's CloudWatch alarms only (confused-
+        # deputy guard): add aws:SourceAccount + aws:SourceArn conditions so
+        # the service principal cannot be induced from any other account or on
+        # behalf of a non-alarm resource. kms:Decrypt is retained because
+        # CloudWatch must decrypt the data key when publishing an alarm
+        # notification to the SSE-KMS SNS topic (see observability_stack.py).
         self.cmk.add_to_resource_policy(
             iam.PolicyStatement(
                 actions=[
@@ -53,6 +59,17 @@ class SecurityStack(Stack):
                     iam.ServicePrincipal("cloudwatch.amazonaws.com"),
                 ],
                 resources=["*"],
+                conditions={
+                    "StringEquals": {
+                        "aws:SourceAccount": Stack.of(self).account,
+                    },
+                    "ArnLike": {
+                        "aws:SourceArn": (
+                            f"arn:aws:cloudwatch:{Stack.of(self).region}:"
+                            f"{Stack.of(self).account}:alarm:*"
+                        ),
+                    },
+                },
             )
         )
 
@@ -87,20 +104,14 @@ class SecurityStack(Stack):
                 ),  # placeholder — replace via console/CLI
             )
 
-        # --- CloudTrail (on by default) ------------------------------------
-        # Tenant isolation on the multi-tenant user-files bucket is enforced in
-        # application code, so object-level audit logs are the primary
-        # detection mechanism for a cross-namespace bypass. A dedicated trail
-        # with S3 data events is therefore enabled by default. Operators whose
-        # account already has an organization-level or account-level trail
-        # that covers this account (including S3 data events for the user-
-        # files bucket) can disable it via cdk.json context:
-        # "enable_cloudtrail": false
-        enable_cloudtrail_ctx = self.node.try_get_context("enable_cloudtrail")
-        if enable_cloudtrail_ctx is None:
-            enable_cloudtrail = True
-        else:
-            enable_cloudtrail = bool(enable_cloudtrail_ctx)
+        # --- CloudTrail (optional, off by default) -------------------------
+        # Most AWS accounts already have an organization-level or account-level
+        # CloudTrail, and an account can hold only a few trails per region, so
+        # the dedicated trail stays opt-in: "enable_cloudtrail": true in
+        # cdk.json. When enabled it is multi-region and also records S3 data
+        # events on the user-files bucket, whose per-user namespace boundary is
+        # enforced in application code.
+        enable_cloudtrail = bool(self.node.try_get_context("enable_cloudtrail") or False)
         self.trail = None
         trail_bucket = None
 
@@ -141,6 +152,13 @@ class SecurityStack(Stack):
             # these selectors; without them the trail records only management
             # events, which is what the user-files bucket's AwsSolutions-S1
             # suppression already assumes exists.
+            if not user_files_bucket_arn:
+                # Same name the AgentCore stack gives the bucket. Built from
+                # this stack's account/region so it also resolves when the CDK
+                # environment is not set at synth time.
+                user_files_bucket_arn = "arn:aws:s3:::" + namer.name(
+                    f"openclaw-user-files-{self.account}-{self.region}"
+                )
             if user_files_bucket_arn:
                 user_files_bucket = s3.Bucket.from_bucket_arn(
                     self, "UserFilesBucketRefForTrail", user_files_bucket_arn,
@@ -152,6 +170,15 @@ class SecurityStack(Stack):
                 )
 
         # --- Cognito User Pool (admin-provisioned identities) ---------------
+        # NOTE on password_policy: this pool exposes only the IAM-gated
+        # ADMIN_USER_PASSWORD_AUTH flow (no self sign-up, no hosted UI, no
+        # USER_PASSWORD_AUTH/SRP), so the policy is applied solely at admin
+        # password-set time. Complexity is re-enabled as defense-in-depth so
+        # that if a future caller ever uses a user-chosen password, the pool
+        # enforces strong characters. The derivation module
+        # (bridge/cognito-token.js) is responsible for producing passwords
+        # that satisfy this policy for machine-provisioned users; see the
+        # cdk-nag COG1 note below.
         self.user_pool = cognito.UserPool(
             self,
             "IdentityPool",
@@ -160,11 +187,23 @@ class SecurityStack(Stack):
             sign_in_aliases=cognito.SignInAliases(username=True),
             password_policy=cognito.PasswordPolicy(
                 min_length=16,
-                require_lowercase=False,
-                require_uppercase=False,
-                require_digits=False,
+                require_lowercase=True,
+                require_uppercase=True,
+                require_digits=True,
+                # Symbols intentionally not required: base64url output used by
+                # the admin-provisioning derivation only contains '-' and '_'
+                # as symbols (~3% of alphabet), which would make password-set
+                # non-deterministically fail. Entropy (~192 bits) is well
+                # above anything a symbol requirement would add.
                 require_symbols=False,
             ),
+            # Enable Cognito advanced security (threat protection) so that
+            # anomalous admin-initiated authentications - e.g. token minting
+            # for many distinct usernames in a short window, which is the
+            # observable signature of the shared-secret abuse this hardening
+            # defends against - are scored and surfaced in CloudWatch instead
+            # of being completely invisible.
+            advanced_security_mode=cognito.AdvancedSecurityMode.ENFORCED,
             removal_policy=RemovalPolicy.RETAIN,
             account_recovery=cognito.AccountRecovery.NONE,
         )
@@ -200,7 +239,11 @@ class SecurityStack(Stack):
             ),
         )
 
-        # --- HMAC secret for deriving Cognito user passwords -----------------
+        # --- Cognito password secret (previous derivation scheme) -----------
+        # The runtime no longer reads this secret: each Cognito user now has a
+        # random password in its own secret (bridge/cognito-token.js), and
+        # existing users move to one on their next authentication. The secret
+        # is kept unchanged so an older runtime image still deploys.
         self.cognito_password_secret = secretsmanager.Secret(
             self,
             "CognitoPasswordSecret",
@@ -252,27 +295,19 @@ class SecurityStack(Stack):
             [
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-COG1",
-                    reason="Passwords are HMAC-derived by the proxy, not user-chosen. "
-                    "Complexity requirements are unnecessary for deterministic passwords.",
+                    reason="Password policy now requires lower/upper/digits with min_length=16. "
+                    "Symbol requirement is intentionally omitted because this pool is only ever "
+                    "authenticated against via ADMIN_USER_PASSWORD_AUTH with machine-provisioned "
+                    "base64url passwords (~192 bits entropy, bridge/cognito-token.js), whose "
+                    "alphabet contains only '-' and '_' as symbols and so would hit a non-zero "
+                    "password-set failure rate under require_symbols=True. The remaining "
+                    "complexity gap vs. COG1's full requirement is tracked by the companion "
+                    "architectural remediation (per-user credentials / scoped token service).",
                 ),
                 cdk_nag.NagPackSuppression(
                     id="AwsSolutions-COG2",
                     reason="Users are service identities auto-provisioned from channel user IDs "
                     "(e.g. telegram:12345). MFA is not applicable for non-interactive accounts.",
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-COG3",
-                    reason="Advanced security mode (WAF integration) adds cost with no benefit "
-                    "for programmatic-only service identities. All auth is admin-initiated.",
-                ),
-                cdk_nag.NagPackSuppression(
-                    id="AwsSolutions-COG8",
-                    reason="The Plus feature plan only adds threat protection (compromised-"
-                    "credential and adaptive-auth checks on sign-in). This pool has no "
-                    "user-facing sign-in: self sign-up is off, and the only client is the "
-                    "bridge, which provisions users and authenticates them via "
-                    "ADMIN_USER_PASSWORD_AUTH with HMAC-derived passwords. Same rationale "
-                    "as COG3, which Plus-tier threat protection replaces.",
                 ),
             ],
         )
