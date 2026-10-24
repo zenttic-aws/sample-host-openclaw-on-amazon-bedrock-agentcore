@@ -93,10 +93,8 @@ if (temperatureOverride.invalid !== undefined) {
 }
 
 // Cognito identity configuration. Per-user Cognito passwords are stored in
-// Secrets Manager at openclaw/user/<namespace>/cognito (one secret per user)
-// and fetched via the proxy's execution-role credentials; no shared password
-// secret is placed in this process' environment anymore (dropping the
-// cross-user token-minting path exploited by sibling-process environ reads).
+// Secrets Manager (one secret per user, see cognito-token.js) and read with
+// the execution role; no password key is placed in this process' environment.
 const COGNITO_USER_POOL_ID = process.env.COGNITO_USER_POOL_ID || "";
 const COGNITO_CLIENT_ID = process.env.COGNITO_CLIENT_ID || "";
 
@@ -263,9 +261,9 @@ function extractSessionMetadata(parsed, headers) {
   return { sessionId, actorId, channel, idSource, modelOverride, trigger };
 }
 
-// Per-user Cognito ID tokens (user provisioning + per-user random password
-// stored in Secrets Manager at openclaw/user/<namespace>/cognito, with a
-// token cache). Shared with agentcore-contract.js via bridge/cognito-token.js.
+// Per-user Cognito ID tokens (user provisioning, per-user random password in
+// Secrets Manager, token cache). Shared with agentcore-contract.js via
+// bridge/cognito-token.js.
 const { scopeGuardrailToLatestUserTurn } = require("./guardrail-scope");
 // Per-session sticky redaction of previously-blocked user turns. Without this,
 // scopeGuardrailToLatestUserTurn would re-send blocked text untagged on the

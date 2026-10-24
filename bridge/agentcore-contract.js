@@ -81,10 +81,10 @@ let GATEWAY_TOKEN = null;
 // Used for typing indicator during processing + single final message delivery.
 let TELEGRAM_BOT_TOKEN = null;
 
-// Cognito password secret — no longer loaded. Per-user Cognito passwords are
-// generated with crypto.randomBytes and persisted in Secrets Manager at
-// openclaw/user/<namespace>/cognito; no shared password-derivation key is
-// held by the contract server or passed into the proxy child.
+// Cognito passwords are per user: generated with crypto.randomBytes and stored
+// in Secrets Manager at openclaw/cognito-user/<poolId>/<namespace> (see
+// cognito-token.js). No password-derivation key is held by the contract server
+// or passed into the proxy child.
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
@@ -601,9 +601,8 @@ async function prefetchSecrets() {
     }
   }
 
-  // The shared Cognito password secret is no longer fetched: per-user
-  // passwords are generated and stored in Secrets Manager on first use
-  // (openclaw/user/<namespace>/cognito).
+  // No Cognito password key is fetched: per-user passwords are generated and
+  // stored in Secrets Manager on first use (cognito-token.js).
 
   const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
   if (telegramSecretId) {
@@ -1625,10 +1624,9 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         BEDROCK_FALLBACK_MODEL_ID: process.env.BEDROCK_FALLBACK_MODEL_ID || "",
         COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
         COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-        // COGNITO_PASSWORD_SECRET is intentionally NOT forwarded: per-user
-        // Cognito passwords are stored in Secrets Manager (one secret per
-        // user) and are fetched by the proxy via its scoped IAM role. No
-        // shared HMAC key is exposed to the Bedrock proxy child process.
+        // No Cognito password key is forwarded: the proxy reads the bound
+        // user's own per-user password secret (cognito-token.js) with the
+        // execution role.
         S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
         SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
         SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",

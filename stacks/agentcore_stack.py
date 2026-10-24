@@ -183,6 +183,21 @@ class AgentCoreStack(Stack):
                 ],
             )
         )
+        # Secrets Manager — per-user Cognito passwords (bridge/cognito-token.js).
+        # Kept outside openclaw/user/* so the agent's scoped session policy,
+        # which only covers openclaw/user/{namespace}/*, never reaches them.
+        # The pool id in the path separates deployments sharing an account.
+        self.execution_role.add_to_policy(
+            iam.PolicyStatement(
+                actions=[
+                    "secretsmanager:GetSecretValue",
+                    "secretsmanager:CreateSecret",
+                ],
+                resources=[
+                    f"arn:aws:secretsmanager:{region}:{account}:secret:openclaw/cognito-user/{cognito_user_pool_id}/*",
+                ],
+            )
+        )
         # ListSecrets does not support resource-level restrictions (AWS API limitation).
         # Results filtered by prefix in application code (executeManageSecret).
         self.execution_role.add_to_policy(
