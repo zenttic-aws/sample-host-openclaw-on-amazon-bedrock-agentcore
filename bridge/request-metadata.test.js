@@ -155,6 +155,7 @@ function proxy({ identity, env = { USER_ID: "telegram:1001", CHANNEL: "telegram"
     modelOutcomeUnknown: false, chatRequestCount: 0, subagentRequestCount: 0,
   };
   vm.createContext(box);
+  vm.runInContext(slice("const VALID_CHANNELS = new Set([", "\nasync function retrieveMemoryContext("), box);
   vm.runInContext('const { osRandomUUID } = require("./runtime-lifecycle");' +
     slice("function extractSessionMetadata(", "// Per-user Cognito"), box);
   vm.runInContext('const { readBody } = require("./read-body");', box);
@@ -261,10 +262,18 @@ test("message content never reaches requestMetadata", async () => {
   assert.equal(values.includes("hunter2"), false);
 });
 
-test("a malformed identity-file session is hashed, not forwarded", async () => {
+test("a malformed identity-file session is refused before any Bedrock request", async () => {
   const app = proxy({ identity: { ...IDENTITY, sessionId: "bad session\nid" } });
-  await app.chat(MAIN);
-  assert.match(app.requests[0].input.requestMetadata["openclaw.session_id"], /^sha256:[0-9a-f]{32}$/);
+  assert.notEqual(await app.chat(MAIN), 200);
+  assert.equal(app.requests.length, 0);
+});
+
+test("an identity-file channel or trigger outside the proxy allowlists is refused", async () => {
+  for (const identity of [{ ...IDENTITY, channel: "email" }, { ...IDENTITY, trigger: "webhook" }]) {
+    const app = proxy({ identity });
+    assert.notEqual(await app.chat(MAIN), 200);
+    assert.equal(app.requests.length, 0);
+  }
 });
 
 test("the image ships request-metadata.js next to the proxy", () => {
