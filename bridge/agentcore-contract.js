@@ -94,9 +94,10 @@ let GATEWAY_TOKEN = null;
 // Used for typing indicator during processing + single final message delivery.
 let TELEGRAM_BOT_TOKEN = null;
 
-// Cognito password secret — fetched during user activation.
-// Stored in-process only, never written to process.env.
-let COGNITO_PASSWORD_SECRET = null;
+// Cognito passwords are per user: generated with crypto.randomBytes and stored
+// in Secrets Manager at openclaw/cognito-user/<poolId>/<namespace> (see
+// cognito-token.js). No password-derivation key is held by the contract server
+// or passed into the proxy child.
 
 // Maximum request body size (1MB) to prevent memory exhaustion
 const MAX_BODY_SIZE = 1 * 1024 * 1024;
@@ -613,16 +614,8 @@ async function prefetchSecrets() {
     }
   }
 
-  const cognitoSecretId = process.env.COGNITO_PASSWORD_SECRET_ID;
-  if (cognitoSecretId) {
-    const resp = await smClient.send(
-      new GetSecretValueCommand({ SecretId: cognitoSecretId }),
-    );
-    if (resp.SecretString) {
-      COGNITO_PASSWORD_SECRET = resp.SecretString;
-      console.log("[contract] Cognito password secret pre-fetched");
-    }
-  }
+  // No Cognito password key is fetched: per-user passwords are generated and
+  // stored in Secrets Manager on first use (cognito-token.js).
 
   const telegramSecretId = process.env.TELEGRAM_CHANNEL_SECRET_ID;
   if (telegramSecretId) {
@@ -1516,7 +1509,6 @@ async function setupGatewayBearer(actorId) {
   const provider = createCognitoTokenProvider({
     userPoolId: process.env.COGNITO_USER_POOL_ID || "",
     clientId: process.env.COGNITO_CLIENT_ID || "",
-    passwordSecret: COGNITO_PASSWORD_SECRET || "",
     region: process.env.AWS_REGION || "us-west-2",
     log: (msg) => console.log(msg.replace(/^\[cognito\]/, "[contract] Cognito")),
   });
@@ -1649,7 +1641,9 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
         BEDROCK_FALLBACK_MODEL_ID: process.env.BEDROCK_FALLBACK_MODEL_ID || "",
         COGNITO_USER_POOL_ID: process.env.COGNITO_USER_POOL_ID || "",
         COGNITO_CLIENT_ID: process.env.COGNITO_CLIENT_ID || "",
-        COGNITO_PASSWORD_SECRET: COGNITO_PASSWORD_SECRET || "",
+        // No Cognito password key is forwarded: the proxy reads the bound
+        // user's own per-user password secret (cognito-token.js) with the
+        // execution role.
         S3_USER_FILES_BUCKET: process.env.S3_USER_FILES_BUCKET || "",
         SUBAGENT_MODEL_NAME: SUBAGENT_MODEL_NAME,
         SUBAGENT_BEDROCK_MODEL_ID: process.env.SUBAGENT_BEDROCK_MODEL_ID || "",
@@ -1680,7 +1674,6 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
             currentUserId !== userId || currentNamespace !== namespace ||
             process.env.USER_ID !== actorId || process.env.INTERNAL_USER_ID !== userId ||
             !secretsReady || !GATEWAY_TOKEN || credentialManager !== credentials ||
-            (COGNITO_PASSWORD_SECRET || "") !== proxyEnv.COGNITO_PASSWORD_SECRET ||
             !current.resources.includes("restore") || !current.resources.includes("credentials") ||
             (AGENTCORE_GATEWAY_URL && !gatewayBearer?.token) ||
             ["BEDROCK_MODEL_ID", "BEDROCK_FALLBACK_MODEL_ID", "COGNITO_USER_POOL_ID", "COGNITO_CLIENT_ID",
@@ -1786,6 +1779,16 @@ async function init(userId, actorId, channel, channelActorId, channelTarget) {
       manifestFile: runtimeSkills.manifestPath(OPENCLAW_DIR), log: console, run: runRuntimeSkillInstall,
     });
     checkpoint();
+    if (skills.refused) {
+      // An operator-pinned allowlist refused one or more manifest entries:
+      // the slug is in the manifest but the deployment operator has not
+      // permitted it. Surface it in the cold-start logs.
+      for (const r of skills.results) {
+        if (r.status === "refused") {
+          console.warn("[contract] Runtime skill %s refused by operator allowlist and NOT reinstalled", r.slug);
+        }
+      }
+    }
     // Previously any failed/corrupt/invalid summary threw and blocked
     // USER_READY, which turned a single unresolvable manifest entry (prompt-
     // injected bad slug, upstream unpublish, clawhub.ai outage) into a
@@ -2673,21 +2676,38 @@ const server = http.createServer(async (req, res) => {
       try {
         const payload = body ? JSON.parse(body) : {};
         startupTiming.recordHttpHandler(handlerArrival, payload?.startupAttemptId);
-        const action = payload.action || "status";
+        const action = payload.action;
 
-        // Status check (no init needed)
+        // Status check — bound to the active user binding like every other action.
+        // No action defaulting: an action-less payload is not an authenticated
+        // caller for the diagnostic branch; verbose runtime detail stays in
+        // CloudWatch rather than in an invocation reply.
         if (action === "status") {
+          const runtimeSessionHeader = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+          const statusContext = Object.freeze({
+            userId: payload.userId,
+            actorId: payload.actorId,
+            runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
+            routingGeneration: payload.routingGeneration ?? null,
+          });
+          try {
+            v2Lifecycle.assertBinding(statusContext);
+            v2Lifecycle.checkpoint();
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              response: "This AgentCore Runtime cannot accept the requested user binding.",
+              status: "error",
+            }));
+            return;
+          }
           // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = proxyReady ? await checkProxyHealth() : null;
 
-          // The /invocations endpoint has no caller authentication (any process
-          // inside the microVM can POST here), so the status response MUST NOT
-          // echo back the binding fields a forged turn needs to pass
-          // assertBinding — the per-turn delivery identity is now authorized
-          // separately, but we still redact runtimeSessionId and
-          // routingGeneration so a replay attempt cannot cheaply impersonate
-          // the activated session. userId/actorId remain to let AgentCore's
-          // own health polling identify the active binding.
+          // The status branch is gated by assertBinding above, so the
+          // userId/actorId echoed here are the caller's own values. The raw
+          // runtimeSessionId/routingGeneration, currentUserId and gateway logs
+          // stay out of the reply; detailed diagnostics remain in CloudWatch.
           const lifecycleSnapshot = v2Lifecycle.snapshot();
           const redactedBinding = lifecycleSnapshot.binding ? {
             userId: lifecycleSnapshot.binding.userId,
@@ -2703,13 +2723,11 @@ const server = http.createServer(async (req, res) => {
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-            currentUserId,
             openclawReady,
             proxyReady,
             secretsReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
-            openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             subagentRequestCount: proxyHealth?.subagent_requests ?? null,
             activeTaskCount,

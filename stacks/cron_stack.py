@@ -55,6 +55,12 @@ class CronStack(Stack):
         log_retention = self.node.try_get_context("cloudwatch_log_retention_days") or 30
         lambda_timeout = int(self.node.try_get_context("cron_lambda_timeout_seconds") or "600")
         lambda_memory = int(self.node.try_get_context("cron_lambda_memory_mb") or "256")
+        # Optional reserved concurrency for the cron executor, so Router
+        # traffic cannot use the whole account pool. Off by default (0): a
+        # reservation fails to deploy on accounts whose concurrency quota
+        # cannot keep 100 unreserved executions.
+        _cron_rc = self.node.try_get_context("cron_reserved_concurrency")
+        cron_reserved_concurrency = int(0 if _cron_rc in (None, "") else _cron_rc)
         # Async cron (default on): a schedule's Lambda invocation starts the
         # CronRunner state machine, which runs the turn in the container and polls
         # it, so a brief is not bound by the Lambda's 900 s limit. Rollback: deploy
@@ -124,6 +130,9 @@ class CronStack(Stack):
             # gets a duplicate turn (and its "already ran" reply) instead of the brief.
             retry_attempts=0,
             memory_size=lambda_memory,
+            reserved_concurrent_executions=(
+                cron_reserved_concurrency if cron_reserved_concurrency > 0 else None
+            ),
             environment={
                 "AGENTCORE_RUNTIME_ARN": runtime_arn,
                 "AGENTCORE_QUALIFIER": runtime_endpoint_name,
@@ -199,6 +208,18 @@ class CronStack(Stack):
         # <scheduleId>-<fire time>, which makes a repeated fire a no-op).
         self.cron_fn.add_to_role_policy(
             iam.PolicyStatement(actions=["states:StartExecution"], resources=[state_machine_arn])
+        )
+        # On an "already exists" start, the Lambda reads that execution's input to
+        # confirm it belongs to the same schedule owner.
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["states:DescribeExecution"],
+                resources=[Stack.of(self).format_arn(
+                    service="states", resource="execution",
+                    resource_name=f"{state_machine_name}:*",
+                    arn_format=ArnFormat.COLON_RESOURCE_NAME,
+                )],
+            )
         )
 
         # Grant scheduler role permission to invoke the Lambda (IAM policy)

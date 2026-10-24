@@ -102,6 +102,45 @@ describe("runtime-skills manifest read/write", () => {
   });
   afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
 
+  it("recordInstall captures install provenance from the environment", () => {
+    rs.recordInstall(file, "baidu-search", "1.0.0", {
+      log: quietLog,
+      env: { INTERNAL_USER_ID: "user-123", AGENTCORE_RUNTIME_SESSION_ID: "session-abc" },
+    });
+    const m = rs.readManifest(file, { log: quietLog });
+    assert.equal(m.skills["baidu-search"].installedBy, "user-123");
+    assert.equal(m.skills["baidu-search"].installedSession, "session-abc");
+    assert.match(m.skills["baidu-search"].installedAt, /^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("recordInstall tolerates missing provenance env vars and does not store empty fields", () => {
+    rs.recordInstall(file, "baidu-search", "1.0.0", { log: quietLog, env: {} });
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    assert.equal(Object.prototype.hasOwnProperty.call(raw.skills["baidu-search"], "installedBy"), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(raw.skills["baidu-search"], "installedSession"), false);
+  });
+
+  it("readManifest preserves provenance fields on round-trip and ignores oversized / malformed ones", () => {
+    fs.writeFileSync(
+      file,
+      JSON.stringify({
+        version: 1,
+        skills: {
+          good: { version: "1.0.0", installedBy: "u1", installedSession: "s1", installedAt: "2026-01-01T00:00:00Z" },
+          nostr: { version: null, installedBy: 42, installedSession: {} },
+          toobig: { version: null, installedBy: "x".repeat(300) },
+        },
+      }),
+    );
+    const m = rs.readManifest(file, { log: quietLog });
+    assert.equal(m.skills.good.installedBy, "u1");
+    assert.equal(m.skills.good.installedSession, "s1");
+    assert.equal(m.skills.good.installedAt, "2026-01-01T00:00:00Z");
+    assert.equal(m.skills.nostr.installedBy, undefined);
+    assert.equal(m.skills.nostr.installedSession, undefined);
+    assert.equal(m.skills.toobig.installedBy, undefined);
+  });
+
   it("reads a missing manifest as empty (not corrupt)", () => {
     const m = rs.readManifest(file, { log: quietLog });
     assert.deepEqual(m.skills, {});
@@ -311,6 +350,35 @@ describe("runtime-skills clawhub argv", () => {
       CLAWHUB_REGISTRY: "https://registry.example",
       CLAWDHUB_SITE: "https://site.example",
     });
+  });
+});
+
+describe("runtime-skills.parseAllowlist / isAllowed", () => {
+  it("returns null when the env var is unset or empty (back-compat: no allowlist)", () => {
+    assert.equal(rs.parseAllowlist({}, { log: quietLog }), null);
+    assert.equal(rs.parseAllowlist({ RUNTIME_SKILLS_ALLOWLIST: "" }, { log: quietLog }), null);
+    assert.equal(rs.parseAllowlist({ RUNTIME_SKILLS_ALLOWLIST: "   \t  " }, { log: quietLog }), null);
+  });
+
+  it("parses comma / whitespace separated slugs, lowercases, drops invalid tokens with a warning", () => {
+    const log = collectingLog();
+    const list = rs.parseAllowlist(
+      { RUNTIME_SKILLS_ALLOWLIST: "alpha, Beta ,gamma\n@owner/slug, ../bad\tdelta" },
+      { log },
+    );
+    assert.ok(list instanceof Set);
+    assert.deepEqual([...list].sort(), ["alpha", "beta", "delta", "gamma"]);
+    assert.equal(log.lines.filter((l) => l.startsWith("warn:")).length, 2);
+  });
+
+  it("isAllowed returns true when there is no allowlist, enforces membership otherwise", () => {
+    assert.equal(rs.isAllowed("anything", null), true);
+    const list = rs.parseAllowlist({ RUNTIME_SKILLS_ALLOWLIST: "alpha,beta" }, { log: quietLog });
+    assert.equal(rs.isAllowed("alpha", list), true);
+    assert.equal(rs.isAllowed("ALPHA", list), true);
+    assert.equal(rs.isAllowed("gamma", list), false);
+    assert.equal(rs.isAllowed("", list), false);
+    assert.equal(rs.isAllowed(undefined, list), false);
   });
 });
 
@@ -532,6 +600,256 @@ describe("runtime-skills.reinstallFromManifest", () => {
     const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
     assert.equal(r.failed, 1);
     assert.match(r.results[0].error, /ENOENT/);
+  });
+
+  it("operator allowlist (RUNTIME_SKILLS_ALLOWLIST) refuses manifest entries that are not permitted", async () => {
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
+    rs.recordInstall(manifestFile, "attacker-slug", null, { log: quietLog });
+    rs.recordInstall(manifestFile, "gamma", "3.0.0", { log: quietLog });
+    const { run, calls } = fakeRunner();
+    const log = collectingLog();
+    const r = await rs.reinstallFromManifest({
+      manifestFile,
+      skillsDir,
+      run,
+      log,
+      env: { RUNTIME_SKILLS_ALLOWLIST: "alpha, gamma" },
+    });
+    assert.equal(r.total, 3);
+    assert.equal(r.refused, 1);
+    assert.equal(r.reinstalled, 2);
+    assert.deepEqual(calls.map((a) => a[1]).sort(), ["alpha", "gamma"]);
+    const refused = r.results.find((x) => x.status === "refused");
+    assert.equal(refused.slug, "attacker-slug");
+    assert.match(refused.error, /not in operator allowlist/);
+    assert.ok(
+      log.lines.some((l) => /warn:.*Refusing to reinstall attacker-slug.*RUNTIME_SKILLS_ALLOWLIST/.test(l)),
+      log.lines.join("\n"),
+    );
+  });
+
+  it("an unset or empty allowlist is back-compat: every valid entry is reinstalled", async () => {
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
+    rs.recordInstall(manifestFile, "beta", null, { log: quietLog });
+    const { run, calls } = fakeRunner();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog, env: {} });
+    assert.equal(r.refused, 0);
+    assert.equal(r.reinstalled, 2);
+    assert.deepEqual(calls.map((a) => a[1]), ["alpha", "beta"]);
+    const r2 = await rs.reinstallFromManifest({
+      manifestFile,
+      skillsDir: path.join(dir, "skills2"),
+      run: fakeRunner().run,
+      log: quietLog,
+      env: { RUNTIME_SKILLS_ALLOWLIST: "   " },
+    });
+    assert.equal(r2.refused, 0);
+  });
+
+  it("the allowlist log notes a slug's recorded installedBy if present", async () => {
+    rs.recordInstall(manifestFile, "attacker-slug", null, { log: quietLog, env: { INTERNAL_USER_ID: "victim-user-id" } });
+    const { run } = fakeRunner();
+    const log = collectingLog();
+    await rs.reinstallFromManifest({
+      manifestFile,
+      skillsDir,
+      run,
+      log,
+      env: { RUNTIME_SKILLS_ALLOWLIST: "only-permitted-slug" },
+    });
+    assert.ok(
+      log.lines.some((l) => /Refusing to reinstall attacker-slug.*installedBy=victim-user-id/.test(l)),
+      log.lines.join("\n"),
+    );
+  });
+});
+
+describe("runtime-skills integrity digest", () => {
+  let dir;
+  let skillsDir;
+  let manifestFile;
+  beforeEach(() => {
+    dir = mkTmp("rs-integrity-");
+    skillsDir = path.join(dir, "skills");
+    fs.mkdirSync(skillsDir);
+    manifestFile = path.join(dir, "state", "runtime-skills.json");
+  });
+  afterEach(() => fs.rmSync(dir, { recursive: true, force: true }));
+
+  /** Fake clawhub that writes `content` into scripts/run.js and origin.json with `version`. */
+  function contentRunner(state) {
+    const calls = [];
+    const run = async (args) => {
+      calls.push(args);
+      const slug = args[1];
+      placeSkill(skillsDir, slug, { version: state.version || "9.9.9" });
+      fs.mkdirSync(path.join(skillsDir, slug, "scripts"), { recursive: true });
+      fs.writeFileSync(path.join(skillsDir, slug, "scripts", "run.js"), state.content);
+      return { stdout: "", stderr: "" };
+    };
+    return { run, calls };
+  }
+
+  function installed(slug, content, version = "1.0.0") {
+    placeSkill(skillsDir, slug, { version });
+    fs.mkdirSync(path.join(skillsDir, slug, "scripts"), { recursive: true });
+    fs.writeFileSync(path.join(skillsDir, slug, "scripts", "run.js"), content);
+    return rs.computeSkillIntegrity(slug, skillsDir);
+  }
+
+  it("computeSkillIntegrity is stable, ignores .clawhub metadata and changes with the files", () => {
+    const a = installed("alpha", "console.log(1)\n");
+    assert.match(a, /^sha256:[0-9a-f]{64}$/);
+    assert.equal(rs.isValidIntegrity(a), true);
+    fs.writeFileSync(path.join(skillsDir, "alpha", ".clawhub", "origin.json"), "{\"installedAt\":2}");
+    assert.equal(rs.computeSkillIntegrity("alpha", skillsDir), a);
+    fs.writeFileSync(path.join(skillsDir, "alpha", "scripts", "run.js"), "console.log(2)\n");
+    const b = rs.computeSkillIntegrity("alpha", skillsDir);
+    assert.notEqual(b, a);
+    fs.writeFileSync(path.join(skillsDir, "alpha", "extra.js"), "");
+    assert.notEqual(rs.computeSkillIntegrity("alpha", skillsDir), b);
+    const c = rs.computeSkillIntegrity("alpha", skillsDir);
+    fs.symlinkSync("/etc/hostname", path.join(skillsDir, "alpha", "link"));
+    assert.notEqual(rs.computeSkillIntegrity("alpha", skillsDir), c);
+    assert.equal(rs.computeSkillIntegrity("missing", skillsDir), null);
+    assert.equal(rs.computeSkillIntegrity("../alpha", skillsDir), null);
+    assert.equal(rs.isValidIntegrity("sha256:xyz"), false);
+  });
+
+  it("the manifest round-trips integrity and disabledReason and drops malformed integrity values", () => {
+    const digest = `sha256:${"a".repeat(64)}`;
+    fs.mkdirSync(path.dirname(manifestFile), { recursive: true });
+    fs.writeFileSync(manifestFile, JSON.stringify({
+      version: 1,
+      skills: {
+        good: { version: "1.0.0", integrity: digest },
+        legacy: { version: "1.0.0" },
+        bad: { version: "1.0.0", integrity: "md5:abc" },
+        off: { version: "1.0.0", disabled: true, disabledReason: "integrity" },
+        odd: { version: "1.0.0", disabledReason: "integrity" },
+      },
+    }));
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.invalid, 1);
+    assert.equal(m.skills.bad, undefined);
+    assert.equal(m.skills.good.integrity, digest);
+    assert.equal("integrity" in m.skills.legacy, false);
+    assert.equal(m.skills.off.disabledReason, "integrity");
+    assert.equal(m.skills.odd.disabledReason, undefined);
+    const out = rs.writeManifest(manifestFile, m);
+    assert.equal(out.skills.good.integrity, digest);
+    assert.equal(out.skills.off.disabledReason, "integrity");
+  });
+
+  it("recordInstall stores the digest and a fresh install clears an integrity quarantine", () => {
+    const digest = `sha256:${"b".repeat(64)}`;
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog, integrity: digest });
+    const seeded = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(seeded.skills.alpha.integrity, digest);
+    Object.assign(seeded.skills.alpha, { disabled: true, disabledReason: "integrity", failures: 1 });
+    rs.writeManifest(manifestFile, seeded);
+    const newer = `sha256:${"c".repeat(64)}`;
+    rs.recordInstall(manifestFile, "alpha", "1.0.1", { log: quietLog, integrity: newer });
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.deepEqual(
+      [m.skills.alpha.version, m.skills.alpha.integrity, m.skills.alpha.disabled, m.skills.alpha.disabledReason],
+      ["1.0.1", newer, undefined, undefined],
+    );
+  });
+
+  it("reinstalls a pinned entry whose files match the recorded digest", async () => {
+    const digest = installed("alpha", "ok\n");
+    fs.rmSync(path.join(skillsDir, "alpha"), { recursive: true });
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog, integrity: digest });
+    const { run, calls } = contentRunner({ content: "ok\n", version: "1.0.0" });
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.equal(r.reinstalled, 1);
+    assert.equal(r.quarantined, 0);
+    assert.deepEqual(calls[0].slice(0, 4), ["install", "alpha", "--version", "1.0.0"]);
+    assert.equal(rs.isSkillPresent("alpha", skillsDir), true);
+  });
+
+  it("removes and quarantines a reinstall whose files differ from the recorded digest, without retrying it", async () => {
+    const digest = installed("alpha", "ok\n");
+    fs.rmSync(path.join(skillsDir, "alpha"), { recursive: true });
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog, integrity: digest });
+    rs.recordInstall(manifestFile, "beta", "2.0.0", { log: quietLog });
+    const { run, calls } = contentRunner({ content: "changed\n", version: "1.0.0" });
+    const log = collectingLog();
+    const r = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log });
+    assert.equal(r.quarantined, 1);
+    assert.equal(r.failed, 0);
+    assert.equal(r.reinstalled, 1, "the other entry is still restored");
+    assert.equal(fs.existsSync(path.join(skillsDir, "alpha")), false, "mismatched files are removed before the gateway starts");
+    assert.equal(r.results.find((x) => x.slug === "alpha").status, "quarantined");
+    assert.ok(log.lines.some((l) => /warn:.*Quarantining alpha@1\.0\.0: reinstalled files do not match/.test(l)));
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.skills.alpha.disabled, true);
+    assert.equal(m.skills.alpha.disabledReason, "integrity");
+    assert.equal(m.skills.alpha.integrity, digest, "the approved digest is kept");
+    calls.length = 0;
+    fs.rmSync(path.join(skillsDir, "beta"), { recursive: true });
+    const again = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.equal(again.skipped, 1);
+    assert.deepEqual(calls.map((a) => a[1]), ["beta"]);
+  });
+
+  it("records a digest for a pinned entry written before digests existed, then verifies it", async () => {
+    rs.recordInstall(manifestFile, "alpha", "1.0.0", { log: quietLog });
+    const state = { content: "v1\n", version: "1.0.0" };
+    const { run } = contentRunner(state);
+    const first = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.deepEqual([first.reinstalled, first.migrated, first.failed, first.quarantined], [1, 1, 0, 0]);
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.skills.alpha.integrity, rs.computeSkillIntegrity("alpha", skillsDir));
+    assert.equal(m.skills.alpha.version, "1.0.0");
+
+    fs.rmSync(path.join(skillsDir, "alpha"), { recursive: true });
+    const second = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.deepEqual([second.reinstalled, second.migrated], [1, 0]);
+
+    fs.rmSync(path.join(skillsDir, "alpha"), { recursive: true });
+    state.content = "v1 changed\n";
+    const third = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.equal(third.quarantined, 1);
+  });
+
+  it("pins the resolved version and records a digest for an unpinned entry written before digests existed", async () => {
+    rs.recordInstall(manifestFile, "beta", null, { log: quietLog });
+    const { run, calls } = contentRunner({ content: "b\n", version: "3.1.4" });
+    const first = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.deepEqual([first.reinstalled, first.migrated], [1, 1]);
+    assert.equal(calls[0].includes("--version"), false);
+    assert.equal(first.results[0].version, "3.1.4");
+    const m = rs.readManifest(manifestFile, { log: quietLog });
+    assert.equal(m.skills.beta.version, "3.1.4");
+    assert.ok(rs.isValidIntegrity(m.skills.beta.integrity));
+    fs.rmSync(path.join(skillsDir, "beta"), { recursive: true });
+    await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.deepEqual(calls[1].slice(0, 4), ["install", "beta", "--version", "3.1.4"]);
+  });
+
+  it("an entry with a digest but no version (no semver from clawhub) still has its files verified", async () => {
+    const digest = installed("gitty", "g\n", "abc123");
+    fs.rmSync(path.join(skillsDir, "gitty"), { recursive: true });
+    rs.recordInstall(manifestFile, "gitty", null, { log: quietLog, integrity: digest });
+    const state = { content: "g\n", version: "abc123" };
+    const { run, calls } = contentRunner(state);
+    const ok = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.equal(ok.reinstalled, 1);
+    assert.equal(calls[0].includes("--version"), false);
+    fs.rmSync(path.join(skillsDir, "gitty"), { recursive: true });
+    state.content = "g2\n";
+    const bad = await rs.reinstallFromManifest({ manifestFile, skillsDir, run, log: quietLog });
+    assert.equal(bad.quarantined, 1);
+  });
+
+  it("install.js records the digest and list.js explains an integrity quarantine", () => {
+    const install = fs.readFileSync(path.join(__dirname, "skills", "clawhub-manage", "install.js"), "utf-8");
+    assert.match(install, /computeSkillIntegrity\(skillName\)/);
+    assert.match(install, /recordInstall\(manifestFile, skillName, installedVersion, \{ integrity: installedIntegrity \}\)/);
+    const list = fs.readFileSync(path.join(__dirname, "skills", "clawhub-manage", "list.js"), "utf-8");
+    assert.match(list, /disabledReason === "integrity"/);
   });
 });
 
