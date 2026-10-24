@@ -200,6 +200,18 @@ class CronStack(Stack):
         self.cron_fn.add_to_role_policy(
             iam.PolicyStatement(actions=["states:StartExecution"], resources=[state_machine_arn])
         )
+        # On an "already exists" start, the Lambda reads that execution's input to
+        # confirm it belongs to the same schedule owner.
+        self.cron_fn.add_to_role_policy(
+            iam.PolicyStatement(
+                actions=["states:DescribeExecution"],
+                resources=[Stack.of(self).format_arn(
+                    service="states", resource="execution",
+                    resource_name=f"{state_machine_name}:*",
+                    arn_format=ArnFormat.COLON_RESOURCE_NAME,
+                )],
+            )
+        )
 
         # Grant scheduler role permission to invoke the Lambda (IAM policy)
         self.scheduler_role.add_to_policy(
