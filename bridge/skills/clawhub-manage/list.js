@@ -28,10 +28,13 @@ try {
       .sort();
   }
   const pending = Object.keys(persisted)
-    .filter((slug) => !onDisk.includes(slug))
+    .filter((slug) => !onDisk.includes(slug) && !persisted[slug].disabled)
+    .sort();
+  const disabled = Object.keys(persisted)
+    .filter((slug) => persisted[slug].disabled && !onDisk.includes(slug))
     .sort();
 
-  if (onDisk.length === 0 && pending.length === 0) {
+  if (onDisk.length === 0 && pending.length === 0 && disabled.length === 0) {
     console.log("No ClawHub skills installed.");
     process.exit(0);
   }
@@ -72,6 +75,15 @@ try {
         ? "  [WARNING: no install provenance recorded]"
         : "";
       console.log(`  - ${skill}${suffix}${warning}`);
+    }
+  }
+  if (disabled.length > 0) {
+    console.log(
+      `\nQuarantined after repeated reinstall failures (${disabled.length}) — these entries are skipped on cold start so one unresolvable slug cannot block activation. Reinstall the skill with 'install <slug>' to try again:\n`,
+    );
+    for (const skill of disabled) {
+      const v = persisted[skill].version;
+      console.log(`  - ${skill}${v ? ` (v${v})` : ""}`);
     }
   }
   if (manifest.corrupt) {

@@ -37,6 +37,18 @@ const MANIFEST_VERSION = 1;
 /** Per-skill `clawhub install` budget during background reinstall. */
 const REINSTALL_TIMEOUT_MS = 90_000;
 
+/**
+ * Consecutive-failure threshold after which a manifest entry is quarantined
+ * (marked `disabled: true` and skipped on future cold starts). Each entry
+ * tracks its own failure streak in the manifest (`failures`), reset to 0 on a
+ * successful reinstall. This bounds the self-sustaining lockout a persistently
+ * unresolvable slug (upstream unpublish, registry outage, or a prompt-injected
+ * bad entry) would otherwise cause: once quarantined the slug stops counting
+ * toward activation health and the user can re-enable it with a fresh
+ * `clawhub install` through clawhub-manage.
+ */
+const MAX_CONSECUTIVE_FAILURES = 3;
+
 // ClawHub slugs: lowercase letters, digits and hyphens, must start with a
 // letter (clawhub's own sanitizeSlug lowercases and strips anything else).
 // Owner-qualified specs (@owner/slug) are deliberately NOT accepted: clawhub
@@ -141,7 +153,12 @@ function emptyManifest() {
  * entries that fail slug/version validation are dropped (counted in
  * `invalid`) so nothing unvalidated ever reaches the CLI.
  *
- * @returns {{ version: number, skills: Record<string, {version: string|null, installedAt?: string, installedBy?: string, installedSession?: string}>, corrupt: boolean, invalid: number }}
+ * The optional per-entry `failures` and `disabled` fields are preserved so the
+ * cold-start reinstall can quarantine an entry that keeps failing (see
+ * MAX_CONSECUTIVE_FAILURES / reinstallFromManifest below). The optional
+ * provenance fields (`installedBy`, `installedSession`) are informational.
+ *
+ * @returns {{ version: number, skills: Record<string, {version: string|null, installedAt?: string, installedBy?: string, installedSession?: string, failures?: number, disabled?: boolean}>, corrupt: boolean, invalid: number }}
  */
 function readManifest(file = manifestPath(), { log = console } = {}) {
   const result = { ...emptyManifest(), corrupt: false, invalid: 0 };
@@ -180,8 +197,14 @@ function readManifest(file = manifestPath(), { log = console } = {}) {
       log.warn(`[runtime-skills] Dropping manifest entry ${slug}: invalid version ${JSON.stringify(version)}`);
       continue;
     }
+    const failures = entry && typeof entry === "object" && Number.isInteger(entry.failures) && entry.failures > 0
+      ? entry.failures
+      : 0;
+    const disabled = !!(entry && typeof entry === "object" && entry.disabled === true);
     const normalized = {
       version: isValidVersion(version) ? version : null,
+      ...(failures > 0 ? { failures } : {}),
+      ...(disabled ? { disabled: true } : {}),
     };
     if (entry && typeof entry.installedAt === "string") normalized.installedAt = entry.installedAt;
     if (entry && typeof entry.installedBy === "string" && entry.installedBy.length <= 256) {
@@ -201,8 +224,11 @@ function writeManifest(file, manifest) {
   for (const slug of Object.keys(manifest.skills || {}).sort()) {
     const entry = manifest.skills[slug];
     if (!isValidSlug(slug)) continue;
+    const failures = Number.isInteger(entry?.failures) && entry.failures > 0 ? entry.failures : 0;
     const persisted = {
       version: isValidVersion(entry?.version) ? entry.version : null,
+      ...(failures > 0 ? { failures } : {}),
+      ...(entry?.disabled === true ? { disabled: true } : {}),
     };
     if (entry?.installedAt) persisted.installedAt = entry.installedAt;
     if (typeof entry?.installedBy === "string" && entry.installedBy.length <= 256) {
@@ -259,6 +285,8 @@ function recordInstall(file, slug, version, opts = {}) {
   const entry = {
     version: isValidVersion(version) ? version : null,
     installedAt: new Date().toISOString(),
+    // A fresh install clears any previous quarantine / failure streak so the
+    // cold-start reinstall will try this slug again on the next session.
   };
   const by = typeof env.INTERNAL_USER_ID === "string" ? env.INTERNAL_USER_ID.trim() : "";
   if (by && by.length <= 256) entry.installedBy = by;
@@ -438,33 +466,44 @@ function runClawhub(args, { timeoutMs = REINSTALL_TIMEOUT_MS, env = clawhubEnv()
 
 /**
  * Reinstall every skill in the manifest that is not already present in
- * `skillsDir`. Sequential (one ClawHub download at a time), never throws,
- * never touches the manifest: a failed reinstall stays recorded so the next
- * cold start tries again. Returns a summary suitable for logging.
+ * `skillsDir`. Sequential (one ClawHub download at a time), never throws.
+ *
+ * Self-healing policy (so a persistently unresolvable entry can never
+ * permanently brick activation):
+ *   - Corrupt / wrong-shape manifests are rewritten as an empty manifest
+ *     (the file is attacker/agent-writable; keeping it as-is would feed
+ *     `corrupt: true` on every cold start forever).
+ *   - Entries that fail slug/version validation are dropped from the
+ *     persisted manifest.
+ *   - Each failed reinstall increments a per-entry `failures` counter. After
+ *     `MAX_CONSECUTIVE_FAILURES` consecutive failures the entry is marked
+ *     `disabled: true` and skipped on future cold starts (summary.quarantined
+ *     bumps once, `failed` does not); a successful reinstall clears both
+ *     counters. `recordInstall` from the clawhub-manage skill also clears
+ *     them, so the user can re-enable a quarantined skill by reinstalling.
+ *
+ * Returns a summary suitable for logging; `failed` / `corrupt` / `invalid`
+ * remain informational only — callers must not treat them as fatal.
  *
  * @param {object} opts
  * @param {string} [opts.manifestFile]
  * @param {string} [opts.skillsDir]
  * @param {(args: string[]) => Promise<{stdout: string, stderr: string}>} [opts.run]  injected for tests
  * @param {object} [opts.log]
- * @returns {Promise<{ total: number, reinstalled: number, present: number, failed: number, corrupt: boolean, invalid: number, results: Array<{slug: string, version: string|null, status: string, error?: string}> }>}
+ * @param {number} [opts.maxConsecutiveFailures]
+ * @returns {Promise<{ total: number, reinstalled: number, present: number, failed: number, quarantined: number, skipped: number, corrupt: boolean, invalid: number, results: Array<{slug: string, version: string|null, status: string, error?: string}> }>}
  */
 async function reinstallFromManifest({
   manifestFile = manifestPath(),
   skillsDir = SKILLS_DIR,
   run = runClawhub,
   log = console,
+  maxConsecutiveFailures = MAX_CONSECUTIVE_FAILURES,
   env = process.env,
 } = {}) {
   const summary = {
-    total: 0,
-    reinstalled: 0,
-    present: 0,
-    failed: 0,
-    corrupt: false,
-    invalid: 0,
-    refused: 0,
-    results: [],
+    total: 0, reinstalled: 0, present: 0, failed: 0, quarantined: 0, skipped: 0,
+    corrupt: false, invalid: 0, refused: 0, results: [],
   };
   let manifest;
   try {
@@ -475,6 +514,28 @@ async function reinstallFromManifest({
   }
   summary.corrupt = manifest.corrupt;
   summary.invalid = manifest.invalid;
+
+  // Self-heal: rewrite a clean manifest if we found corruption or dropped
+  // invalid entries, so the next cold start starts from a trustworthy state
+  // and the same `corrupt`/`invalid` counters do not re-fire forever.
+  if (manifest.corrupt) {
+    try {
+      writeManifest(manifestFile, emptyManifest());
+      log.warn(`[runtime-skills] Rewrote corrupt manifest ${manifestFile} as empty`);
+    } catch (err) {
+      log.warn(`[runtime-skills] Could not rewrite corrupt manifest ${manifestFile}: ${err.message}`);
+    }
+    return summary;
+  }
+  if (manifest.invalid > 0) {
+    try {
+      writeManifest(manifestFile, { skills: manifest.skills });
+      log.warn(`[runtime-skills] Rewrote manifest ${manifestFile} without ${manifest.invalid} invalid entr${manifest.invalid === 1 ? "y" : "ies"}`);
+    } catch (err) {
+      log.warn(`[runtime-skills] Could not rewrite manifest ${manifestFile}: ${err.message}`);
+    }
+  }
+
   const entries = Object.entries(manifest.skills);
   summary.total = entries.length;
   if (entries.length === 0) return summary;
@@ -484,6 +545,7 @@ async function reinstallFromManifest({
     log.log(`[runtime-skills] Operator allowlist active: ${allowlist.size} slug(s) permitted`);
   }
 
+  let manifestDirty = false;
   for (const [slug, entry] of entries) {
     const version = entry.version || null;
     if (!isAllowed(slug, allowlist)) {
@@ -495,9 +557,18 @@ async function reinstallFromManifest({
       );
       continue;
     }
+    if (entry.disabled === true) {
+      summary.skipped++;
+      summary.results.push({ slug, version, status: "skipped", error: "quarantined after repeated failures" });
+      continue;
+    }
     if (isSkillPresent(slug, skillsDir)) {
       summary.present++;
       summary.results.push({ slug, version, status: "present" });
+      if (entry.failures) {
+        entry.failures = 0;
+        manifestDirty = true;
+      }
       continue;
     }
     let args;
@@ -521,11 +592,34 @@ async function reinstallFromManifest({
         ? ` (installedBy=${entry.installedBy}${entry.installedAt ? ` at ${entry.installedAt}` : ""})`
         : " (no provenance recorded)";
       log.log(`[runtime-skills] Reinstalled ${slug}${version ? `@${version}` : ""} in ${Date.now() - started}ms${prov}`);
+      if (entry.failures) {
+        entry.failures = 0;
+        manifestDirty = true;
+      }
     } catch (err) {
       const detail = String(err.stderr || err.stdout || err.message || err).trim().split("\n").slice(-3).join(" | ");
-      summary.failed++;
-      summary.results.push({ slug, version, status: "failed", error: detail });
-      log.warn(`[runtime-skills] Reinstall of ${slug}${version ? `@${version}` : ""} failed after ${Date.now() - started}ms: ${detail}`);
+      const nextFailures = (entry.failures || 0) + 1;
+      if (nextFailures >= maxConsecutiveFailures) {
+        entry.failures = nextFailures;
+        entry.disabled = true;
+        manifestDirty = true;
+        summary.quarantined++;
+        summary.results.push({ slug, version, status: "quarantined", error: detail });
+        log.warn(`[runtime-skills] Quarantining ${slug}${version ? `@${version}` : ""} after ${nextFailures} consecutive failures: ${detail}`);
+      } else {
+        entry.failures = nextFailures;
+        manifestDirty = true;
+        summary.failed++;
+        summary.results.push({ slug, version, status: "failed", error: detail });
+        log.warn(`[runtime-skills] Reinstall of ${slug}${version ? `@${version}` : ""} failed after ${Date.now() - started}ms (attempt ${nextFailures}/${maxConsecutiveFailures}): ${detail}`);
+      }
+    }
+  }
+  if (manifestDirty) {
+    try {
+      writeManifest(manifestFile, { skills: manifest.skills });
+    } catch (err) {
+      log.warn(`[runtime-skills] Could not persist reinstall state to ${manifestFile}: ${err.message}`);
     }
   }
   return summary;
@@ -536,6 +630,7 @@ module.exports = {
   MANIFEST_NAME,
   DEFAULT_MOUNT_STATE_DIR,
   REINSTALL_TIMEOUT_MS,
+  MAX_CONSECUTIVE_FAILURES,
   ALLOWLIST_ENV,
   parseAllowlist,
   isAllowed,

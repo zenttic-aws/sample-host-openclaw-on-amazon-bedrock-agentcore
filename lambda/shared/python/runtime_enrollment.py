@@ -51,15 +51,60 @@ def read_actor_owner(table, actor_id):
     return owner
 
 
+# Deterministic lookup bound: ownership residue for a V2 enrollment always
+# lands under USER#<derived user id>, which is computable from actor_id. We
+# probe those three sort keys with O(1) get_item calls before falling back to
+# a filtered table scan that only has to find legacy (non-derived user id)
+# records. The scan drives to LastEvaluatedKey == None with a 1 MB page so
+# that unrelated table growth (DEDUP#, CRON#, ALLOW#, ...) cannot starve the
+# reconciliation; a generous iteration ceiling remains to prevent an infinite
+# loop against a misbehaving backend and to preserve fail-closed semantics.
+_RECONCILE_SCAN_PAGE_LIMIT = 1000
+_RECONCILE_SCAN_MAX_PAGES = 10000
+
+
+def _derived_user_id(actor_id):
+    return f"user_{hashlib.sha256(actor_id.encode()).hexdigest()[:16]}"
+
+
+def _deterministic_actor_residue(table, actor_id):
+    derived_user = _derived_user_id(actor_id)
+    partition = f"USER#{derived_user}"
+    backref = table.get_item(
+        Key={"PK": partition, "SK": f"CHANNEL#{actor_id}"}, ConsistentRead=True,
+    ).get("Item")
+    if backref:
+        return True
+    profile = table.get_item(
+        Key={"PK": partition, "SK": "PROFILE"}, ConsistentRead=True,
+    ).get("Item") or {}
+    if profile.get("enrollmentActorId") == actor_id:
+        return True
+    session = table.get_item(
+        Key={"PK": partition, "SK": "SESSION"}, ConsistentRead=True,
+    ).get("Item") or {}
+    if session.get("actorId") == actor_id:
+        return True
+    return False
+
+
 def reconcile_actor_owner(table, actor_id):
     owner = read_actor_owner(table, actor_id)
     if owner:
         return owner
+    # Fast deterministic path: residue of a prior V2 enrollment for this actor
+    # always lives under the derived USER#<sha256(actor_id)> partition and is
+    # retrievable with O(1) get_item calls that do not depend on table size.
+    if _deterministic_actor_residue(table, actor_id):
+        raise RouteUnavailable("Actor has retained ownership; reconciliation required")
     cursor = None
     # Missing CHANNEL is not evidence that the actor's state namespace is unused.
-    for _ in range(100):
+    # Drive the (bounded) scan to LastEvaluatedKey == None so that unrelated
+    # table growth cannot flip reconciliation into permanent failure. The page
+    # Limit is sized so a healthy DynamoDB page (1 MB cap) is the real bound.
+    for _ in range(_RECONCILE_SCAN_MAX_PAGES):
         request = {
-            "ConsistentRead": True, "Limit": 100,
+            "ConsistentRead": True, "Limit": _RECONCILE_SCAN_PAGE_LIMIT,
             "FilterExpression": "begins_with(#pk, :users) AND (#sk = :backref OR #actor = :actor OR #enrolled = :actor)",
             "ExpressionAttributeNames": {
                 "#pk": "PK", "#sk": "SK", "#actor": "actorId", "#enrolled": "enrollmentActorId",
@@ -74,6 +119,9 @@ def reconcile_actor_owner(table, actor_id):
         cursor = response.get("LastEvaluatedKey")
         if not cursor:
             return None
+    # Fail closed: a cursor that never drains means we cannot prove the actor
+    # namespace is unused. This now only trips against a pathological backend
+    # (10,000 1 MB pages exceeds any realistic identity table), not organic growth.
     raise RouteUnavailable("Legacy actor ownership scan incomplete; registration blocked")
 
 
