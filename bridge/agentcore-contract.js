@@ -2656,21 +2656,38 @@ const server = http.createServer(async (req, res) => {
       try {
         const payload = body ? JSON.parse(body) : {};
         startupTiming.recordHttpHandler(handlerArrival, payload?.startupAttemptId);
-        const action = payload.action || "status";
+        const action = payload.action;
 
-        // Status check (no init needed)
+        // Status check — bound to the active user binding like every other action.
+        // No action defaulting: an action-less payload is not an authenticated
+        // caller for the diagnostic branch; verbose runtime detail stays in
+        // CloudWatch rather than in an invocation reply.
         if (action === "status") {
+          const runtimeSessionHeader = req.headers["x-amzn-bedrock-agentcore-runtime-session-id"];
+          const statusContext = Object.freeze({
+            userId: payload.userId,
+            actorId: payload.actorId,
+            runtimeSessionId: runtimeSessionHeader || payload.runtimeSessionId || null,
+            routingGeneration: payload.routingGeneration ?? null,
+          });
+          try {
+            v2Lifecycle.assertBinding(statusContext);
+            v2Lifecycle.checkpoint();
+          } catch {
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({
+              response: "This AgentCore Runtime cannot accept the requested user binding.",
+              status: "error",
+            }));
+            return;
+          }
           // Fetch proxy /health for request counters (non-blocking — null on failure)
           const proxyHealth = proxyReady ? await checkProxyHealth() : null;
 
-          // The /invocations endpoint has no caller authentication (any process
-          // inside the microVM can POST here), so the status response MUST NOT
-          // echo back the binding fields a forged turn needs to pass
-          // assertBinding — the per-turn delivery identity is now authorized
-          // separately, but we still redact runtimeSessionId and
-          // routingGeneration so a replay attempt cannot cheaply impersonate
-          // the activated session. userId/actorId remain to let AgentCore's
-          // own health polling identify the active binding.
+          // The status branch is gated by assertBinding above, so the
+          // userId/actorId echoed here are the caller's own values. The raw
+          // runtimeSessionId/routingGeneration, currentUserId and gateway logs
+          // stay out of the reply; detailed diagnostics remain in CloudWatch.
           const lifecycleSnapshot = v2Lifecycle.snapshot();
           const redactedBinding = lifecycleSnapshot.binding ? {
             userId: lifecycleSnapshot.binding.userId,
@@ -2686,13 +2703,11 @@ const server = http.createServer(async (req, res) => {
           const diag = {
             buildVersion: BUILD_VERSION,
             uptime_seconds: Math.floor((Date.now() - startTime) / 1000),
-            currentUserId,
             openclawReady,
             proxyReady,
             secretsReady,
             openclawExitCode,
             openclawPid: openclawProcess?.pid || null,
-            openclawLogs: openclawLogs.slice(-20),
             totalRequestCount: proxyHealth?.total_requests ?? null,
             subagentRequestCount: proxyHealth?.subagent_requests ?? null,
             activeTaskCount,

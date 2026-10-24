@@ -750,12 +750,22 @@ test("HTTP chat activates the same child after restore, config, migration and sk
   assert.equal(result.body.runtimeSessionId, owner.runtimeSessionId);
   assert.equal(result.body.actorId, owner.actorId);
   assert.equal(result.body.routingGeneration, owner.routingGeneration);
-  const status = JSON.parse((await app.request({ action: "status" })).body.response);
+  const status = JSON.parse((await app.request({ ...owner, action: "status" })).body.response);
   assert.equal(status.lifecycle.generation, result.body.activationGeneration);
   assert.equal(activation.generation, result.body.activationGeneration);
   assert.equal(status.lifecycle.state, "USER_READY");
-  assert.equal(status.lifecycle.binding.userId, owner.userId);
-  assert.equal(status.lifecycle.binding.actorId, owner.actorId);
+  assert.deepEqual(status.lifecycle.binding, { userId: owner.userId, actorId: owner.actorId });
+  assert.equal(status.currentUserId, undefined);
+  assert.equal(status.openclawLogs, undefined);
+  // Status for a different binding, or with no binding at all, is refused.
+  for (const probe of [{ action: "status" }, { ...owner, actorId: "telegram:999", action: "status" },
+    { ...owner, routingGeneration: owner.routingGeneration + 1, action: "status" }]) {
+    const refused = (await app.request(probe)).body;
+    assert.equal(refused.status, "error");
+    assert.equal(refused.response, "This AgentCore Runtime cannot accept the requested user binding.");
+  }
+  // An action-less payload no longer falls into the status branch.
+  assert.match((await app.request({ ...owner })).body.response, /Unknown action/);
   assert.ok(app.calls.some((call) => call.includes("[OPENCLAW_IMAGES:")));
   // The stale suspended-delivery sweep runs once, after readiness, before the first turn.
   assert.equal(app.calls.filter((call) => call === "gateway:sweep").length, 1);

@@ -218,6 +218,8 @@ function contractHandler(telemetry) {
     v2Lifecycle: {
       health: () => ({ statusCode: 503, body: { status: "HealthyBusy" } }),
       snapshot: () => ({ state: "UNBOUND", binding: null, generation: 0, resources: [] }),
+      assertBinding: () => {},
+      checkpoint: () => {},
     },
     console: { log() {}, error() {} },
   });
@@ -288,7 +290,8 @@ test("unbound status correlates overlapping requests when bodies finish out of o
   for (const response of [firstResponse, secondResponse]) {
     assert.equal(response.code, 200);
     const diag = JSON.parse(response.body.response);
-    assert.equal(diag.currentUserId, null);
+    assert.equal(diag.currentUserId, undefined);
+    assert.equal(diag.openclawLogs, undefined);
     assert.equal(diag.openclawReady, false);
     assert.equal(diag.activeTaskCount, 0);
     assert.equal(diag.lifecycle.state, "UNBOUND");
