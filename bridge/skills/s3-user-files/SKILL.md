@@ -24,7 +24,7 @@ node {baseDir}/read.js <user_id> <filename>
 ```
 
 - `user_id` (required): The user's unique identifier (e.g., `telegram_12345`)
-- `filename` (required): The file name to read (e.g., `IDENTITY.md`)
+- `filename` (required): The file name to read (e.g., `notes.md`)
 
 ### write_user_file
 
@@ -97,7 +97,7 @@ When a user sends a Markdown (`.md`) file or a ZIP (`.zip`) archive, the router 
 
 - "Save my preferences" -> write_user_file with the user's preferences
 - "What do you remember about me?" -> read_user_file to check stored notes
-- "What's your name?" -> read_user_file IDENTITY.md for this user
+- "What's your name?" -> use the Agent Identity section already in the system prompt
 - "Forget everything about me" -> delete_user_file on each stored file
 - "What files do you have for me?" -> list_user_files
 - "Give me a download link for that file" -> presign_user_file
