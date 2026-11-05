@@ -1,0 +1,82 @@
+# Throwaway fork-only workflow: builds the arm64 bridge image of
+# feat/channel-identity-mode and boot-smokes it on a native ubuntu-24.04-arm
+# runner. Not for merge to the official repo.
+name: arm64-verify-channel-identity
+
+on:
+  push:
+    branches: [ci/arm64-verify-channel-identity]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build arm64 bridge image
+        run: |
+          docker buildx build --platform linux/arm64 --provenance=false --load \
+            --tag openclaw-bridge:smoke --file bridge/Dockerfile bridge
+
+      - name: Node version and undici floor
+        run: |
+          echo "node: $(docker run --rm --entrypoint node openclaw-bridge:smoke -v)"
+          docker run --rm --entrypoint node openclaw-bridge:smoke /tmp/undici-floor-check.js
+
+      - name: Changed modules parse and load in the image
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint node openclaw-bridge:smoke \
+            --check /app/agentcore-proxy.js
+          docker run --rm --network none --entrypoint node openclaw-bridge:smoke \
+            --check /skills/eventbridge-cron/common.js
+          # The proxy's bound-actor allowlist accepts the conversation identities.
+          docker run --rm --network none --entrypoint node openclaw-bridge:smoke -e '
+            const src = require("fs").readFileSync("/app/agentcore-proxy.js", "utf8");
+            const m = /const VALID_ACTOR_ID =\s*\/\^(.+?)\$\/;/s.exec(src);
+            const re = new RegExp("^" + m[1] + "$");
+            for (const actor of ["slack_channel:C0123CHAN", "feishu_group:oc_0123abcdef",
+                                 "telegram_group:-1001234567890", "slack:U0123USER"]) {
+              if (!re.test(actor)) { console.error("refused " + actor); process.exit(1); }
+            }
+            console.log("proxy actor allowlist ok");'
+          # The cron skill in the image refuses a schedule for a Slack channel identity.
+          docker run --rm --network none -e AWS_REGION=us-west-2 --entrypoint node openclaw-bridge:smoke -e '
+            const fs = require("fs");
+            fs.writeFileSync("/tmp/current-identity.json", JSON.stringify({ actorId: "slack_channel:C0123CHAN",
+              channel: "slack_channel", channelActorId: "slack_channel:C0123CHAN", channelTarget: "C0123CHAN" }));
+            const cron = require("/skills/eventbridge-cron/common.js");
+            try { cron.resolveScheduleDelivery("slack_channel_C0123CHAN"); }
+            catch (error) {
+              if (/not available in group chats/.test(error.message)) { console.log("cron refusal ok"); process.exit(0); }
+              console.error(error.message);
+            }
+            process.exit(1);'
+
+      - name: Boot smoke (/ping Healthy, no network)
+        run: |
+          set -euo pipefail
+          docker run -d --network none --name smoke openclaw-bridge:smoke
+          ok=
+          for i in $(seq 1 90); do
+            out="$(docker exec smoke node -e 'const http=require("http");http.get("http://127.0.0.1:8080/ping",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>process.stdout.write(d))}).on("error",e=>{process.stderr.write(String(e.message));process.exit(1)})' 2>/dev/null || true)"
+            if echo "$out" | grep -q 'Healthy'; then echo "ping ok after ${i} tries: $out"; ok=1; break; fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "=== /ping never returned Healthy; container logs: ==="
+            docker logs smoke || true
+            docker rm -f smoke || true
+            exit 1
+          fi
+          docker rm -f smoke
+
+      - name: Agent uid-split smoke
+        run: SMOKE_TIMEOUT=180 scripts/smoke-agent-uid-dirs.sh openclaw-bridge:smoke
