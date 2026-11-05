@@ -71,11 +71,22 @@ jobs:
             BEDROCK_GUARDRAIL_ID: "", BEDROCK_GUARDRAIL_VERSION: "", BEDROCK_TEMPERATURE: "",
             BEDROCK_USER_SELECTABLE_MODEL_IDS: "", USER_ID: ACTOR, INTERNAL_USER_ID: BINDING.userId,
             USER_NAMESPACE: namespace, CHANNEL: "telegram", OPENCLAW_SKIP_CRON: "1" });
-          const health = () => new Promise((resolve, reject) => {
+          // activate() resolves once the proxy has bound; it listens a moment later. The
+          // bridge waits for the port (waitForPort) before using it, and so does this check.
+          const healthOnce = () => new Promise((resolve, reject) => {
             http.get("http://127.0.0.1:18790/health", (res) => {
               let body = ""; res.on("data", (c) => { body += c; }); res.on("end", () => resolve([res.statusCode, body]));
             }).on("error", reject);
           });
+          const health = async () => {
+            const deadline = Date.now() + 15000;
+            for (;;) {
+              try { return await healthOnce(); } catch (error) {
+                if (error.code !== "ECONNREFUSED" || Date.now() > deadline) throw error;
+                await new Promise((resolve) => setTimeout(resolve, 200));
+              }
+            }
+          };
           async function attempt(namespace) {
             const owner = createProxySdkSnapshotOwner({ env: BASE, onFailure: () => {}, onChild: (child) => {
               child.stdout.on("data", (d) => process.stdout.write(`[proxy:out] ${d}`));
