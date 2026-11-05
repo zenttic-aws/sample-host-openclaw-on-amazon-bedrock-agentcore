@@ -1,0 +1,89 @@
+# Throwaway fork-only workflow: builds the arm64 bridge image of
+# feat/s3-user-files-read-pdf on a native ubuntu-24.04-arm runner, runs
+# read_pdf_text inside it, then boot-smokes the image.
+# Not for merge to the official repo.
+name: arm64-verify-read-pdf
+
+on:
+  push:
+    branches: [ci/arm64-verify-read-pdf]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build arm64 bridge image (includes the clawpdf resolution check)
+        run: |
+          set -o pipefail
+          docker buildx build --platform linux/arm64 --provenance=false --load --progress=plain \
+            --tag openclaw-bridge:smoke --file bridge/Dockerfile bridge 2>&1 | tee "$RUNNER_TEMP/build.log"
+          grep -F '[build] clawpdf 0.3.2 resolves from /app' "$RUNNER_TEMP/build.log"
+          grep -F '[build] clawpdf 0.3.2 resolves from /skills/s3-user-files' "$RUNNER_TEMP/build.log"
+
+      - name: Node version, architecture and undici floor
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint node openclaw-bridge:smoke -p 'process.version + " " + process.arch'
+          test "$(docker run --rm --entrypoint node openclaw-bridge:smoke -p process.arch)" = arm64
+          docker run --rm --entrypoint node openclaw-bridge:smoke /tmp/undici-floor-check.js
+
+      - name: clawpdf in the image (version, PDFium build, WASM checksum)
+        run: |
+          set -euo pipefail
+          docker run --rm --network none -w /skills/s3-user-files --entrypoint node openclaw-bridge:smoke \
+            --input-type=module -e '
+              import { createHash } from "node:crypto";
+              import { readFileSync } from "node:fs";
+              const url = import.meta.resolve("clawpdf");
+              const pkg = JSON.parse(readFileSync(new URL("../package.json", url), "utf8"));
+              const wasm = readFileSync(new URL("./vendor/pdfium.esm.wasm", url));
+              const sha = createHash("sha256").update(wasm).digest("hex");
+              const { PDFIUM_RELEASE, PDFIUM_WASM_SHA256 } = await import("clawpdf");
+              console.log(`clawpdf ${pkg.version} at ${url}, PDFium ${PDFIUM_RELEASE}, wasm sha256 ${sha}`);
+              if (pkg.version !== "0.3.2" || sha !== PDFIUM_WASM_SHA256 ||
+                  sha !== "f3fe52ae7f150e912a8379ec4478cac9c11b4135dc56fdc039b0ff885f1c0981") process.exit(1);'
+
+      - name: read-pdf.js --self-test as the agent uid and as root (no network)
+        run: |
+          set -euo pipefail
+          for user in 10001:10001 0:0; do
+            out="$(docker run --rm --network none --user "$user" --entrypoint node openclaw-bridge:smoke \
+              /skills/s3-user-files/read-pdf.js --self-test)"
+            echo "$out"
+            echo "$out" | grep -q '^read_pdf_text self-test passed: 2 pages in [0-9]* ms (PDFium 7902, node v24\.22\.1, arm64)\.$'
+          done
+
+      - name: read-pdf.test.js inside the image (agent uid, no network)
+        run: |
+          docker run --rm --network none --user 10001:10001 -e AWS_REGION=us-west-2 \
+            -w /skills/s3-user-files --entrypoint node openclaw-bridge:smoke --test read-pdf.test.js
+
+      - name: Boot smoke (/ping Healthy, no network)
+        run: |
+          set -euo pipefail
+          docker run -d --network none --name smoke openclaw-bridge:smoke
+          ok=
+          for i in $(seq 1 90); do
+            out="$(docker exec smoke node -e 'const http=require("http");http.get("http://127.0.0.1:8080/ping",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>process.stdout.write(d))}).on("error",e=>{process.stderr.write(String(e.message));process.exit(1)})' 2>/dev/null || true)"
+            if echo "$out" | grep -q 'Healthy'; then echo "ping ok after ${i} tries: $out"; ok=1; break; fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "=== /ping never returned Healthy; container logs: ==="
+            docker logs smoke || true
+            docker rm -f smoke || true
+            exit 1
+          fi
+          docker rm -f smoke
+
+      - name: Agent uid-split smoke
+        run: SMOKE_TIMEOUT=180 scripts/smoke-agent-uid-dirs.sh openclaw-bridge:smoke
