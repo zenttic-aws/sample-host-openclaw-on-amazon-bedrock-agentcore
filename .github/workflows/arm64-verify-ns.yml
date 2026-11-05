@@ -1,0 +1,133 @@
+# Throwaway fork-only workflow: builds the arm64 bridge image of
+# feat/namespace-dual-read and boot-smokes it on a native ubuntu-24.04-arm
+# runner, then activates the real proxy SDK snapshot with USER_NAMESPACE.
+# Not for merge to the official repo.
+name: arm64-verify-ns
+
+on:
+  push:
+    branches: [ci/arm64-verify-ns]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build arm64 bridge image
+        run: |
+          docker buildx build --platform linux/arm64 --provenance=false --load \
+            --tag openclaw-bridge:smoke --file bridge/Dockerfile bridge
+
+      - name: Node version and undici floor
+        run: |
+          echo "node: $(docker run --rm --entrypoint node openclaw-bridge:smoke -v)"
+          docker run --rm --entrypoint node openclaw-bridge:smoke /tmp/undici-floor-check.js
+
+      - name: Changed modules parse and load in the image
+        run: |
+          set -euo pipefail
+          for f in agentcore-proxy agentcore-contract proxy-sdk-snapshot runtime-lifecycle user-namespace \
+                   cognito-token workspace-sync live-seed-bridge; do
+            docker run --rm --network none --entrypoint node openclaw-bridge:smoke --check /app/$f.js
+          done
+          docker run --rm --network none --entrypoint node openclaw-bridge:smoke -e '
+            const ns = require("/app/user-namespace.js");
+            const opaque = "ns_" + "a".repeat(26);
+            if (ns.requestNamespace("telegram:1", undefined) !== "telegram_1") process.exit(1);
+            if (ns.requestNamespace("slack_channel:C0123", opaque) !== opaque) process.exit(2);
+            if (ns.requestNamespace("telegram:1", "telegram_2") !== null) process.exit(3);
+            if (ns.cognitoUsername("telegram:1", opaque) !== opaque) process.exit(4);
+            for (const f of ["cognito-token", "workspace-sync", "runtime-lifecycle"]) require(`/app/${f}.js`);
+            for (const s of ["s3-user-files", "api-keys", "eventbridge-cron"]) {
+              process.env.AWS_REGION = "us-west-2";
+              require(`/skills/${s}/common.js`);
+            }
+            console.log("modules ok");'
+
+      - name: Proxy SDK snapshot activates with USER_NAMESPACE (real snapshot protocol)
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/proxy-namespace-smoke.js" <<'EOF'
+          "use strict";
+          const http = require("node:http");
+          const { randomUUID } = require("node:crypto");
+          const { createProxySdkSnapshotOwner } = require("/app/proxy-sdk-snapshot.js");
+          const BASE = { PATH: "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", HOME: "/root",
+            NODE_PATH: "/app/node_modules", NODE_OPTIONS: "", AWS_REGION: "us-west-2" };
+          const ACTOR = "telegram:100000001";
+          const BINDING = { userId: "user_0123456789abcdef", actorId: ACTOR,
+            runtimeSessionId: "ses_" + "a".repeat(40), routingGeneration: 2 };
+          const env = (namespace) => ({ ...BASE, BEDROCK_MODEL_ID: "", BEDROCK_FALLBACK_MODEL_ID: "",
+            COGNITO_USER_POOL_ID: "", COGNITO_CLIENT_ID: "", S3_USER_FILES_BUCKET: "smoke-bucket",
+            SUBAGENT_MODEL_NAME: "bedrock-agentcore-subagent", SUBAGENT_BEDROCK_MODEL_ID: "",
+            BEDROCK_GUARDRAIL_ID: "", BEDROCK_GUARDRAIL_VERSION: "", BEDROCK_TEMPERATURE: "",
+            BEDROCK_USER_SELECTABLE_MODEL_IDS: "", USER_ID: ACTOR, INTERNAL_USER_ID: BINDING.userId,
+            USER_NAMESPACE: namespace, CHANNEL: "telegram", OPENCLAW_SKIP_CRON: "1" });
+          const health = () => new Promise((resolve, reject) => {
+            http.get("http://127.0.0.1:18790/health", (res) => {
+              let body = ""; res.on("data", (c) => { body += c; }); res.on("end", () => resolve([res.statusCode, body]));
+            }).on("error", reject);
+          });
+          async function attempt(namespace) {
+            const owner = createProxySdkSnapshotOwner({ env: BASE, onFailure: () => {}, onChild: (child) => {
+              child.stdout.on("data", (d) => process.stdout.write(`[proxy:out] ${d}`));
+              child.stderr.on("data", (d) => process.stdout.write(`[proxy:err] ${d}`));
+            } });
+            await owner.prepare();
+            try {
+              await owner.activate({ env: env(namespace), binding: BINDING, generation: randomUUID(),
+                signal: new AbortController().signal, assertCurrent: () => {} });
+              const [status, body] = await health();
+              if (status !== 200) throw new Error(`proxy health ${status}`);
+              console.log(`ACTIVATED namespace=${namespace} health=${status} ${body.slice(0, 120)}`);
+              return true;
+            } catch (error) {
+              console.log(`REFUSED namespace=${namespace} reason=${error.code || error.message}`);
+              return false;
+            } finally {
+              await owner.stop().catch(() => {});
+            }
+          }
+          (async () => {
+            const results = [];
+            for (const [namespace, expected] of [["ns_" + "a".repeat(26), true], ["telegram_100000001", true],
+              ["telegram_999", false], ["ns_short", false]]) {
+              results.push((await attempt(namespace)) === expected);
+            }
+            if (!results.every(Boolean)) { console.log("FAILED", JSON.stringify(results)); process.exit(1); }
+            console.log("proxy namespace smoke ok");
+            process.exit(0);
+          })().catch((error) => { console.log("FAILED", error.stack); process.exit(1); });
+          EOF
+          docker run --rm --network none -w /app --entrypoint node \
+            -v "$RUNNER_TEMP/proxy-namespace-smoke.js:/tmp/proxy-namespace-smoke.js:ro" \
+            openclaw-bridge:smoke /tmp/proxy-namespace-smoke.js
+
+      - name: Boot smoke (/ping Healthy, no network)
+        run: |
+          set -euo pipefail
+          docker run -d --network none --name smoke openclaw-bridge:smoke
+          ok=
+          for i in $(seq 1 90); do
+            out="$(docker exec smoke node -e 'const http=require("http");http.get("http://127.0.0.1:8080/ping",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>process.stdout.write(d))}).on("error",e=>{process.stderr.write(String(e.message));process.exit(1)})' 2>/dev/null || true)"
+            if echo "$out" | grep -q 'Healthy'; then echo "ping ok after ${i} tries: $out"; ok=1; break; fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "=== /ping never returned Healthy; container logs: ==="
+            docker logs smoke || true
+            docker rm -f smoke || true
+            exit 1
+          fi
+          docker rm -f smoke
+
+      - name: Agent uid-split smoke
+        run: SMOKE_TIMEOUT=180 scripts/smoke-agent-uid-dirs.sh openclaw-bridge:smoke
