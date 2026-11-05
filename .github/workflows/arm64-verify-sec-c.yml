@@ -1,0 +1,51 @@
+# Throwaway fork-only workflow: builds the arm64 bridge image and boot-smokes
+# it on a native ubuntu-24.04-arm runner. Not for merge to the official repo.
+name: arm64-verify-sec-c
+
+on:
+  push:
+    branches: [ci/arm64-verify-sec-c]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build arm64 bridge image
+        run: |
+          docker buildx build --platform linux/arm64 --provenance=false --load \
+            --tag openclaw-bridge:smoke --file bridge/Dockerfile bridge
+
+      - name: Node version and undici floor
+        run: |
+          echo "node: $(docker run --rm --entrypoint node openclaw-bridge:smoke -v)"
+          docker run --rm --entrypoint node openclaw-bridge:smoke /tmp/undici-floor-check.js
+
+      - name: Boot smoke (/ping Healthy, no network)
+        run: |
+          set -euo pipefail
+          docker run -d --network none --name smoke openclaw-bridge:smoke
+          ok=
+          for i in $(seq 1 90); do
+            out="$(docker exec smoke node -e 'const http=require("http");http.get("http://127.0.0.1:8080/ping",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>process.stdout.write(d))}).on("error",e=>{process.stderr.write(String(e.message));process.exit(1)})' 2>/dev/null || true)"
+            if echo "$out" | grep -q 'Healthy'; then echo "ping ok after ${i} tries: $out"; ok=1; break; fi
+            sleep 2
+          done
+          if [ -z "$ok" ]; then
+            echo "=== /ping never returned Healthy; container logs: ==="
+            docker logs smoke || true
+            docker rm -f smoke || true
+            exit 1
+          fi
+          docker rm -f smoke
+
+      - name: Agent uid-split smoke
+        run: SMOKE_TIMEOUT=180 scripts/smoke-agent-uid-dirs.sh openclaw-bridge:smoke
