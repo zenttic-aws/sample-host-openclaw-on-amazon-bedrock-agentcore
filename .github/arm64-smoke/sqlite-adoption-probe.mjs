@@ -27,7 +27,10 @@ config.gateway.port = 18791;
 fs.writeFileSync(`${stateDir}/openclaw.json`, JSON.stringify(config, null, 2));
 Object.assign(process.env, {
   HOME: home, OPENCLAW_STATE_DIR: stateDir, OPENCLAW_CONFIG_PATH: `${stateDir}/openclaw.json`,
-  OPENCLAW_WORKSPACE_DIR: `${stateDir}/workspace`, OPENCLAW_SKIP_CRON: "1", OPENCLAW_NO_RESPAWN: "1",
+  OPENCLAW_WORKSPACE_DIR: `${stateDir}/workspace`, OPENCLAW_SKIP_CRON: "1",
+  // The same respawn controls as openclaw-worker-owner.js: with a compile cache active, a
+  // foreground `gateway run` otherwise replaces this process (execve) before it opens SQLite.
+  OPENCLAW_NO_RESPAWN: "1", NODE_DISABLE_COMPILE_CACHE: "1",
   OPENCLAW_AGENTCORE_SQLITE_RECEIVER_PREPARE: "1", OPENCLAW_AGENTCORE_SQLITE_BACKEND_PREPARE: "1",
 });
 const broker = await import(`${PACKAGE}/dist/sqlite-worker-store-CpfrwHqQ.mjs`);

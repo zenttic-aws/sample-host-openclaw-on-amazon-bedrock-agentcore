@@ -70,9 +70,10 @@ jobs:
         run: |
           set +e
           mkdir -p "$RUNNER_TEMP/probe" && chmod 777 "$RUNNER_TEMP/probe"
+          # No NODE_COMPILE_CACHE: like the worker owner, the probe runs with the compile cache disabled.
           docker run -d --init --name adoption --network none --user 10001:10001 \
             -v "$PWD/.github/arm64-smoke:/smoke:ro" -v "$RUNNER_TEMP/probe:/probe" \
-            -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
+            -e NODE_DISABLE_COMPILE_CACHE=1 -e OPENCLAW_NO_RESPAWN=1 --entrypoint node openclaw-bridge:smoke \
             /smoke/sqlite-adoption-probe.mjs
           for i in $(seq 1 75); do
             grep -q '^ADOPTION ' "$RUNNER_TEMP/probe/result.txt" 2>/dev/null && break
