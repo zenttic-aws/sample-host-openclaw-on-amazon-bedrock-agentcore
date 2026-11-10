@@ -68,8 +68,9 @@ jobs:
 
       - name: The gateway adopts the prepared SQLite receiver (agent uid, no network)
         run: |
-          set -uo pipefail
-          timeout --signal=KILL 300 docker run --rm --name adoption --network none --user 10001:10001 \
+          set +e
+          # --init: the probe ends itself with SIGKILL, which PID 1 in a container would ignore.
+          timeout 300 docker run --rm --init --name adoption --network none --user 10001:10001 \
             -v "$PWD/.github/arm64-smoke:/smoke:ro" -e NODE_COMPILE_CACHE=/app/.compile-cache \
             --entrypoint node openclaw-bridge:smoke /smoke/sqlite-adoption-probe.mjs > "$RUNNER_TEMP/adoption-full.log" 2>&1
           echo "probe exit=$?"
