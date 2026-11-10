@@ -1,0 +1,41 @@
+# Throwaway fork-only workflow: measures what the SQLite receiver preparation saves on
+# arm64 for the current image (openclaw 2026.9.5). Runs the prepared-gateway smoke
+# three times with and three times without the preparation controls.
+# Not for merge to the official repo.
+name: arm64-ab-sqlite-prep
+
+on:
+  push:
+    branches: [ci/arm64-ab-sqlite-prep]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build arm64 bridge image
+        run: |
+          docker buildx build --platform linux/arm64 --provenance=false --load \
+            --tag openclaw-bridge:smoke --file bridge/Dockerfile bridge
+
+      - name: Prepared gateway with and without SQLite receiver preparation (3 runs each, no network)
+        run: |
+          set -euo pipefail
+          for round in 1 2 3; do
+            for mode in with without; do
+              flag=0; [ "$mode" = without ] && flag=1
+              docker run --rm --network none -v "$PWD/.github/arm64-smoke:/smoke:ro" \
+                -e NODE_COMPILE_CACHE=/app/.compile-cache -e SMOKE_WITHOUT_SQLITE_PREP=$flag \
+                --entrypoint node openclaw-bridge:smoke /smoke/prepared-gateway-smoke.js 2026.9.5 > "$RUNNER_TEMP/$mode-$round.log"
+              grep -q '^SMOKE PASSED' "$RUNNER_TEMP/$mode-$round.log"
+              echo "$mode round $round: $(grep -E '^(PREPARED|ACTIVATED|READY|SMOKE PASSED)' "$RUNNER_TEMP/$mode-$round.log" | sed -E 's/.*\(([0-9.]+s)\)$/\1/' | tr '\n' ' ')"
+            done
+          done
