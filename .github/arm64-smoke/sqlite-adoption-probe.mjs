@@ -24,23 +24,26 @@ Object.assign(process.env, {
 });
 const started = performance.now();
 const ms = () => Math.round(performance.now() - started);
+// The gateway reroutes console output once it starts, so write probe lines to fd 1 directly
+// and end with SIGKILL: the gateway's own exit handling must not keep the probe alive.
+const say = (line) => fs.writeSync(1, `${line}\n`);
+const finish = (line) => { say(line); process.kill(process.pid, "SIGKILL"); };
 const broker = await import(`${PACKAGE}/dist/sqlite-worker-store-CpfrwHqQ.mjs`);
 const prepared = await broker.prepareUnboundSqliteReceiver({ timeoutMs: 30000 });
-console.log(`PREPARED ${ms()}ms ${JSON.stringify(prepared)}`);
-if (!prepared.prepared || !prepared.backend_definitions_prepared || !prepared.empty) process.exit(1);
+say(`PREPARED ${ms()}ms ${JSON.stringify(prepared)}`);
+if (!prepared.prepared || !prepared.backend_definitions_prepared || !prepared.empty) finish("PROBE FAILED: not prepared");
 const reservation = globalThis[Symbol.for("openclaw.sqliteWorkerBroker")]?.agentCoreReceiver;
-if (!reservation) { console.log("PROBE FAILED: reservation not found"); process.exit(1); }
+if (!reservation) finish("PROBE FAILED: reservation not found");
 process.env.USER_ID = "telegram:100000001";
 process.env.INTERNAL_USER_ID = "user_smoke_0001";
 const armed = await broker.bindPreparedSqliteReceiver({ generation: "probe", environment: { ...process.env } });
-console.log(`ARMED ${ms()}ms ${JSON.stringify(armed)}`);
+say(`ARMED ${ms()}ms ${JSON.stringify(armed)}`);
 const deadline = Date.now() + 120000;
 const timer = setInterval(() => {
   const phase = reservation.phase;
   if (phase === "consumed" || phase === "retired" || Date.now() > deadline) {
     clearInterval(timer);
-    console.log(`ADOPTION ${phase} ${ms()}ms actors=${reservation.slot?.actors?.size ?? 0} thread=${reservation.slot?.worker?.threadId}`);
-    process.exit(phase === "consumed" ? 0 : 1);
+    finish(`ADOPTION ${phase} ${ms()}ms actors=${reservation.slot?.actors?.size ?? 0} thread=${reservation.slot?.worker?.threadId}`);
   }
 }, 25);
 process.argv = [process.argv[0], `${PACKAGE}/openclaw.mjs`, "gateway", "run", "--port", "18791", "--bind", "loopback"];

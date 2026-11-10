@@ -68,11 +68,17 @@ jobs:
 
       - name: The gateway adopts the prepared SQLite receiver (agent uid, no network)
         run: |
-          set -euo pipefail
-          docker run --rm --network none --user 10001:10001 -v "$PWD/.github/arm64-smoke:/smoke:ro" \
-            -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
-            /smoke/sqlite-adoption-probe.mjs 2>&1 | grep -E '^(PREPARED|ARMED|ADOPTION|PROBE)' | tee "$RUNNER_TEMP/adoption.log"
-          grep -q '^ADOPTION consumed ' "$RUNNER_TEMP/adoption.log"
+          set -uo pipefail
+          timeout --signal=KILL 300 docker run --rm --name adoption --network none --user 10001:10001 \
+            -v "$PWD/.github/arm64-smoke:/smoke:ro" -e NODE_COMPILE_CACHE=/app/.compile-cache \
+            --entrypoint node openclaw-bridge:smoke /smoke/sqlite-adoption-probe.mjs > "$RUNNER_TEMP/adoption-full.log" 2>&1
+          echo "probe exit=$?"
+          docker rm -f adoption > /dev/null 2>&1 || true
+          grep -E '^(PREPARED|ARMED|ADOPTION|PROBE)' "$RUNNER_TEMP/adoption-full.log" || true
+          if ! grep -q '^ADOPTION consumed ' "$RUNNER_TEMP/adoption-full.log"; then
+            tail -n 80 "$RUNNER_TEMP/adoption-full.log"
+            exit 1
+          fi
 
       - name: Prepared gateway with and without SQLite receiver preparation (3 runs each, no network)
         run: |
