@@ -1,0 +1,84 @@
+# Throwaway fork-only workflow: builds the arm64 bridge image of
+# feat/openclaw-workspace-files-not-in-prompt on a native ubuntu-24.04-arm
+# runner, validates the rendered OpenClaw config with the image's own OpenClaw,
+# runs the prepared gateway with a USER.md in the workspace and chat turns
+# against a loopback stub provider (no OpenClaw Project Context and no USER.md
+# text in any system text, no seeded workspace templates), then boot-smokes the
+# image. Not for merge to the official repo.
+name: arm64-verify-workspace-files
+
+on:
+  push:
+    branches: [ci/arm64-verify-workspace-files]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build arm64 bridge image (runs the patch-script tests and applies every patch)
+        run: |
+          set -o pipefail
+          docker buildx build --platform linux/arm64 --provenance=false --load --progress=plain \
+            --tag openclaw-bridge:smoke --file bridge/Dockerfile bridge 2>&1 | tee "$RUNNER_TEMP/build.log"
+          grep -F '[patch-openclaw] OpenClaw 2026.9.5: empty subagent fact patch applied.' "$RUNNER_TEMP/build.log"
+          grep -F '[patch-openclaw-preinit] OpenClaw 2026.9.5: preinit patches applied.' "$RUNNER_TEMP/build.log"
+          grep -F '[patch-openclaw-snapshot] OpenClaw 2026.9.5: snapshot patches applied.' "$RUNNER_TEMP/build.log"
+          grep -E 'ℹ (tests|pass|fail) ' "$RUNNER_TEMP/build.log" | head -6 || true
+
+      - name: Node version, architecture and undici floor
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint node openclaw-bridge:smoke -p 'process.version + " " + process.arch'
+          test "$(docker run --rm --entrypoint node openclaw-bridge:smoke -p process.arch)" = arm64
+          docker run --rm --entrypoint node openclaw-bridge:smoke /tmp/undici-floor-check.js
+
+      - name: Rendered config passes the image's own `openclaw config validate` (no network)
+        run: |
+          set -euo pipefail
+          docker run --rm --network none -v "$PWD/bridge/gateway-config.test.js:/check/gateway-config.test.js:ro" \
+            -e OPENCLAW_PACKAGE_DIR=/usr/local/lib/node_modules/openclaw --entrypoint sh openclaw-bridge:smoke -c '
+              set -e
+              cp /check/gateway-config.test.js /app/gateway-config.test.js
+              cd /app && node --test gateway-config.test.js' | tee "$RUNNER_TEMP/config.log"
+          grep -E '^ℹ pass 4$' "$RUNNER_TEMP/config.log"
+          grep -E '^ℹ fail 0$' "$RUNNER_TEMP/config.log"
+
+      - name: Prepared gateway, activation and chat turns; workspace files not in the system prompt, no seeded templates (no network)
+        run: |
+          set -euo pipefail
+          docker run --rm --network none -v "$PWD/.github/arm64-smoke:/smoke:ro" \
+            -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
+            /smoke/prepared-gateway-smoke.js 2026.9.5 | tee "$RUNNER_TEMP/prepared.log"
+          grep -q '^SMOKE PASSED' "$RUNNER_TEMP/prepared.log"
+          grep -E '^PROJECT CONTEXT: in 0 of [1-9][0-9]* chat request\(s\); USER.md text in 0;' "$RUNNER_TEMP/prepared.log"
+
+      - name: Boot smoke (/ping Healthy, no network)
+        run: |
+          set -euo pipefail
+          docker run -d --network none --name smoke openclaw-bridge:smoke
+          ok=
+          for i in $(seq 1 90); do
+            out="$(docker exec smoke node -e 'const http=require("http");http.get("http://127.0.0.1:8080/ping",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>process.stdout.write(d))}).on("error",e=>{process.stderr.write(String(e.message));process.exit(1)})' 2>/dev/null || true)"
+            if echo "$out" | grep -q 'Healthy'; then echo "ping ok after ${i} tries: $out"; ok=1; break; fi
+            sleep 2
+          done
+          docker logs smoke 2>&1 | grep -E 'BOOTSTRAP_READY|preparation elapsedMs' || true
+          if [ -z "$ok" ]; then
+            echo "=== /ping never returned Healthy; container logs: ==="
+            docker logs smoke || true
+            docker rm -f smoke || true
+            exit 1
+          fi
+          docker rm -f smoke
+
+      - name: Agent uid-split smoke
+        run: SMOKE_TIMEOUT=180 scripts/smoke-agent-uid-dirs.sh openclaw-bridge:smoke
