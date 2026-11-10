@@ -1,0 +1,120 @@
+# Throwaway fork-only workflow: builds the arm64 bridge image of
+# chore/openclaw-2026.11.2 on a native ubuntu-24.04-arm runner, checks the patch
+# set, runs the prepared gateway with chat turns against a loopback stub provider
+# (with and without the SQLite receiver preparation), checks that the gateway
+# adopts the prepared SQLite receiver, then boot-smokes the image.
+# Not for merge to the official repo.
+name: arm64-verify-openclaw-2026-11-2
+
+on:
+  push:
+    branches: [ci/arm64-verify-openclaw-2026-11-2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  EXPECTED_TOOLS: >-
+    agents_list agents_wait conversations_list create_goal dashboard dir_fetch dir_list exec file_fetch
+    file_write get_goal github_identity_status intent ls memory_get memory_search mobile_ui node_inference
+    openclaw portal session_status sessions sessions_history sessions_list sessions_search sessions_send
+    sessions_spawn sessions_yield skill_workshop skills_read skills_search subagents talk_voice transcripts
+    update_goal web_fetch
+
+jobs:
+  arm64:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build arm64 bridge image (runs the patch-script tests and applies every patch)
+        run: |
+          set -o pipefail
+          docker buildx build --platform linux/arm64 --provenance=false --load --progress=plain \
+            --tag openclaw-bridge:smoke --file bridge/Dockerfile bridge 2>&1 | tee "$RUNNER_TEMP/build.log"
+          grep -F '[patch-openclaw-delivery-expiry] OpenClaw 2026.11.2: suspended delivery expiry patch applied.' "$RUNNER_TEMP/build.log"
+          grep -F '[patch-openclaw-preinit] OpenClaw 2026.11.2: preinit patches applied.' "$RUNNER_TEMP/build.log"
+          grep -F '[patch-openclaw-snapshot] OpenClaw 2026.11.2: snapshot patches applied.' "$RUNNER_TEMP/build.log"
+          grep -E 'undici.*\(min |undici floor check passed' "$RUNNER_TEMP/build.log"
+          grep -E 'ℹ (tests|pass|fail|skipped) ' "$RUNNER_TEMP/build.log" | head -8 || true
+          if grep -E '^#[0-9]+ [0-9.]+ ℹ fail [1-9]' "$RUNNER_TEMP/build.log"; then exit 1; fi
+
+      - name: Node version, architecture, undici floor and runtime manifest
+        run: |
+          set -euo pipefail
+          docker run --rm --entrypoint node openclaw-bridge:smoke -p 'process.version + " " + process.arch'
+          test "$(docker run --rm --entrypoint node openclaw-bridge:smoke -p process.arch)" = arm64
+          docker run --rm --entrypoint node openclaw-bridge:smoke /tmp/undici-floor-check.js
+          docker run --rm --network none --entrypoint node openclaw-bridge:smoke -e '
+            const m = require("/app/runtime-source-manifest.json");
+            const files = m.files.map((f) => f.path);
+            const patch = require("/app/patches/runtime-v2.json");
+            console.log(`manifest: openclaw ${m.openclaw}, node ${m.node}, ${files.length} pinned files, ${patch.files.length} snapshot patch files`);
+            if (m.openclaw !== "2026.11.2" || patch.version !== "2026.11.2" || patch.files.length !== 3 ||
+                !files.includes("/app/state-schema.js") || files.some((f) => f.endsWith("/patch-openclaw.js"))) process.exit(1);'
+
+      - name: Prepared gateway (preinit + SQLite receiver preparation), activation, chat turns and tool list (no network)
+        run: |
+          set -euo pipefail
+          docker run --rm --network none -v "$PWD/.github/arm64-smoke:/smoke:ro" -e EXPECTED_TOOLS \
+            -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
+            /smoke/prepared-gateway-smoke.js 2026.11.2 | tee "$RUNNER_TEMP/prepared.log"
+          grep -q '^SMOKE PASSED' "$RUNNER_TEMP/prepared.log"
+          grep -E '^REQUEST 1: .*messages=system,user,user\(runtime-context\)$' "$RUNNER_TEMP/prepared.log"
+
+      - name: The gateway adopts the prepared SQLite receiver (agent uid, no network)
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --user 10001:10001 -v "$PWD/.github/arm64-smoke:/smoke:ro" \
+            -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
+            /smoke/sqlite-adoption-probe.mjs 2>&1 | grep -E '^(PREPARED|ARMED|ADOPTION|PROBE)' | tee "$RUNNER_TEMP/adoption.log"
+          grep -q '^ADOPTION consumed ' "$RUNNER_TEMP/adoption.log"
+
+      - name: Prepared gateway with and without SQLite receiver preparation (3 runs each, no network)
+        run: |
+          set -euo pipefail
+          for round in 1 2 3; do
+            for mode in with without; do
+              flag=""; [ "$mode" = without ] && flag="-e SMOKE_WITHOUT_SQLITE_PREP=1"
+              docker run --rm --network none -v "$PWD/.github/arm64-smoke:/smoke:ro" $flag \
+                -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
+                /smoke/prepared-gateway-smoke.js 2026.11.2 > "$RUNNER_TEMP/$mode-$round.log" 2>&1 || { cat "$RUNNER_TEMP/$mode-$round.log"; exit 1; }
+              grep -q '^SMOKE PASSED' "$RUNNER_TEMP/$mode-$round.log"
+              echo "$mode round $round: $(grep -E '^(PREPARED|ACTIVATED|READY|SMOKE PASSED)' "$RUNNER_TEMP/$mode-$round.log" | sed -E 's/.*\(([0-9.]+s)\)$/\1/' | tr '\n' ' ')"
+            done
+          done
+
+      - name: read-pdf.js --self-test as the agent uid (no network)
+        run: |
+          set -euo pipefail
+          out="$(docker run --rm --network none --user 10001:10001 --entrypoint node openclaw-bridge:smoke \
+            /skills/s3-user-files/read-pdf.js --self-test)"
+          echo "$out"
+          echo "$out" | grep -q '^read_pdf_text self-test passed: '
+
+      - name: Boot smoke (/ping Healthy, no network)
+        run: |
+          set -euo pipefail
+          docker run -d --network none --name smoke openclaw-bridge:smoke
+          ok=
+          for i in $(seq 1 90); do
+            out="$(docker exec smoke node -e 'const http=require("http");http.get("http://127.0.0.1:8080/ping",r=>{let d="";r.on("data",c=>d+=c);r.on("end",()=>process.stdout.write(d))}).on("error",e=>{process.stderr.write(String(e.message));process.exit(1)})' 2>/dev/null || true)"
+            if echo "$out" | grep -q 'Healthy'; then echo "ping ok after ${i} tries: $out"; ok=1; break; fi
+            sleep 2
+          done
+          docker logs smoke 2>&1 | grep -E 'BOOTSTRAP_READY|preparation elapsedMs' || true
+          if [ -z "$ok" ]; then
+            echo "=== /ping never returned Healthy; container logs: ==="
+            docker logs smoke || true
+            docker rm -f smoke || true
+            exit 1
+          fi
+          docker logs smoke 2>&1 | grep -q 'BOOTSTRAP_READY platform=V2 openclaw=2026.11.2'
+          docker rm -f smoke
+
+      - name: Agent uid-split smoke
+        run: SMOKE_TIMEOUT=180 scripts/smoke-agent-uid-dirs.sh openclaw-bridge:smoke
