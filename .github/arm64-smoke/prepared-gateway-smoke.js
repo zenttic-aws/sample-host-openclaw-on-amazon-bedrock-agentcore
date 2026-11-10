@@ -90,6 +90,99 @@ const extractText = (value) => {
   return "";
 };
 
+// SMOKE_SKILL_DIRS=control|restore: the system prompt's skills catalog after a
+// restart from a backup that holds OpenClaw's own skill directories.
+//   control: the directories are on local disk, as a restore left them before
+//            the bridge stopped restoring them (each probe skill is listed).
+//   restore: the same files come from a fake S3 backup and a session-storage
+//            mirror through the bridge's own restore code, followed by the
+//            activation step removeOpenClawSkillDirs (none is listed).
+// In both modes the catalog must still list the image's skills from /skills.
+const SKILL_MODE = process.env.SMOKE_SKILL_DIRS || "";
+if (SKILL_MODE && !["control", "restore"].includes(SKILL_MODE)) throw new Error(`SMOKE_SKILL_DIRS=${SKILL_MODE}`);
+// `backup` probes are in the fake S3 backup and the mirror; the `leftover` one is
+// already on local disk before activation (only removeOpenClawSkillDirs acts on it).
+const SKILL_PROBES = [
+  { rel: "skills/probe-st/SKILL.md", marker: "PROBE-SKILLST-8e21", source: "backup" },
+  { rel: "workspace/skills/probe-ws/SKILL.md", marker: "PROBE-SKILLWS-41d7", source: "backup" },
+  { rel: "workspace/.agents/skills/probe-ag/SKILL.md", marker: "PROBE-SKILLAG-6d02", source: "backup" },
+  { rel: "workspace/skills/probe-lo/SKILL.md", marker: "PROBE-SKILLLO-2b8f", source: "leftover" },
+];
+const skillMd = ({ rel, marker }) =>
+  `---\nname: ${rel.split("/").at(-2)}\ndescription: ${marker} probe skill used by the arm64 smoke.\n---\n\n# probe\n`;
+const writeFile = (file, body) => {
+  fs.mkdirSync(require("node:path").dirname(file), { recursive: true });
+  fs.writeFileSync(file, body);
+};
+
+async function placeSkillProbes(mode) {
+  const path = require("node:path");
+  const stateDir = stateStorage.resolvePaths().stateDir;
+  if (mode === "control") {
+    for (const probe of SKILL_PROBES) writeFile(path.join(stateDir, probe.rel), skillMd(probe));
+  } else {
+    const NS = "telegram_100000001";
+    const backup = SKILL_PROBES.filter((probe) => probe.source === "backup");
+    for (const probe of SKILL_PROBES.filter((p) => p.source === "leftover")) writeFile(path.join(stateDir, probe.rel), skillMd(probe));
+    const objects = new Map(backup.map((probe) => [`${NS}/.openclaw/${probe.rel}`, Buffer.from(skillMd(probe))]));
+    objects.set(`${NS}/.openclaw/workspace/USER.md`, Buffer.from("# USER.md\n"));
+    const sha = (body) => require("node:crypto").createHash("sha256").update(body).digest("hex");
+    const fakeS3 = {
+      async send(cmd) {
+        if (cmd.kind === "list") {
+          return { Contents: [...objects].map(([Key, body]) => ({ Key, Size: body.length })), IsTruncated: false };
+        }
+        const body = objects.get(cmd.input.Key);
+        if (!body) throw new Error("NoSuchKey");
+        if (cmd.kind === "head") return { ContentLength: body.length, Metadata: { sha256: sha(body) } };
+        if (cmd.kind === "get") return { Body: (async function* () { yield body; })(), Metadata: { sha256: sha(body) } };
+        throw new Error(`unexpected S3 command ${cmd.kind}`);
+      },
+    };
+    const Module = require("node:module");
+    const realLoad = Module._load;
+    Module._load = function (request, ...rest) {
+      if (request === "@aws-sdk/client-s3") {
+        const cmd = (kind) => function (input) { this.kind = kind; this.input = input; };
+        return { S3Client: function () { return fakeS3; }, ListObjectsV2Command: cmd("list"),
+          GetObjectCommand: cmd("get"), HeadObjectCommand: cmd("head"), PutObjectCommand: cmd("put") };
+      }
+      return realLoad.call(this, request, ...rest);
+    };
+    process.env.AWS_REGION = "us-west-2";
+    process.env.S3_USER_FILES_BUCKET = "smoke-bucket";
+    const mountDir = "/tmp/smoke-mount";
+    for (const probe of backup) writeFile(path.join(mountDir, ".openclaw", probe.rel), skillMd(probe));
+    writeFile(path.join(mountDir, ".openclaw", "workspace", "MEMORY.md"), "# MEMORY.md\n");
+    const quiet = { log() {}, warn: (...a) => console.log("[warn]", ...a), error: (...a) => console.log("[error]", ...a) };
+    const mount = stateStorage.setupSessionStorage({ homeDir: process.env.HOME || "/root", mountDir, log: quiet });
+    const workspaceSync = require("/app/workspace-sync.js");
+    workspaceSync.configureCredentials({ accessKeyId: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "smoke-not-a-real-secret" });
+    const restored = await workspaceSync.restoreWorkspace(NS, { overwrite: false });
+    const removed = stateStorage.removeOpenClawSkillDirs(stateDir, { log: quiet });
+    console.log(`RESTORE mount=${JSON.stringify(mount.restored)} s3=${JSON.stringify(restored)} removed=${JSON.stringify(removed)}`);
+  }
+  const onDisk = SKILL_PROBES.filter((probe) => fs.existsSync(path.join(stateDir, probe.rel))).map((probe) => probe.rel);
+  console.log(`SKILLS ${mode} on local disk before activation: ${onDisk.length ? onDisk.join(" ") : "none"}`);
+}
+
+function checkSkillsCatalog(mode, chat) {
+  const last = chat[chat.length - 1]?.body || {};
+  const system = (last.messages || []).filter((m) => m.role === "system").map((m) => extractText(m.content)).join("\n");
+  const everything = chat.map((entry) => JSON.stringify(entry.body || {})).join("\n");
+  const catalog = system.includes("<available_skills>");
+  const imageSkills = [...system.matchAll(/<location>\/skills\/([^/<]+)\/SKILL\.md<\/location>/g)].map((m) => m[1]);
+  console.log(`SKILLS ${mode} catalog=${catalog} /skills entries listed: ${imageSkills.length ? imageSkills.join(" ") : "none"}`);
+  if (!catalog || !imageSkills.length) fail("the skills catalog lists no skill from /skills");
+  for (const probe of SKILL_PROBES) {
+    const listed = system.includes(probe.marker);
+    const anywhere = everything.includes(probe.marker);
+    console.log(`SKILLS ${mode} ${probe.rel}: ${listed ? "listed in the system prompt" : anywhere ? "elsewhere in a request" : "absent from every request"}`);
+    if (mode === "control" && !listed) fail(`control: ${probe.rel} is not listed, so the check would prove nothing`);
+    if (mode === "restore" && anywhere) fail(`restore: ${probe.rel} reached a model request`);
+  }
+}
+
 (async () => {
   await new Promise((resolve, reject) => stub.listen(18790, "127.0.0.1", resolve).on("error", reject));
   console.log(`stub listening on 127.0.0.1:18790 (${elapsed()})`);
@@ -124,6 +217,7 @@ const extractText = (value) => {
   console.log(`PREPARED: openclaw:prepared acknowledged by preinit (${elapsed()})`);
 
   // The restore would run here; then the contract writes config and AGENTS.md.
+  if (SKILL_MODE) await placeSkillProbes(SKILL_MODE);
   const token = randomUUID().replace(/-/g, "") + randomUUID().replace(/-/g, "");
   fs.mkdirSync(`${OPENCLAW_DIR}/workspace`, { recursive: true });
   fs.writeFileSync(`${OPENCLAW_DIR}/openclaw.json`, JSON.stringify(renderConfig({ gatewayToken: token }), null, 2));
@@ -168,6 +262,7 @@ const extractText = (value) => {
     });
     console.log(`REQUEST ${index + 1}: model=${body.model} tools=${(body.tools || []).length} messages=${roles.join(",")}`);
   }
+  if (SKILL_MODE) checkSkillsCatalog(SKILL_MODE, chat);
   const tools = (chat[0]?.body?.tools || []).map((tool) => tool.function?.name).sort();
   console.log(`TOOLS (${tools.length}): ${tools.join(" ")}`);
   if (process.env.EXPECTED_TOOLS && tools.join(" ") !== process.env.EXPECTED_TOOLS.split(/\s+/).sort().join(" ")) {

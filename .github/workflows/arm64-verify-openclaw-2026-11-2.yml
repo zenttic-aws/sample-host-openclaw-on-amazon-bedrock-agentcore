@@ -66,6 +66,18 @@ jobs:
           grep -q '^SMOKE PASSED' "$RUNNER_TEMP/prepared.log"
           grep -E '^REQUEST 1: .*messages=system,user,user\(runtime-context\)$' "$RUNNER_TEMP/prepared.log"
 
+      - name: Skills catalog after a restart from a backup that holds OpenClaw's own skill directories (no network)
+        run: |
+          set -euo pipefail
+          for mode in control restore; do
+            docker run --rm --network none -v "$PWD/.github/arm64-smoke:/smoke:ro" -e SMOKE_SKILL_DIRS="$mode" \
+              -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
+              /smoke/prepared-gateway-smoke.js 2026.11.2 > "$RUNNER_TEMP/skills-$mode.log" 2>&1 \
+              || { cat "$RUNNER_TEMP/skills-$mode.log"; exit 1; }
+            grep -q '^SMOKE PASSED' "$RUNNER_TEMP/skills-$mode.log" || { cat "$RUNNER_TEMP/skills-$mode.log"; exit 1; }
+            grep -E '^(RESTORE|SKILLS|REQUEST 1|SMOKE PASSED)' "$RUNNER_TEMP/skills-$mode.log"
+          done
+
       - name: The gateway adopts the prepared SQLite receiver (agent uid, no network)
         run: |
           set +e
