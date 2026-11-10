@@ -69,14 +69,20 @@ jobs:
       - name: The gateway adopts the prepared SQLite receiver (agent uid, no network)
         run: |
           set +e
-          # --init: the probe ends itself with SIGKILL, which PID 1 in a container would ignore.
-          timeout 300 docker run --rm --init --name adoption --network none --user 10001:10001 \
-            -v "$PWD/.github/arm64-smoke:/smoke:ro" -e NODE_COMPILE_CACHE=/app/.compile-cache \
-            --entrypoint node openclaw-bridge:smoke /smoke/sqlite-adoption-probe.mjs > "$RUNNER_TEMP/adoption-full.log" 2>&1
-          echo "probe exit=$?"
-          docker rm -f adoption > /dev/null 2>&1 || true
-          grep -E '^(PREPARED|ARMED|ADOPTION|PROBE)' "$RUNNER_TEMP/adoption-full.log" || true
-          if ! grep -q '^ADOPTION consumed ' "$RUNNER_TEMP/adoption-full.log"; then
+          mkdir -p "$RUNNER_TEMP/probe" && chmod 777 "$RUNNER_TEMP/probe"
+          docker run -d --init --name adoption --network none --user 10001:10001 \
+            -v "$PWD/.github/arm64-smoke:/smoke:ro" -v "$RUNNER_TEMP/probe:/probe" \
+            -e NODE_COMPILE_CACHE=/app/.compile-cache --entrypoint node openclaw-bridge:smoke \
+            /smoke/sqlite-adoption-probe.mjs
+          for i in $(seq 1 75); do
+            grep -q '^ADOPTION ' "$RUNNER_TEMP/probe/result.txt" 2>/dev/null && break
+            sleep 2
+          done
+          sleep 2
+          docker logs adoption > "$RUNNER_TEMP/adoption-full.log" 2>&1
+          docker rm -f adoption > /dev/null 2>&1
+          cat "$RUNNER_TEMP/probe/result.txt"
+          if ! grep -q '^ADOPTION consumed ' "$RUNNER_TEMP/probe/result.txt"; then
             tail -n 80 "$RUNNER_TEMP/adoption-full.log"
             exit 1
           fi
