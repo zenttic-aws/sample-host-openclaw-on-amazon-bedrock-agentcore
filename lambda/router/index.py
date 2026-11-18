@@ -416,7 +416,8 @@ def validate_slack_webhook(headers, body):
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Slack webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Slack webhook invalid timestamp: %s", timestamp)
         return False
 
@@ -464,7 +465,8 @@ def validate_feishu_webhook(headers, body_bytes):
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Feishu webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
         return False
 
@@ -3045,15 +3047,14 @@ def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
     try:
         return _handler_impl(event, context)
-    except Exception:
+    except Exception as e:
         # Contain any uncaught exception on the unauthenticated webhook path so
         # that malformed input cannot register a Lambda invocation error
         # (which API Gateway surfaces as 5xx and which drives the
         # openclaw-router-errors CloudWatch alarm).
-        try:
-            logger.exception("Unhandled exception in router handler")
-        except Exception:
-            pass
+        # Only the exception type is logged: the message and traceback can
+        # carry request bodies, header values or reply text.
+        logger.error("Unhandled router error: %s", type(e).__name__)
         return {"statusCode": 500, "body": "Internal Server Error"}
 
 

@@ -71,7 +71,7 @@ def verify_signature(headers, body_bytes, app_secret):
     if not app_secret:
         return False
     signature = (headers or {}).get("x-hub-signature-256", "")
-    if not signature or not signature.startswith("sha256="):
+    if not isinstance(signature, str) or not signature.startswith("sha256="):
         return False
     if not isinstance(body_bytes, bytes):
         return False
