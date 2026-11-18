@@ -71,7 +71,12 @@ class BuildStack(Stack):
         )
 
         # --- S3 bucket for bridge source uploads ---------------------------------
-        # Receives a zip of bridge/ uploaded by scripts/codebuild-push.sh
+        # Receives a zip of bridge/ uploaded by scripts/codebuild-push.sh.
+        # Versioning is on so that scripts/codebuild-push.sh can capture the
+        # VersionId of the upload and pass it to CodeBuild as --source-version,
+        # binding every build to the exact object the operator uploaded. A
+        # later overwrite of ``bridge-source.zip`` cannot retroactively change
+        # what a running build consumes.
         self.source_bucket = s3.Bucket(
             self,
             "BuildSourceBucket",
@@ -80,8 +85,51 @@ class BuildStack(Stack):
             auto_delete_objects=True,
             block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
             enforce_ssl=True,
-            versioned=False,
+            versioned=True,
         )
+
+        # Optional: restrict who may upload the build input. If the operator
+        # provides a list of release/deploy role ARNs via the
+        # ``build_source_writer_arns`` context, deny every ``s3:PutObject*``
+        # that is not performed by one of those principals. CloudFormation
+        # itself does not write objects into this bucket, so this does not
+        # affect stack deploys. Omitting the context keeps the historical
+        # behaviour (any principal with s3:PutObject on the bucket may write).
+        writer_arns_ctx = self.node.try_get_context("build_source_writer_arns") or []
+        if isinstance(writer_arns_ctx, str):
+            writer_arns = [arn.strip() for arn in writer_arns_ctx.split(",") if arn.strip()]
+        else:
+            writer_arns = [str(arn).strip() for arn in writer_arns_ctx if str(arn).strip()]
+        if writer_arns:
+            self.source_bucket.add_to_resource_policy(
+                iam.PolicyStatement(
+                    sid="DenyUnapprovedBuildSourceWriters",
+                    effect=iam.Effect.DENY,
+                    actions=[
+                        "s3:PutObject",
+                        "s3:PutObjectAcl",
+                        "s3:PutObjectTagging",
+                        "s3:PutObjectVersionAcl",
+                        "s3:PutObjectVersionTagging",
+                        "s3:DeleteObject",
+                        "s3:DeleteObjectVersion",
+                    ],
+                    resources=[self.source_bucket.arn_for_objects("*")],
+                    principals=[iam.StarPrincipal()],
+                    conditions={
+                        "StringNotLike": {
+                            # auto-delete lambda and CloudFormation custom
+                            # resources use their own session role; exempting
+                            # them by path keeps ``removal_policy=DESTROY``
+                            # working.
+                            "aws:PrincipalArn": writer_arns + [
+                                f"arn:{partition}:iam::{account}:role/cdk-*",
+                                f"arn:{partition}:iam::{account}:role/*AutoDeleteObjects*",
+                            ],
+                        }
+                    },
+                )
+            )
 
         # --- CloudWatch log group for build logs ---------------------------------
         build_log_group = logs.LogGroup(

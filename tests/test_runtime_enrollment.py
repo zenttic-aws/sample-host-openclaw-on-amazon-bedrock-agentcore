@@ -352,8 +352,10 @@ def test_legacy_reconciliation_continues_after_empty_filtered_page():
     with pytest.raises(routing.RouteUnavailable, match="retained ownership"):
         module.resolve_user("telegram", "123")
     scans = [params for operation, params in table.calls if operation == "scan"]
-    assert len(scans) == 2
-    assert all(scan["ConsistentRead"] is True for scan in scans)
+    # Legacy residue under a non-derived USER# partition is only discoverable via the
+    # filtered table scan; the scan must be driven with consistent reads and a page
+    # Limit sized for a full 1 MB page so unrelated growth does not starve it.
+    assert scans and all(scan["ConsistentRead"] is True and scan["Limit"] >= 1000 for scan in scans)
     assert not module.identity_client.calls
 
 
@@ -507,6 +509,9 @@ def test_bound_channel_cron_uses_canonical_session_and_delivers_to_scheduled_cha
     assert module.redeem_bind_code("LINKCODE", "slack", "456") == (user, True)
     module.identity_table.items[(f"USER#{user}", "CRON#schedule123")] = {
         "PK": f"USER#{user}", "SK": "CRON#schedule123",
+        "channel": "slack", "channelTarget": "C123",
+        "channelActorId": "slack:456", "actorId": "telegram:owner",
+        "message": "hi",
     }
     cron = load_lambda("cron")
     cron.identity_table = module.identity_table

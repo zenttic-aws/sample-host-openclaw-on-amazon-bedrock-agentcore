@@ -46,7 +46,21 @@ TELEGRAM_TOKEN=$(aws secretsmanager get-secret-value \
     --secret-id openclaw/channels/telegram \
     --region "$REGION" $PROFILE_ARG --query SecretString --output text)
 
-WEBHOOK_RESULT=$(curl -s "https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook?url=${API_URL}webhook/telegram&secret_token=${WEBHOOK_SECRET}")
+# Avoid placing the bot token or webhook secret in argv (readable via
+# `ps`/`/proc/<pid>/cmdline` and captured by execve audit tooling).
+# The URL (which contains the bot token) is passed via a `curl --config`
+# file created under `umask 077`, and the webhook URL + `secret_token`
+# travel in the POST body read from stdin, not the command line.
+CURL_CONFIG=$(umask 077 && mktemp "${TMPDIR:-/tmp}/openclaw-tg-curl.XXXXXX")
+trap 'rm -f "$CURL_CONFIG"' EXIT
+printf 'url = "https://api.telegram.org/bot%s/setWebhook"\n' "$TELEGRAM_TOKEN" > "$CURL_CONFIG"
+
+WEBHOOK_RESULT=$(
+    printf 'url=%s&secret_token=%s' "${API_URL}webhook/telegram" "$WEBHOOK_SECRET" \
+    | curl -s -X POST --data-binary @- --config "$CURL_CONFIG"
+)
+rm -f "$CURL_CONFIG"
+trap - EXIT
 echo "Webhook result: $WEBHOOK_RESULT"
 
 if ! echo "$WEBHOOK_RESULT" | grep -q '"ok":true'; then
