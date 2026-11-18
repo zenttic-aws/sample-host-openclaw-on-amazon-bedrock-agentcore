@@ -34,7 +34,13 @@ const https = require("node:https");
 const RESERVED_ARG = "__caller_token";
 
 // Same namespace pattern the exec skills enforce (bridge/skills/*/common.js).
-const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,64}$/;
+// Body length is capped at 37 characters so the full namespace never exceeds
+// 46 characters — the maximum width that fits inside an EventBridge schedule
+// name of the form `openclaw-<namespace>-<8-hex-id>` (64-char service limit,
+// see eventbridge_cron/index.js:buildScheduleName). This prevents the
+// scheduler's name derivation from silently truncating the identity-bearing
+// component and collapsing distinct tenants onto a single schedule name.
+const VALID_NAMESPACE = /^(telegram|slack|discord|whatsapp|feishu|line)_[a-zA-Z0-9_-]{1,37}$/;
 
 class IdentityError extends Error {
   constructor(message) {

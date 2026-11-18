@@ -5,6 +5,8 @@ if cold, sends the cron message, and delivers the response to the user's
 channel (Telegram, Slack or Feishu).
 """
 
+import hashlib
+import html as _html
 import json
 import logging
 import os
@@ -12,11 +14,12 @@ import re
 import time
 import uuid
 from urllib import request as urllib_request
+from urllib.parse import urlparse
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from runtime_routing import admit_route, is_unknown_outcome, resolve_route
+from runtime_routing import RouteUnavailable, admit_route, is_unknown_outcome, resolve_route
 import whatsapp
 import line_channel
 from runtime_enrollment import authorize_channel_actor, read_actor_owner
@@ -162,8 +165,28 @@ def _get_feishu_tenant_token():
 # DynamoDB session management (reuse pattern from router Lambda)
 # ---------------------------------------------------------------------------
 
+def _is_user_disabled(user_id):
+    """Operator kill switch: USER#<id>/PROFILE.status == "DISABLED" blocks routing."""
+    try:
+        profile = identity_table.get_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"}, ConsistentRead=True,
+        ).get("Item") or {}
+    except Exception as e:
+        # Fail closed: an unreadable profile must not grant service.
+        logger.error("User status read failed for %s: %s", user_id, e)
+        return True
+    return profile.get("status") == "DISABLED"
+
+
 def get_or_create_session(user_id):
-    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation."""
+    """Resolve an explicitly enrolled V2 route; missing routes require reconciliation.
+
+    Honours the operator kill switch: a USER#<id>/PROFILE record with
+    ``status == "DISABLED"`` short-circuits scheduled routing before any
+    AgentCore invocation.
+    """
+    if _is_user_disabled(user_id):
+        raise RouteUnavailable("User is administratively disabled")
     return resolve_route(identity_table, user_id)
 
 
@@ -301,6 +324,12 @@ _BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
 _MALFORMED_TEXT_BLOCK_RE = re.compile(
     r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
 )
+# Maximum consecutive '[{' / '[' / '{' opener depth we will attempt to JSON
+# decode. CPython's json scanner recurses in C per nested container and raises
+# RecursionError well before 500 levels; attacker-controlled model output may
+# contain arbitrary depth, so we reject obviously too-deep candidates before
+# raw_decode() is called. Legitimate subagent nesting is <<< 100 levels.
+_MAX_CONTENT_BLOCK_NEST_DEPTH = 100
 
 
 def _extract_text_from_content_blocks(text):
@@ -329,24 +358,43 @@ def _extract_text_from_content_blocks(text):
                 rebuilt.append(result[i:])
                 break
             rebuilt.append(result[i:pos])
-            # Try to parse a JSON array starting at pos
-            try:
-                blocks, end = decoder.raw_decode(result, pos)
-                if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
-                    # Check if this looks like a content block array (dicts with "type" keys)
-                    has_typed_blocks = any(b.get("type") for b in blocks)
-                    if has_typed_blocks:
-                        parts = [
-                            b.get("text", "")
-                            for b in blocks
-                            if isinstance(b, dict) and b.get("type") == "text"
-                        ]
-                        # Always advance past the block — image-only blocks produce empty text
-                        rebuilt.append("".join(parts))
-                        i = end
-                        continue
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+            # Try to parse a JSON array starting at pos.
+            # Guard against attacker-controlled deeply nested JSON that would
+            # make json.JSONDecoder.raw_decode() raise RecursionError (not a
+            # subclass of ValueError/JSONDecodeError, so historically it would
+            # escape the handler, drop the brief delivery, and — because async
+            # scheduler invocations retry — trigger duplicate paid agent turns).
+            # Any candidate with more than _MAX_CONTENT_BLOCK_NEST_DEPTH
+            # consecutive openers at its start cannot be a legitimate content
+            # block array and is skipped as plain text.
+            opener_depth = 0
+            for ch in result[pos:pos + _MAX_CONTENT_BLOCK_NEST_DEPTH + 2]:
+                if ch in "[{":
+                    opener_depth += 1
+                else:
+                    break
+            if opener_depth <= _MAX_CONTENT_BLOCK_NEST_DEPTH:
+                try:
+                    blocks, end = decoder.raw_decode(result, pos)
+                    if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
+                        # Check if this looks like a content block array (dicts with "type" keys)
+                        has_typed_blocks = any(b.get("type") for b in blocks)
+                        if has_typed_blocks:
+                            parts = [
+                                b.get("text", "")
+                                for b in blocks
+                                if isinstance(b, dict) and b.get("type") == "text"
+                            ]
+                            # Always advance past the block — image-only blocks produce empty text
+                            rebuilt.append("".join(parts))
+                            i = end
+                            continue
+                except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
+                    # RecursionError can escape raw_decode() for deeply nested
+                    # attacker-controlled JSON on top of the depth guard above
+                    # (platform/interpreter dependent); treat the fragment as
+                    # plain text rather than crashing the handler.
+                    pass
             # Not a valid content block array. If it looks like content-block
             # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
             # runs to the end of the string is dropped (a partial stream tail).
@@ -484,12 +532,25 @@ def _markdown_to_telegram_html(text):
     text = re.sub(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", r"<i>\1</i>", text)
     text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
 
-    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection
+    # Links: [text](url) — allowlist safe URL schemes to prevent javascript:/data: injection.
+    # Reject any URL containing characters that could break out of the href attribute
+    # (quotes, angle brackets, whitespace, control/NUL — incl. placeholder markers), then
+    # validate the full scheme (not just a prefix) and HTML-escape for attribute context.
+    _LINK_URL_FORBIDDEN = re.compile(r'[\x00-\x20"\'<>]')
+    _LINK_ALLOWED_SCHEMES = {"http", "https", "tg", "mailto"}
+
     def _safe_link(m):
         link_text, link_url = m.group(1), m.group(2)
-        if re.match(r'^(https?://|tg://|mailto:)', link_url):
-            return f'<a href="{link_url}">{link_text}</a>'
-        return m.group(0)  # leave non-http links as plain text
+        if _LINK_URL_FORBIDDEN.search(link_url):
+            return m.group(0)  # unsafe characters — leave as plain text
+        try:
+            scheme = urlparse(link_url).scheme.lower()
+        except ValueError:
+            return m.group(0)
+        if scheme not in _LINK_ALLOWED_SCHEMES:
+            return m.group(0)  # leave non-allowlisted links as plain text
+        safe_url = _html.escape(link_url, quote=True)
+        return f'<a href="{safe_url}">{link_text}</a>'
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _safe_link, text)
     text = re.sub(r"^&gt;\s?(.+)$", r"<blockquote>\1</blockquote>", text, flags=re.MULTILINE)
@@ -626,13 +687,27 @@ def _send_telegram_chunks(chat_id, text, token, limit=TELEGRAM_CHUNK_UTF16_UNITS
     return delivered_all
 
 
+def _escape_slack_text(text):
+    """Neutralize Slack control characters per Slack's documented escaping rules.
+
+    Replaces ``&`` with ``&amp;``, ``<`` with ``&lt;``, and ``>`` with ``&gt;`` so
+    that attacker-influenced content (e.g. model output) cannot inject mrkdwn link
+    syntax (``<url|label>``) or broadcast/user mention tokens (``<!channel>``,
+    ``<!here>``, ``<@U...>``, ``<!subteam^ID>``) into chat.postMessage ``text``.
+    See https://api.slack.com/reference/surfaces/formatting#escaping.
+    """
+    if not isinstance(text, str):
+        return text
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def send_slack_message(channel_id, text, bot_token):
     """Send a message via Slack Web API."""
     if not bot_token:
         logger.error("No Slack bot token available")
         return
     url = "https://slack.com/api/chat.postMessage"
-    data = json.dumps({"channel": channel_id, "text": text}).encode()
+    data = json.dumps({"channel": channel_id, "text": _escape_slack_text(text)}).encode()
     req = urllib_request.Request(
         url,
         data=data,
@@ -959,7 +1034,13 @@ def handler(event, context):
     phase = event.get("cronPhase")
     if phase in ASYNC_PHASES:
         return run_async_phase(phase, event, context)
-    logger.info("Cron event received: %s", json.dumps(event)[:1000])
+    logger.info(
+        "Cron event received: schedule=%s user=%s channel=%s msg_len=%d",
+        event.get("scheduleId"),
+        event.get("userId"),
+        event.get("channel"),
+        len(event.get("message") or ""),
+    )
     if CRON_ASYNC_STATE_MACHINE_ARN:
         return launch_async(event)
 
@@ -1061,6 +1142,68 @@ def verify_cron_event(event):
             "body": "Schedule ownership verification error",
         }
 
+    # Bind the delivery destination (and the message to execute) to the stored,
+    # server-authoritative CRON# record. The EventBridge Scheduler Target.Input
+    # is attacker-influenceable (via the eventbridge-cron skill and via scoped
+    # STS credentials that allow scheduler:UpdateSchedule), so every field used
+    # for delivery or runtime invocation MUST come from DynamoDB and the payload
+    # is only accepted when it matches. See CWE-639.
+    required_record_fields = ("channel", "channelTarget", "channelActorId", "actorId", "message")
+    missing = [field for field in required_record_fields if not cron_record.get(field)]
+    if missing:
+        logger.error(
+            "CRON# record for schedule %s is missing authoritative fields %s — refusing to deliver",
+            schedule_id, missing,
+        )
+        return None, {
+            "statusCode": 403,
+            "body": "Schedule record is missing delivery binding",
+        }
+
+    record_channel = cron_record.get("channel")
+    record_channel_target = cron_record.get("channelTarget")
+    record_channel_actor = cron_record.get("channelActorId")
+    record_actor = cron_record.get("actorId")
+    record_message = cron_record.get("message")
+
+    # Reject any payload that disagrees with the stored binding. We never
+    # overwrite the record from the payload — the payload is treated as
+    # untrusted and must match what the owner persisted at schedule creation.
+    if (channel != record_channel
+            or channel_target != record_channel_target
+            or actor_id != record_channel_actor
+            or message != record_message
+            or (event.get("actorId") is not None and event.get("actorId") != record_actor)):
+        logger.error(
+            "Schedule %s payload does not match stored CRON# record — refusing to deliver",
+            schedule_id,
+        )
+        return None, {
+            "statusCode": 403,
+            "body": "Schedule payload does not match stored record",
+        }
+
+    # The stored channelActorId must itself be bound to the resolved owner on
+    # the resolved channel — the actor prefix check above only validates the
+    # payload; here we re-validate the record so a tampered record is still
+    # caught. authorize_channel_actor (below) performs the DynamoDB side of
+    # this binding; here we only enforce the simple shape invariant.
+    if not isinstance(record_channel_actor, str) or not record_channel_actor.startswith(f"{record_channel}:"):
+        logger.error(
+            "Schedule %s stored channelActorId %r does not match channel %r",
+            schedule_id, record_channel_actor, record_channel,
+        )
+        return None, {
+            "statusCode": 403,
+            "body": "Schedule record channel binding invalid",
+        }
+
+    # From here on, use the record values — never the payload — for delivery.
+    channel = record_channel
+    channel_target = record_channel_target
+    actor_id = record_channel_actor
+    message = record_message
+
     # Phase 1: Get or create session
     try:
         session_id = get_or_create_session(current_user_id)
@@ -1127,22 +1270,69 @@ ASYNC_STATUS_TIMEOUT_SECONDS = 60
 _SCHEDULED_TIME_RE = re.compile(r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})Z")
 
 
-def async_job_id(event, now=None):
-    """Execution name and contract jobId: <scheduleId>-<scheduled fire time>.
+def async_job_id(job, scheduled_time=None, now=None):
+    """Execution name and contract jobId, tenant-scoped by the verified owner.
 
-    One fire of one schedule always maps to the same name, so a repeated
-    invocation cannot start a second run (Step Functions rejects the name).
-    Schedules created by the eventbridge-cron skill pass the scheduled time;
-    older schedules fall back to the invocation time rounded down to the minute.
+    The name is `<scheduleId>-<ownerHash>-<stamp>` where ``ownerHash`` is derived
+    from the verified ``userId`` and ``scheduleId``. Including the owner in the
+    name makes the Step Functions execution-name namespace tenant-scoped: two
+    different tenants cannot collide on the same name, so one tenant cannot
+    silently suppress another tenant's scheduled fire by pre-reserving a name.
+    One fire of one schedule for one owner still always maps to the same name,
+    so a repeated invocation cannot start a second run.
+
+    ``job`` is the verified result of :func:`verify_cron_event`. The stamp is
+    the schedule's fire time (``scheduled_time``, which schedules created by the
+    eventbridge-cron skill pass), so every delivery of one fire maps to one name
+    even if it arrives in a later minute. Because the owner hash scopes the
+    name, a caller choosing ``scheduledTime`` can only pick slots in its own
+    namespace. Older schedules fall back to the invocation time rounded down to
+    the minute. Step Functions execution names are limited to 80 characters.
     """
-    schedule = re.sub(r"[^A-Za-z0-9_-]", "", str(event.get("scheduleId") or ""))[:48] or "unknown"
-    match = _SCHEDULED_TIME_RE.fullmatch(str(event.get("scheduledTime") or ""))
+    now = time.time() if now is None else now
+    user_id = str(job.get("userId") or "")
+    raw_schedule = str(job.get("scheduleId") or "")
+    schedule = re.sub(r"[^A-Za-z0-9_-]", "", raw_schedule)[:48] or "unknown"
+    match = _SCHEDULED_TIME_RE.fullmatch(str(scheduled_time or ""))
     if match:
         parts = match.groups()
         stamp = "".join(parts[:3]) + "T" + "".join(parts[3:]) + "Z"
     else:
-        stamp = time.strftime("%Y%m%dT%H%M00Z", time.gmtime(time.time() if now is None else now))
-    return f"{schedule}-{stamp}"
+        stamp = time.strftime("%Y%m%dT%H%M00Z", time.gmtime(now))
+    # 12 hex chars = 48 bits, ample for separating tenants on one state machine
+    # while keeping the 80-char Step Functions execution-name limit (48+1+12+1+16=78).
+    owner_hash = hashlib.sha256(f"{user_id}|{raw_schedule}".encode("utf-8")).hexdigest()[:12]
+    return f"{schedule}-{owner_hash}-{stamp}"
+
+
+def _existing_execution_belongs_to(job, name):
+    """Best-effort ownership check for an ``ExecutionAlreadyExists`` collision.
+
+    The verified owner is already baked into the execution name, so a
+    cross-tenant collision is cryptographically improbable; this is defence in
+    depth. Returns True when the existing execution's input names the same
+    verified owner, False when it names a different owner, and None when the
+    check cannot be performed (treated as "unknown, trust the hash").
+    """
+    sm_arn = CRON_ASYNC_STATE_MACHINE_ARN
+    marker = ":stateMachine:"
+    if marker not in sm_arn:
+        return None
+    prefix, _, sm_name = sm_arn.partition(marker)
+    execution_arn = f"{prefix}:execution:{sm_name}:{name}"
+    try:
+        description = sfn_client.describe_execution(executionArn=execution_arn)
+    except ClientError as e:
+        logger.warning("describe_execution for %s failed: %s", name, e.response.get("Error", {}).get("Code"))
+        return None
+    except Exception as e:  # pylint: disable=broad-except
+        logger.warning("describe_execution for %s failed: %s", name, type(e).__name__)
+        return None
+    try:
+        existing = json.loads(description.get("input") or "{}")
+    except (TypeError, ValueError):
+        return False
+    return existing.get("userId") == job["userId"] and existing.get("scheduleId") == job["scheduleId"]
 
 
 def launch_async(event):
@@ -1150,13 +1340,35 @@ def launch_async(event):
     job, error = verify_cron_event(event)
     if error:
         return error
-    name = async_job_id(event)
-    state = {key: event[key] for key in ASYNC_EVENT_FIELDS if event.get(key) is not None}
+    name = async_job_id(job, event.get("scheduledTime"))
+    # Build the state machine input from the verified job, not the raw event,
+    # so the identity, channel and schedule carried into the state machine are
+    # the server-authoritative values rather than whatever the payload claimed.
+    state = {key: job[key] for key in ASYNC_EVENT_FIELDS if job.get(key) is not None}
+    # Preserve passthrough fields the verified job does not carry (channelActorId
+    # is a legacy alias for actorId; scheduledTime is informational for the
+    # downstream phases). Taking them from the raw event is safe because
+    # downstream phases re-verify the state and use job["actorId"]/job["userId"].
+    for key in ("channelActorId", "scheduledTime"):
+        if event.get(key) is not None and key not in state:
+            state[key] = event[key]
     state.update({"cronPhase": "start", "jobId": name})
     try:
         sfn_client.start_execution(stateMachineArn=CRON_ASYNC_STATE_MACHINE_ARN, name=name, input=json.dumps(state))
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "ExecutionAlreadyExists":
+            same_owner = _existing_execution_belongs_to(job, name)
+            if same_owner is False:
+                # Different owner holds this name: the owner hash in the name
+                # makes this cryptographically improbable, so if it ever fires
+                # it is a signal worth alarming on. Match the
+                # openclaw-scheduled-task-failures alarm pattern.
+                logger.error(
+                    "Scheduled task %s did not complete: execution name %s is held by a different owner",
+                    job["scheduleId"], name,
+                )
+                deliver_failure(job, "name_collision")
+                return {"statusCode": 409, "body": "Execution name collision"}
             logger.warning("Scheduled task %s already started for this fire time; not starting it again",
                            job["scheduleId"])
             return {"statusCode": 200, "body": "Already started"}
