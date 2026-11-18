@@ -137,4 +137,60 @@ describe("interceptor", () => {
     });
     assert.deepEqual(out.mcp.transformedGatewayResponse, { statusCode: 200, body: { jsonrpc: "2.0", id: 1, result: {} } });
   });
+
+  it("rewrites __caller_token on every tools/call entry in a JSON-RPC batch", async () => {
+    const body = [
+      {
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "user-files___list_files", arguments: { [RESERVED_ARG]: "spoofed-a" } },
+      },
+      {
+        jsonrpc: "2.0", id: 2, method: "tools/call",
+        params: { name: "user-files___read_file", arguments: { filename: "x", [RESERVED_ARG]: "spoofed-b" } },
+      },
+      { jsonrpc: "2.0", id: 3, method: "tools/list" },
+    ];
+    const out = await interceptor.handler({ mcp: { gatewayRequest: { headers, body } } });
+    const next = out.mcp.transformedGatewayRequest.body;
+    assert.equal(next[0].params.arguments[RESERVED_ARG], "eyJ.fake.token");
+    assert.equal(next[1].params.arguments[RESERVED_ARG], "eyJ.fake.token");
+    assert.equal(next[1].params.arguments.filename, "x");
+    assert.deepEqual(next[2], { jsonrpc: "2.0", id: 3, method: "tools/list" });
+  });
+
+  it("fails closed on a batch with a tools/call entry when no bearer is present", async () => {
+    const body = [
+      {
+        jsonrpc: "2.0", id: 1, method: "tools/call",
+        params: { name: "t", arguments: { [RESERVED_ARG]: "spoofed" } },
+      },
+    ];
+    const out = await interceptor.handler({ mcp: { gatewayRequest: { body } } });
+    assert.equal(out.mcp.transformedGatewayResponse.statusCode, 401);
+    assert.match(out.mcp.transformedGatewayResponse.body.error.message, /missing bearer/);
+  });
+
+  it("rejects an unparsed string body (fail-closed on unsupported shape)", async () => {
+    const body = '[{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"arguments":{"__caller_token":"spoofed"}}}]';
+    const out = await interceptor.handler({ mcp: { gatewayRequest: { headers, body } } });
+    assert.equal(out.mcp.transformedGatewayResponse.statusCode, 401);
+    assert.match(out.mcp.transformedGatewayResponse.body.error.message, /unsupported request body/);
+  });
+
+  it("rejects an empty JSON-RPC batch", async () => {
+    const out = await interceptor.handler({ mcp: { gatewayRequest: { headers, body: [] } } });
+    assert.equal(out.mcp.transformedGatewayResponse.statusCode, 401);
+    assert.match(out.mcp.transformedGatewayResponse.body.error.message, /empty JSON-RPC batch/);
+  });
+
+  it("scrubs __caller_token from a non-tools/call single body", async () => {
+    const body = {
+      jsonrpc: "2.0", id: 9, method: "tools/list",
+      params: { arguments: { [RESERVED_ARG]: "spoofed", other: "keep" } },
+    };
+    const out = await interceptor.handler({ mcp: { gatewayRequest: { headers, body } } });
+    const args = out.mcp.transformedGatewayRequest.body.params.arguments;
+    assert.equal(args[RESERVED_ARG], undefined);
+    assert.equal(args.other, "keep");
+  });
 });
