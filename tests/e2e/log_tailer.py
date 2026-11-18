@@ -26,6 +26,10 @@ PATTERNS = {
     "agentcore_response": re.compile(
         r"AgentCore response \(len=\d+, first \d+ chars\): (.+)", re.DOTALL
     ),
+    # Logged on every Telegram turn; carries the reply length only.
+    "response_ready": re.compile(
+        r"Telegram response ready \(len=(\d+)"
+    ),
     "response_to_send": re.compile(
         r"Response to send \(len=(\d+)\)(?:: (.+))?", re.DOTALL
     ),
@@ -107,6 +111,8 @@ def _parse_line(line: str, result: TailResult) -> None:
             # for security reasons; group(2) may be None.
             if m.group(2) is not None:
                 result.response_text = m.group(2)
+        elif name == "response_ready":
+            result.response_len = int(m.group(1))
         elif name == "telegram_sent":
             result.telegram_sent = True
         elif name == "new_session":
