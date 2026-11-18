@@ -168,6 +168,7 @@ RUN mkdir -p /root/.openclaw
 COPY agentcore-contract.js /app/agentcore-contract.js
 COPY agentcore-proxy.js /app/agentcore-proxy.js
 COPY workspace-sync.js /app/workspace-sync.js
+COPY workspace-files-s3.js /app/workspace-files-s3.js
 COPY state-storage.js /app/state-storage.js
 COPY legacy-session-import.js /app/legacy-session-import.js
 COPY cloudwatch-logger.js /app/cloudwatch-logger.js
@@ -176,6 +177,7 @@ COPY scoped-credentials.js /app/scoped-credentials.js
 COPY force-ipv4.js /app/force-ipv4.js
 COPY cognito-token.js /app/cognito-token.js
 COPY guardrail-scope.js /app/guardrail-scope.js
+COPY guardrail-blocklist.js /app/guardrail-blocklist.js
 COPY tool-history.js /app/tool-history.js
 COPY system-messages.js /app/system-messages.js
 COPY inference-config.js /app/inference-config.js

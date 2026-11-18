@@ -113,11 +113,23 @@ log "    Packaged $(du -sh "$TMPZIP.zip" | cut -f1) -> bridge-source.zip"
 log "==> Uploading to S3 ..."
 aws s3 cp "$TMPZIP.zip" "s3://${SOURCE_BUCKET}/bridge-source.zip" \
 	--region "$REGION" --no-progress >&2
+# Capture the exact VersionId of the object we just uploaded so CodeBuild is
+# pinned to that version. A later overwrite of bridge-source.zip cannot change
+# what this build consumes. The build bucket is created with versioning on by
+# stacks/build_stack.py; refuse to continue if the bucket is not versioned.
+SOURCE_VERSION=$(aws s3api head-object \
+	--bucket "$SOURCE_BUCKET" --key "bridge-source.zip" \
+	--region "$REGION" --query 'VersionId' --output text 2>/dev/null || true)
+if [ -z "$SOURCE_VERSION" ] || [ "$SOURCE_VERSION" = "None" ] || [ "$SOURCE_VERSION" = "null" ]; then
+	die "could not read VersionId for s3://${SOURCE_BUCKET}/bridge-source.zip; enable versioning on the build source bucket (redeploy ${BUILD_STACK})."
+fi
+log "    VersionId: ${SOURCE_VERSION}"
 
 # --- Start CodeBuild build ---------------------------------------------------
 log "==> Starting CodeBuild build ..."
 BUILD_ID=$(aws codebuild start-build \
 	--project-name "$PROJECT_NAME" \
+	--source-version "$SOURCE_VERSION" \
 	--environment-variables-override "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT" \
 	--region "$REGION" \
 	--query "build.id" --output text)
@@ -139,6 +151,16 @@ while true; do
 	fi
 	case "$STATUS" in
 	SUCCEEDED)
+		# Resolve the mutable tag we just pushed to its immutable digest. The
+		# downstream deploy flow re-resolves this anyway, but surfacing the
+		# digest here lets operators pin by digest explicitly if they prefer.
+		IMAGE_DIGEST=$(aws ecr describe-images \
+			--repository-name "$REPOSITORY" --image-ids "imageTag=${IMAGE_TAG}" \
+			--region "$REGION" --query 'imageDetails[0].imageDigest' --output text 2>/dev/null || true)
+		if [[ "$IMAGE_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+			log "    Digest:   ${IMAGE_DIGEST}"
+			log "    Pin by digest: ${REPOSITORY_URI}@${IMAGE_DIGEST}"
+		fi
 		log "==> Build SUCCEEDED. Deploy with:"
 		log "    BUILD_MODE=codebuild ./scripts/deploy.sh --image-uri ${IMAGE_URI}"
 		echo "$IMAGE_URI"

@@ -77,16 +77,46 @@ echo "Step 2: Store Feishu credentials in Secrets Manager"
 echo ""
 echo "Find these in your Feishu app's 'Credentials & Basic Info' and 'Event Subscriptions'."
 echo ""
-read -rp "Enter your Feishu App ID: " APP_ID
-read -rp "Enter your Feishu App Secret: " APP_SECRET
-read -rp "Enter your Verification Token: " VERIFICATION_TOKEN
-read -rp "Enter your Encrypt Key: " ENCRYPT_KEY
+# App ID is not sensitive; the other three are. Read secret values with
+# `read -rsp` so they are not echoed to the terminal/scrollback.
+read -rp  "Enter your Feishu App ID: " APP_ID
+read -rsp "Enter your Feishu App Secret: " APP_SECRET; echo
+read -rsp "Enter your Verification Token: " VERIFICATION_TOKEN; echo
+read -rsp "Enter your Encrypt Key: " ENCRYPT_KEY; echo
 
 echo "Storing credentials in Secrets Manager..."
+
+# Build the credential JSON in a file created with `umask 077` and pass it
+# via `--secret-string fileb://` so the secret values never appear in argv
+# (`ps`/`/proc/<pid>/cmdline`/execve audit).
+SECRET_FILE=$(umask 077 && mktemp "${TMPDIR:-/tmp}/openclaw-feishu-secret.XXXXXX")
+trap 'rm -f "$SECRET_FILE"' EXIT
+
+if command -v jq >/dev/null 2>&1; then
+    jq -n \
+        --arg appId "$APP_ID" \
+        --arg appSecret "$APP_SECRET" \
+        --arg verificationToken "$VERIFICATION_TOKEN" \
+        --arg encryptKey "$ENCRYPT_KEY" \
+        '{appId:$appId, appSecret:$appSecret, verificationToken:$verificationToken, encryptKey:$encryptKey}' \
+        > "$SECRET_FILE"
+else
+    # Fallback: use python to emit well-formed JSON without passing values on argv.
+    APP_ID="$APP_ID" APP_SECRET="$APP_SECRET" \
+    VERIFICATION_TOKEN="$VERIFICATION_TOKEN" ENCRYPT_KEY="$ENCRYPT_KEY" \
+    python3 -c 'import json, os; json.dump({"appId": os.environ["APP_ID"], "appSecret": os.environ["APP_SECRET"], "verificationToken": os.environ["VERIFICATION_TOKEN"], "encryptKey": os.environ["ENCRYPT_KEY"]}, open(os.environ["SECRET_FILE"], "w"))' SECRET_FILE="$SECRET_FILE"
+fi
+
 aws secretsmanager update-secret \
     --secret-id openclaw/channels/feishu \
-    --secret-string "{\"appId\":\"${APP_ID}\",\"appSecret\":\"${APP_SECRET}\",\"verificationToken\":\"${VERIFICATION_TOKEN}\",\"encryptKey\":\"${ENCRYPT_KEY}\"}" \
+    --secret-string "fileb://${SECRET_FILE}" \
     --region "$REGION" $PROFILE_ARG
+
+rm -f "$SECRET_FILE"
+trap - EXIT
+
+# Best-effort scrub of in-memory copies.
+unset APP_SECRET VERIFICATION_TOKEN ENCRYPT_KEY
 
 echo "Credentials stored."
 echo ""
