@@ -193,6 +193,22 @@ class TestMalformedBodies(_ChannelsConfigured):
     def test_oversized_body_is_413(self):
         self.assert_status(_event("telegram", "x" * (index.MAX_BODY_BYTES + 1), {}), 413)
 
+    def test_null_body_with_well_formed_headers_is_401(self):
+        # A body of null with headers that pass every format and timestamp
+        # check reaches the signature comparison on each channel.
+        well_formed = {
+            "telegram": _with_signature("telegram", "wrongButWellFormed"),
+            "slack": _with_signature("slack", "v0=" + "0" * 64),
+            "feishu": _with_signature("feishu", "0" * 64),
+            "whatsapp": _with_signature("whatsapp", "sha256=" + "0" * 64),
+            "line": _with_signature("line", "A" * 43 + "="),
+            "discord": _with_signature("discord", "0" * 128),
+        }
+        for ch, headers in well_formed.items():
+            with self.subTest(channel=ch):
+                self.assert_status(_event(ch, None, headers), 401)
+        self.mock_async.assert_not_called()
+
 
 class TestValidRequestsUnchanged(_ChannelsConfigured):
     def test_signed_request_is_dispatched(self):
