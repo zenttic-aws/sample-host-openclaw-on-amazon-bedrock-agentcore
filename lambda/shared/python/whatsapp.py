@@ -71,14 +71,18 @@ def verify_signature(headers, body_bytes, app_secret):
     if not app_secret:
         return False
     signature = (headers or {}).get("x-hub-signature-256", "")
-    if not signature or not signature.startswith("sha256="):
+    if not isinstance(signature, str) or not signature.startswith("sha256="):
         return False
     if not isinstance(body_bytes, bytes):
         return False
     if len(body_bytes) > MAX_BODY_BYTES:
         return False
     expected = "sha256=" + hmac.new(app_secret.encode("utf-8"), body_bytes, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, signature)
+    try:
+        signature_b = signature.encode("utf-8", "strict") if isinstance(signature, str) else bytes(signature)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        return False
+    return hmac.compare_digest(expected.encode("utf-8"), signature_b)
 
 
 def verify_subscription(query, verify_token):
