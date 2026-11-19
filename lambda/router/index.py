@@ -26,6 +26,7 @@ import secrets
 import threading
 import time
 import uuid
+import binascii
 from urllib import request as urllib_request
 from urllib.parse import quote, urlparse
 
@@ -359,6 +360,19 @@ def _verify_async_dispatch(event):
     return hmac.compare_digest(expected_mac, provided_mac)
 
 
+# Format allowlists for signature/token header values. A value that cannot be
+# a valid signature is rejected before any HMAC work, which mirrors the format
+# checks already performed by discord_channel/line_channel.
+#
+# Telegram: X-Telegram-Bot-Api-Secret-Token is 1–256 chars from [A-Za-z0-9_-]
+# (https://core.telegram.org/bots/api#setwebhook).
+_TELEGRAM_SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{1,256}$")
+# Slack: X-Slack-Signature is "v0=" followed by 64 lowercase hex characters.
+_SLACK_SIGNATURE_RE = re.compile(r"^v0=[0-9a-f]{64}$")
+# Feishu/Lark: X-Lark-Signature is 64 lowercase hex characters (SHA-256).
+_FEISHU_SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
 
@@ -373,8 +387,21 @@ def validate_telegram_webhook(headers):
     if not token:
         logger.warning("Telegram webhook missing X-Telegram-Bot-Api-Secret-Token header")
         return False
+    # Reject malformed header values before comparing.
+    if not isinstance(token, str) or not _TELEGRAM_SECRET_TOKEN_RE.match(token):
+        logger.warning("Telegram webhook secret token has invalid format")
+        return False
 
-    if not hmac.compare_digest(token, webhook_secret):
+    # Normalise to bytes for hmac.compare_digest, which raises TypeError on
+    # non-ASCII str inputs. Treating the attacker-supplied header as bytes
+    # closes that pre-auth crash path without changing the comparison result.
+    try:
+        token_b = token.encode("utf-8", "strict") if isinstance(token, str) else bytes(token)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Telegram webhook secret token not valid UTF-8")
+        return False
+    secret_b = webhook_secret.encode("utf-8") if isinstance(webhook_secret, str) else webhook_secret
+    if not hmac.compare_digest(token_b, secret_b):
         logger.warning("Telegram webhook secret token mismatch")
         return False
 
@@ -401,12 +428,18 @@ def validate_slack_webhook(headers, body):
         logger.warning("Slack webhook missing timestamp or signature headers")
         return False
 
+    # Reject malformed signature headers before comparing.
+    if not isinstance(signature, str) or not _SLACK_SIGNATURE_RE.match(signature):
+        logger.warning("Slack webhook signature has invalid format")
+        return False
+
     # Reject requests older than 5 minutes to prevent replay attacks
     try:
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Slack webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Slack webhook invalid timestamp: %s", timestamp)
         return False
 
@@ -418,7 +451,12 @@ def validate_slack_webhook(headers, body):
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    try:
+        signature_b = signature.encode("utf-8", "strict") if isinstance(signature, str) else bytes(signature)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Slack webhook signature header not valid UTF-8")
+        return False
+    if not hmac.compare_digest(expected.encode("utf-8"), signature_b):
         logger.warning("Slack webhook signature mismatch")
         return False
 
@@ -444,12 +482,18 @@ def validate_feishu_webhook(headers, body_bytes):
         logger.warning("Feishu webhook missing signature headers")
         return False
 
+    # Reject malformed signature headers before comparing.
+    if not isinstance(signature, str) or not _FEISHU_SIGNATURE_RE.match(signature):
+        logger.warning("Feishu webhook signature has invalid format")
+        return False
+
     # Reject requests older than 5 minutes to prevent replay attacks
     try:
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Feishu webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
         return False
 
@@ -457,7 +501,12 @@ def validate_feishu_webhook(headers, body_bytes):
     content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
     expected = hashlib.sha256(content).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    try:
+        signature_b = signature.encode("utf-8", "strict") if isinstance(signature, str) else bytes(signature)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Feishu webhook signature header not valid UTF-8")
+        return False
+    if not hmac.compare_digest(expected.encode("utf-8"), signature_b):
         logger.warning("Feishu webhook signature mismatch")
         return False
 
@@ -986,18 +1035,25 @@ def invoke_agent_runtime(route, user_id, actor_id, channel, message, channel_tar
 # ---------------------------------------------------------------------------
 
 # End of a (possibly malformed) content-block array: '}]' or '},]'.
-_BLOCK_CLOSE_RE = re.compile(r'\}\s*,?\s*\]')
+# The comma and the whitespace after it are one optional group, so a long
+# whitespace run after '}' is scanned once rather than split between two
+# '\s*' runs, which backtracks in time quadratic in the run's length.
+_BLOCK_CLOSE_RE = re.compile(r'\}\s*(?:,\s*)?\]')
 # Text value of a '{"type":"text","text":"..."}' block, for regex fallback.
 # Accepts ',' as well as ':' before the value (seen from models in the wild).
 _MALFORMED_TEXT_BLOCK_RE = re.compile(
     r'"type"\s*:\s*"text"\s*,\s*"text"\s*[,:]\s*"((?:[^"\\]|\\.)*)"'
 )
-# Maximum consecutive '[{' / '[' / '{' opener depth we will attempt to JSON
-# decode. CPython's json scanner recurses in C per nested container and raises
-# RecursionError well before 500 levels; attacker-controlled model output may
-# contain arbitrary depth, so we reject obviously too-deep candidates before
-# raw_decode() is called. Legitimate subagent nesting is <<< 100 levels.
-_MAX_CONTENT_BLOCK_NEST_DEPTH = 100
+# Start of what looks like content-block JSON: '[{"type":'.
+_BLOCK_PREFIX_RE = re.compile(r'\[\{\s*"type"\s*:')
+# A '[{' the JSON decoder could read as a list of objects: a key or '}' next.
+_DECODABLE_START_RE = re.compile(r'\[\{\s*["}]')
+# JSON decodes per call that do not unwrap a content block (the text is not
+# valid JSON, or is JSON but not a content-block array). Each one can cost
+# time in proportion to the text length, so the cap bounds the worst case;
+# past it the rest of the text is kept as it is. A decode that unwraps a
+# block consumes the text it read, so it is not counted.
+_MAX_UNUSED_DECODES = 1000
 
 
 def _extract_text_from_content_blocks(text):
@@ -1010,38 +1066,41 @@ def _extract_text_from_content_blocks(text):
 
     Scans for '[{' positions and attempts JSON parse at each to handle
     complex nested/escaped content blocks from subagent responses.
+
+    Work is linear in the text length: a pass never copies or rescans the
+    rest of the string for each '[{', a '[{' that cannot start JSON is not
+    decoded, at most _MAX_UNUSED_DECODES decodes per call may fail to unwrap
+    a block, and JSON nested too deeply to decode is kept as plain text.
     """
     if not text or not isinstance(text, str):
         return text
     result = text
     decoder = json.JSONDecoder(strict=False)
+    unused_decodes = 0
     for _ in range(10):
         prev = result
         # Scan for all '[{' positions and try to parse JSON arrays
         rebuilt = []
         i = 0
+        # A '[{' that starts here is the bare tail of the string.
+        bare_tail = len(result.rstrip()) - 2
+        # Next block close at or after the scan position, cached until the
+        # scan passes it, and the last position before it already known not
+        # to yield text from the regex fallback.
+        close = None
+        close_searched = False
+        no_text_until = -1
         while i < len(result):
             pos = result.find("[{", i)
             if pos == -1:
                 rebuilt.append(result[i:])
                 break
             rebuilt.append(result[i:pos])
-            # Try to parse a JSON array starting at pos.
-            # Guard against attacker-controlled deeply nested JSON that would
-            # make json.JSONDecoder.raw_decode() raise RecursionError (not a
-            # subclass of ValueError/JSONDecodeError, so historically it would
-            # escape the handler, drop the user reply, and — because async
-            # self-invocations retry — trigger duplicate paid agent turns).
-            # Any candidate with more than _MAX_CONTENT_BLOCK_NEST_DEPTH
-            # consecutive openers at its start cannot be a legitimate content
-            # block array and is skipped as plain text.
-            opener_depth = 0
-            for ch in result[pos:pos + _MAX_CONTENT_BLOCK_NEST_DEPTH + 2]:
-                if ch in "[{":
-                    opener_depth += 1
-                else:
+            # Try to parse a JSON array starting at pos
+            if _DECODABLE_START_RE.match(result, pos):
+                if unused_decodes >= _MAX_UNUSED_DECODES:
+                    rebuilt.append(result[pos:])
                     break
-            if opener_depth <= _MAX_CONTENT_BLOCK_NEST_DEPTH:
                 try:
                     blocks, end = decoder.raw_decode(result, pos)
                     if isinstance(blocks, list) and blocks and all(isinstance(b, dict) for b in blocks):
@@ -1058,34 +1117,41 @@ def _extract_text_from_content_blocks(text):
                             i = end
                             continue
                 except (json.JSONDecodeError, TypeError, ValueError, RecursionError):
-                    # RecursionError can escape raw_decode() for deeply nested
-                    # attacker-controlled JSON on top of the depth guard above
-                    # (platform/interpreter dependent); treat the fragment as
-                    # plain text rather than crashing the handler.
+                    # RecursionError: nested too deeply to decode; keep as text.
                     pass
+                unused_decodes += 1
             # Not a valid content block array. If it looks like content-block
             # JSON (e.g. '[{"type":' ...), only an unterminated fragment that
             # runs to the end of the string is dropped (a partial stream tail).
             # A closed but malformed array keeps the text around it.
-            remainder = result[pos:]
-            if re.match(r'^\[\{\s*"type"\s*:', remainder) or remainder.strip() == "[{":
-                close = _BLOCK_CLOSE_RE.search(remainder)
+            if _BLOCK_PREFIX_RE.match(result, pos) or pos == bare_tail:
+                if not close_searched or close.start() < pos:
+                    close = _BLOCK_CLOSE_RE.search(result, pos)
+                    close_searched = True
+                    no_text_until = -1
                 if close is None:
                     # Truncated content block JSON at the tail — skip the rest
                     break
-                span = remainder[:close.end()]
-                texts = _MALFORMED_TEXT_BLOCK_RE.findall(span)
-                if texts:
-                    try:
-                        rebuilt.append("".join(json.loads('"' + t + '"') for t in texts))
-                        i = pos + close.end()
-                        continue
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-            rebuilt.append("[")
-            i = pos + 1
+                if pos > no_text_until:
+                    texts = []
+                    for match in _MALFORMED_TEXT_BLOCK_RE.finditer(result, pos, close.end()):
+                        try:
+                            texts.append(json.loads('"' + match.group(1) + '"'))
+                        except (json.JSONDecodeError, ValueError):
+                            # Every '[{' up to this block also reaches it.
+                            no_text_until = match.start()
+                            break
+                    else:
+                        if texts:
+                            rebuilt.append("".join(texts))
+                            i = close.end()
+                            continue
+                        no_text_until = close.end()
+            # Keep the '[{' as text. The next '[{' cannot start at the '{'.
+            rebuilt.append("[{")
+            i = pos + 2
         result = "".join(rebuilt)
-        if result == prev:
+        if result == prev or unused_decodes >= _MAX_UNUSED_DECODES:
             break
     return result
 
@@ -3023,6 +3089,21 @@ def _handle_discord_command(command, reply):
 
 def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
+    try:
+        return _handler_impl(event, context)
+    except Exception as e:
+        # Contain any uncaught exception on the unauthenticated webhook path so
+        # that malformed input cannot register a Lambda invocation error
+        # (which API Gateway surfaces as 5xx and which drives the
+        # openclaw-router-errors CloudWatch alarm).
+        # Only the exception type is logged: the message and traceback can
+        # carry request bodies, header values or reply text.
+        logger.error("Unhandled router error: %s", type(e).__name__)
+        return {"statusCode": 500, "body": "Internal Server Error"}
+
+
+def _handler_impl(event, context):
+    """Implementation of the Lambda handler, wrapped by ``handler`` for error containment."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
         # The handler re-enters itself via lambda:Invoke after the per-channel
@@ -3104,7 +3185,12 @@ def handler(event, context):
         return {"statusCode": 413, "body": "Payload too large"}
     if event.get("isBase64Encoded"):
         import base64
-        body = base64.b64decode(body).decode("utf-8")
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except (ValueError, TypeError, UnicodeDecodeError, binascii.Error):
+            logger.warning("Rejecting webhook with undecodable base64/UTF-8 body from %s",
+                           http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 400, "body": "Bad Request"}
     if isinstance(body, (bytes, str)) and len(body) > MAX_BODY_BYTES:
         return {"statusCode": 413, "body": "Payload too large"}
 
@@ -3141,7 +3227,7 @@ def handler(event, context):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"challenge": challenge}),
                 }
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
         # Ignore Slack retries
@@ -3159,7 +3245,7 @@ def handler(event, context):
         # {"encrypt": "..."} envelope that is handled downstream in
         # handle_feishu after decryption, so verifying first does not break
         # a genuine setup flow.
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
         if not validate_feishu_webhook(headers, body_bytes):
             logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
             return {"statusCode": 401, "body": "Unauthorized"}
@@ -3178,7 +3264,7 @@ def handler(event, context):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"challenge": challenge}),
                 }
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
         # Self-invoke async for actual processing
