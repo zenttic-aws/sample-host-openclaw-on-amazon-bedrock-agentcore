@@ -3245,7 +3245,7 @@ def _handler_impl(event, context):
         # {"encrypt": "..."} envelope that is handled downstream in
         # handle_feishu after decryption, so verifying first does not break
         # a genuine setup flow.
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
         if not validate_feishu_webhook(headers, body_bytes):
             logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
             return {"statusCode": 401, "body": "Unauthorized"}
