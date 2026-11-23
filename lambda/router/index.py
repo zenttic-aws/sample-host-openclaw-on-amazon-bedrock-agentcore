@@ -360,6 +360,19 @@ def _verify_async_dispatch(event):
     return hmac.compare_digest(expected_mac, provided_mac)
 
 
+# Format allowlists for signature/token header values. A value that cannot be
+# a valid signature is rejected before any HMAC work, which mirrors the format
+# checks already performed by discord_channel/line_channel.
+#
+# Telegram: X-Telegram-Bot-Api-Secret-Token is 1–256 chars from [A-Za-z0-9_-]
+# (https://core.telegram.org/bots/api#setwebhook).
+_TELEGRAM_SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_\-]{1,256}$")
+# Slack: X-Slack-Signature is "v0=" followed by 64 lowercase hex characters.
+_SLACK_SIGNATURE_RE = re.compile(r"^v0=[0-9a-f]{64}$")
+# Feishu/Lark: X-Lark-Signature is 64 lowercase hex characters (SHA-256).
+_FEISHU_SIGNATURE_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
 def validate_telegram_webhook(headers):
     """Validate Telegram webhook using X-Telegram-Bot-Api-Secret-Token header.
 
@@ -373,6 +386,10 @@ def validate_telegram_webhook(headers):
     token = headers.get("x-telegram-bot-api-secret-token", "")
     if not token:
         logger.warning("Telegram webhook missing X-Telegram-Bot-Api-Secret-Token header")
+        return False
+    # Reject malformed header values before comparing.
+    if not isinstance(token, str) or not _TELEGRAM_SECRET_TOKEN_RE.match(token):
+        logger.warning("Telegram webhook secret token has invalid format")
         return False
 
     # Normalise to bytes for hmac.compare_digest, which raises TypeError on
@@ -409,6 +426,11 @@ def validate_slack_webhook(headers, body):
 
     if not timestamp or not signature:
         logger.warning("Slack webhook missing timestamp or signature headers")
+        return False
+
+    # Reject malformed signature headers before comparing.
+    if not isinstance(signature, str) or not _SLACK_SIGNATURE_RE.match(signature):
+        logger.warning("Slack webhook signature has invalid format")
         return False
 
     # Reject requests older than 5 minutes to prevent replay attacks
@@ -458,6 +480,11 @@ def validate_feishu_webhook(headers, body_bytes):
 
     if not timestamp or not nonce or not signature:
         logger.warning("Feishu webhook missing signature headers")
+        return False
+
+    # Reject malformed signature headers before comparing.
+    if not isinstance(signature, str) or not _FEISHU_SIGNATURE_RE.match(signature):
+        logger.warning("Feishu webhook signature has invalid format")
         return False
 
     # Reject requests older than 5 minutes to prevent replay attacks
