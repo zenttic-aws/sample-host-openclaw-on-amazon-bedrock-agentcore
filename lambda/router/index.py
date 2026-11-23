@@ -26,6 +26,7 @@ import secrets
 import threading
 import time
 import uuid
+import binascii
 from urllib import request as urllib_request
 from urllib.parse import quote, urlparse
 
@@ -374,7 +375,16 @@ def validate_telegram_webhook(headers):
         logger.warning("Telegram webhook missing X-Telegram-Bot-Api-Secret-Token header")
         return False
 
-    if not hmac.compare_digest(token, webhook_secret):
+    # Normalise to bytes for hmac.compare_digest, which raises TypeError on
+    # non-ASCII str inputs. Treating the attacker-supplied header as bytes
+    # closes that pre-auth crash path without changing the comparison result.
+    try:
+        token_b = token.encode("utf-8", "strict") if isinstance(token, str) else bytes(token)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Telegram webhook secret token not valid UTF-8")
+        return False
+    secret_b = webhook_secret.encode("utf-8") if isinstance(webhook_secret, str) else webhook_secret
+    if not hmac.compare_digest(token_b, secret_b):
         logger.warning("Telegram webhook secret token mismatch")
         return False
 
@@ -406,7 +416,8 @@ def validate_slack_webhook(headers, body):
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Slack webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Slack webhook invalid timestamp: %s", timestamp)
         return False
 
@@ -418,7 +429,12 @@ def validate_slack_webhook(headers, body):
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    try:
+        signature_b = signature.encode("utf-8", "strict") if isinstance(signature, str) else bytes(signature)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Slack webhook signature header not valid UTF-8")
+        return False
+    if not hmac.compare_digest(expected.encode("utf-8"), signature_b):
         logger.warning("Slack webhook signature mismatch")
         return False
 
@@ -449,7 +465,8 @@ def validate_feishu_webhook(headers, body_bytes):
         if abs(time.time() - int(timestamp)) > 300:
             logger.warning("Feishu webhook timestamp too old (replay attack prevention)")
             return False
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
+        # OverflowError: an integer too large to subtract from a float.
         logger.warning("Feishu webhook invalid timestamp: %s", timestamp)
         return False
 
@@ -457,7 +474,12 @@ def validate_feishu_webhook(headers, body_bytes):
     content = f"{timestamp}{nonce}{encrypt_key}".encode() + body_b
     expected = hashlib.sha256(content).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
+    try:
+        signature_b = signature.encode("utf-8", "strict") if isinstance(signature, str) else bytes(signature)
+    except (UnicodeEncodeError, TypeError, ValueError):
+        logger.warning("Feishu webhook signature header not valid UTF-8")
+        return False
+    if not hmac.compare_digest(expected.encode("utf-8"), signature_b):
         logger.warning("Feishu webhook signature mismatch")
         return False
 
@@ -3023,6 +3045,21 @@ def _handle_discord_command(command, reply):
 
 def handler(event, context):
     """Lambda handler (API Gateway HTTP API) with async self-invocation for long processing."""
+    try:
+        return _handler_impl(event, context)
+    except Exception as e:
+        # Contain any uncaught exception on the unauthenticated webhook path so
+        # that malformed input cannot register a Lambda invocation error
+        # (which API Gateway surfaces as 5xx and which drives the
+        # openclaw-router-errors CloudWatch alarm).
+        # Only the exception type is logged: the message and traceback can
+        # carry request bodies, header values or reply text.
+        logger.error("Unhandled router error: %s", type(e).__name__)
+        return {"statusCode": 500, "body": "Internal Server Error"}
+
+
+def _handler_impl(event, context):
+    """Implementation of the Lambda handler, wrapped by ``handler`` for error containment."""
     # Check if this is an async self-invocation (already dispatched)
     if event.get("_async_dispatch"):
         # The handler re-enters itself via lambda:Invoke after the per-channel
@@ -3104,7 +3141,12 @@ def handler(event, context):
         return {"statusCode": 413, "body": "Payload too large"}
     if event.get("isBase64Encoded"):
         import base64
-        body = base64.b64decode(body).decode("utf-8")
+        try:
+            body = base64.b64decode(body).decode("utf-8")
+        except (ValueError, TypeError, UnicodeDecodeError, binascii.Error):
+            logger.warning("Rejecting webhook with undecodable base64/UTF-8 body from %s",
+                           http_info.get("sourceIp", "unknown"))
+            return {"statusCode": 400, "body": "Bad Request"}
     if isinstance(body, (bytes, str)) and len(body) > MAX_BODY_BYTES:
         return {"statusCode": 413, "body": "Payload too large"}
 
@@ -3141,7 +3183,7 @@ def handler(event, context):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"challenge": challenge}),
                 }
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
         # Ignore Slack retries
@@ -3159,7 +3201,7 @@ def handler(event, context):
         # {"encrypt": "..."} envelope that is handled downstream in
         # handle_feishu after decryption, so verifying first does not break
         # a genuine setup flow.
-        body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+        body_bytes = body.encode("utf-8") if isinstance(body, str) else (body or b"")
         if not validate_feishu_webhook(headers, body_bytes):
             logger.warning("Feishu webhook validation failed from %s", http_info.get("sourceIp", "unknown"))
             return {"statusCode": 401, "body": "Unauthorized"}
@@ -3178,7 +3220,7 @@ def handler(event, context):
                     "headers": {"Content-Type": "application/json"},
                     "body": json.dumps({"challenge": challenge}),
                 }
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
         # Self-invoke async for actual processing
